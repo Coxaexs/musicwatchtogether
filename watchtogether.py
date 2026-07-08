@@ -963,14 +963,34 @@ async def ws_handler(request):
             elif t == 'bmouse':
                 sess = cobrowser.get(room.id) if cobrowser else None
                 if sess and sess.controller == name:
-                    sess.mouse(data.get('a', 'move'),
-                               float(data.get('x') or 0), float(data.get('y') or 0),
-                               int(data.get('b') or 1), float(data.get('dy') or 0))
+                    a = data.get('a', 'move')
+                    x = float(data.get('x') or 0)
+                    y = float(data.get('y') or 0)
+                    sess.mouse(a, x, y, int(data.get('b') or 1),
+                               float(data.get('dy') or 0))
+                    # so everyone sees where the controller is pointing
+                    if a in ('move', 'down', 'up'):
+                        await _broadcast(room, {'t': 'bcursor', 'x': x, 'y': y,
+                                                'down': a == 'down'})
 
             elif t == 'bkey':
                 sess = cobrowser.get(room.id) if cobrowser else None
                 if sess and sess.controller == name:
                     sess.key(data.get('a', 'down'), str(data.get('key') or ''))
+
+            elif t == 'browser_media':
+                sess = cobrowser.get(room.id) if cobrowser else None
+                if sess:
+                    await ws.send_str(json.dumps(
+                        {'t': 'bmedia', 'items': sess.get_media(),
+                         'page': sess.page_url}))
+
+            elif t == 'browser_pick':
+                sess = cobrowser.get(room.id) if cobrowser else None
+                url = str(data.get('url') or '').strip()
+                if sess and url:
+                    await _notice(room, f'📹 {name} grabbed media from the page')
+                    asyncio.create_task(_add_query(room, url, name))
     finally:
         room.sockets.pop(ws, None)
         if joined:
@@ -1066,6 +1086,8 @@ async def stream_ws(request):
 
 def setup(app, bot=None):
     import shutil
+    if cobrowser:
+        cobrowser.cleanup_orphans()   # kill co-browsers leaked by a prior run
     os.makedirs(WATCH_CACHE_DIR, exist_ok=True)
     os.makedirs(REELS_CACHE_DIR, exist_ok=True)
     # queues don't survive restarts, so leftover files are orphans
@@ -1121,6 +1143,18 @@ WATCH_HTML = r"""<!DOCTYPE html>
   #fsBtn{position:absolute;top:10px;right:10px;z-index:6;background:rgba(0,0,0,.5);
          border-radius:8px;padding:5px 10px;font-size:17px;opacity:.35;transition:opacity .2s}
   #fsBtn:hover{opacity:1}
+  #bcursor{position:absolute;width:22px;height:22px;left:0;top:0;z-index:7;
+    pointer-events:none;transform:translate(-3px,-2px);transition:left .05s linear,top .05s linear;
+    display:none;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))}
+  #bcursor svg{width:100%;height:100%}
+  #bcursor.click{animation:bclick .4s ease-out}
+  @keyframes bclick{0%{filter:drop-shadow(0 0 0 var(--accent2))}
+    50%{filter:drop-shadow(0 0 8px var(--accent2))}100%{filter:none}}
+  #bcanvas.controlling{cursor:none}
+  .mediaitem{display:flex;align-items:center;gap:8px;padding:7px 4px;border-bottom:1px solid #2a2a40;font-size:13px}
+  .mediaitem:last-child{border-bottom:none}
+  .mediaitem .mi-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mediaitem .mi-kind{color:var(--muted);font-size:11px;text-transform:uppercase}
   .overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
            flex-direction:column;gap:10px;background:rgba(5,5,10,.75);cursor:pointer;z-index:5;
            font-size:16px;text-align:center;padding:20px}
@@ -1188,6 +1222,7 @@ WATCH_HTML = r"""<!DOCTYPE html>
       <div id="bwrap" class="hidden" style="position:absolute;inset:0;background:#000">
         <canvas id="bcanvas" tabindex="0"
                 style="width:100%;height:100%;display:block;outline:none"></canvas>
+        <div id="bcursor"><svg viewBox="0 0 24 24"><path d="M4 2 L4 20 L9 15 L12.5 22 L15 21 L11.5 14 L18 14 Z" fill="#fff" stroke="#222" stroke-width="1.2"/></svg></div>
       </div>
       <div class="overlay hidden" id="failOvl">
         <div class="big">🚫</div>
@@ -1211,8 +1246,10 @@ WATCH_HTML = r"""<!DOCTYPE html>
         <input id="burl" placeholder="Go to URL or search…"
                style="flex:1;min-width:140px;background:var(--panel2);border:1px solid #333350;color:var(--text);border-radius:8px;padding:8px 10px;font-size:13px"
                onkeydown="if(event.key==='Enter'&&this.value.trim()){send({t:'browser_nav',url:this.value.trim()});this.value=''}">
+        <button id="bmediaBtn" onclick="requestMedia()">📹 Media <span id="bmediaN"></span></button>
         <button class="danger" onclick="send({t:'browser_stop'})">✖ Close browser</button>
       </div>
+      <div id="bmediaList" class="hidden" style="margin-top:10px;border-top:1px solid #2a2a40;padding-top:10px"></div>
     </div>
     <div class="card">
       <div class="addrow">
@@ -1309,6 +1346,8 @@ function connect(){
     else if(d.t==='sync') applySync(d);
     else if(d.t==='chat') addMsg(d);
     else if(d.t==='progress') updateProgress(d);
+    else if(d.t==='bcursor') showCursor(d);
+    else if(d.t==='bmedia') showMedia(d);
   };
 }
 
@@ -1405,12 +1444,50 @@ function updateBrowserView(){
     const b = st.browser;
     document.getElementById('bwho').textContent = b.status==='starting'
       ? '⏳ starting Firefox…' : '🖱 '+(b.controller||'?')+' has control';
-    document.getElementById('bctl').style.display = amController() ? 'none' : '';
-    document.getElementById('burl').style.display = amController() ? '' : 'none';
+    const mine = amController();
+    document.getElementById('bctl').style.display = mine ? 'none' : '';
+    document.getElementById('burl').style.display = mine ? '' : 'none';
+    document.getElementById('bcanvas').classList.toggle('controlling', mine);
+    const mn = document.getElementById('bmediaN');
+    if(mn) mn.textContent = b.media_count ? '('+b.media_count+')' : '';
     if(!bPlayer && b.status==='running') startStream();
   } else {
     stopStream();
+    document.getElementById('bcursor').style.display='none';
+    document.getElementById('bmediaList').classList.add('hidden');
   }
+}
+function showCursor(d){
+  if(!browserActive()) return;
+  const wrap=document.getElementById('bwrap'), cur=document.getElementById('bcursor');
+  const r=wrap.getBoundingClientRect();
+  cur.style.display='block';
+  cur.style.left=(d.x*r.width)+'px';
+  cur.style.top=(d.y*r.height)+'px';
+  if(d.down){ cur.classList.remove('click'); void cur.offsetWidth; cur.classList.add('click'); }
+}
+function requestMedia(){
+  send({t:'browser_media'});
+  const el=document.getElementById('bmediaList');
+  el.classList.remove('hidden');
+  el.innerHTML='<div class="empty" style="padding:8px 0">Scanning page…</div>';
+}
+function showMedia(d){
+  const el=document.getElementById('bmediaList');
+  el.classList.remove('hidden');
+  if(!d.items || !d.items.length){
+    el.innerHTML='<div class="empty" style="padding:8px 0">No media detected yet — start playing something on the page, then tap 📹 again.</div>';
+    return;
+  }
+  el.innerHTML = d.items.map(m=>
+    `<div class="mediaitem"><span class="mi-kind">${esc(m.kind)}</span>`+
+    `<span class="mi-name" title="${esc(m.url)}">${esc(m.name)} <span style="color:var(--muted)">${esc(m.mime)}</span></span>`+
+    `<button class="primary" onclick='pickMedia(${JSON.stringify(m.url)})'>Add</button></div>`).join('');
+}
+function pickMedia(url){
+  send({t:'browser_pick', url});
+  toast('📹 Added to the queue — resolving…');
+  document.getElementById('bmediaList').classList.add('hidden');
 }
 function startStream(){
   if(typeof JSMpeg === 'undefined'){ toast('❌ stream player failed to load'); return; }

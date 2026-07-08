@@ -5,6 +5,11 @@ screen + audio with ffmpeg and streams MPEG-TS chunks to viewers over the
 existing websocket route — no extra ports, no WebRTC. One participant holds
 control; their mouse/keyboard is injected with XTEST (python-xlib).
 
+Firefox is launched with WebDriver BiDi (--remote-debugging-port) which gives
+us two things: reliable URL navigation, and a DevTools-style feed of every
+media response the page loads (network.responseCompleted) so users can grab
+media that yt-dlp can't resolve on its own.
+
 Per session:
     Xtightvnc :9N          virtual 1280x720 display (VNC port bound to localhost,
                            never actually used - we only want the X server)
@@ -24,6 +29,8 @@ import shutil
 import signal
 import time
 
+import aiohttp
+
 HAS_XVFB = bool(shutil.which('Xvfb'))
 
 logger = logging.getLogger('MusicBot.CoBrowser')
@@ -34,6 +41,10 @@ MAX_SESSIONS = 2
 IDLE_STOP = 180          # seconds with zero viewers before auto-stop
 MAX_LIFETIME = 4 * 3600
 DISPLAY_BASE = 91        # :91, :92, ...
+RDP_BASE = 9300          # Firefox WebDriver BiDi port = RDP_BASE + display num
+MEDIA_EXT = ('.mp4', '.m3u8', '.mpd', '.webm', '.ts', '.m4s', '.mp3', '.m4a',
+             '.mov', '.mkv', '.ogg', '.flac', '.aac')
+MEDIA_MAX = 60
 PROFILE_ROOT = os.path.expanduser('~/snap/firefox/common/wt-rooms')
 ADGUARD_XPI = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'webstatic', 'adguard.xpi')
@@ -100,10 +111,21 @@ class CoBrowserSession:
         self._reader_task = None
         self._watchdog_task = None
         self._audio_ok = False
+        # WebDriver BiDi (navigation + DevTools-style media sniffing)
+        self.rdp_port = None
+        self.bidi_ctx = None           # top-level browsing context id
+        self.page_url = None
+        self.media = []                # [{url, mime, kind, name}] seen on page
+        self._bidi_sess = None         # aiohttp ClientSession
+        self._bidi_ws = None
+        self._bidi_mid = 0
+        self._bidi_task = None
+        self._initial_url = None
 
     # ------------------------------------------------------------ lifecycle
 
     async def start(self, url, adblock=True):
+        self._initial_url = url
         num = self._pick_display()
         self.display = f':{num}'
         self.sink = f'wt{num}'
@@ -166,12 +188,15 @@ class CoBrowserSession:
         except FileNotFoundError:
             self._audio_ok = False
 
-        # 4. firefox
+        # 4. firefox (with WebDriver BiDi for navigation + media sniffing)
+        self.rdp_port = RDP_BASE + num
         env = {**os.environ, 'DISPLAY': self.display, 'MOZ_ENABLE_WAYLAND': '0'}
         if self._audio_ok:
             env['PULSE_SINK'] = self.sink
         self.procs['ff'] = await asyncio.create_subprocess_exec(
             'firefox', '--no-remote', '--new-instance', '--profile', profile,
+            f'--remote-debugging-port={self.rdp_port}',
+            '--remote-allow-hosts=localhost',
             url or 'https://duckduckgo.com',
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             env=env, start_new_session=True)
@@ -183,7 +208,9 @@ class CoBrowserSession:
         enc_stdin = None
         cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
         if HAS_XVFB:
-            cmd += ['-f', 'x11grab', '-framerate', str(FPS),
+            # draw_mouse 0: the client renders a synthetic cursor for everyone
+            # (also the only option on the xwd path), so keep it consistent
+            cmd += ['-f', 'x11grab', '-draw_mouse', '0', '-framerate', str(FPS),
                     '-video_size', f'{WIDTH}x{HEIGHT}', '-i', self.display]
         else:
             r_fd, w_fd = os.pipe()
@@ -199,8 +226,9 @@ class CoBrowserSession:
                     '-f', 'image2pipe', '-vcodec', 'xwd', '-i', '-']
         if self._audio_ok:
             cmd += ['-f', 'pulse', '-i', f'{self.sink}.monitor']
-        cmd += ['-c:v', 'mpeg1video', '-b:v', '2500k', '-maxrate', '3000k',
-                '-bufsize', '1000k', '-bf', '0', '-g', str(FPS),
+        # higher bitrate keeps text/UI readable (mpeg1 is not efficient)
+        cmd += ['-c:v', 'mpeg1video', '-b:v', '4000k', '-maxrate', '5000k',
+                '-bufsize', '1200k', '-bf', '0', '-g', str(FPS),
                 '-r', str(FPS), '-fps_mode', 'cfr']
         if self._audio_ok:
             cmd += ['-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2']
@@ -218,8 +246,167 @@ class CoBrowserSession:
         self.status = 'running'
         self._reader_task = asyncio.create_task(self._reader())
         self._watchdog_task = asyncio.create_task(self._watchdog())
+        # BiDi is best-effort: navigation falls back to keystrokes and media
+        # sniffing just stays empty if it can't connect
+        self._bidi_task = asyncio.create_task(self._bidi_connect())
         logger.info(f"🌐 co-browser up for {self.room_id} on {self.display} "
                     f"(audio={'yes' if self._audio_ok else 'no'})")
+
+    # ------------------------------------------------------------ BiDi
+
+    async def _bidi_send(self, method, params=None):
+        self._bidi_mid += 1
+        mid = self._bidi_mid
+        await self._bidi_ws.send_json(
+            {'id': mid, 'method': method, 'params': params or {}})
+        return mid
+
+    async def _bidi_call(self, method, params=None, timeout=15):
+        """Send a command and await its result, buffering events meanwhile."""
+        mid = await self._bidi_send(method, params)
+        end = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < end:
+            msg = await self._bidi_ws.receive(
+                timeout=max(1, end - asyncio.get_event_loop().time()))
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                raise RuntimeError('bidi socket closed')
+            d = json.loads(msg.data)
+            if d.get('id') == mid:
+                if d.get('type') == 'error':
+                    raise RuntimeError(d.get('message', 'bidi error'))
+                return d.get('result', {})
+            self._handle_bidi_event(d)
+        raise asyncio.TimeoutError(f'bidi {method} timed out')
+
+    async def _bidi_connect(self):
+        ws_url = f'ws://127.0.0.1:{self.rdp_port}/session'
+        for _ in range(60):
+            if self.status != 'running':
+                return
+            try:
+                self._bidi_sess = aiohttp.ClientSession()
+                self._bidi_ws = await self._bidi_sess.ws_connect(
+                    ws_url, max_msg_size=0)
+                break
+            except Exception:
+                await self._bidi_sess.close()
+                self._bidi_sess = None
+                await asyncio.sleep(0.5)
+        if not self._bidi_ws:
+            logger.warning(f"BiDi never came up for {self.room_id}")
+            return
+        try:
+            await self._bidi_call('session.new', {'capabilities': {}})
+            await self._bidi_call('session.subscribe', {'events': [
+                'network.responseCompleted', 'browsingContext.load',
+                'browsingContext.contextCreated']})
+            tree = await self._bidi_call('browsingContext.getTree', {})
+            ctxs = tree.get('contexts', [])
+            # keep one tab we control; drop extras (e.g. AdGuard's welcome tab)
+            keep = None
+            for c in ctxs:
+                if 'adguard' not in (c.get('url') or '').lower():
+                    keep = c
+                    break
+            keep = keep or (ctxs[0] if ctxs else None)
+            if keep:
+                self.bidi_ctx = keep['context']
+                self.page_url = keep.get('url')
+                for c in ctxs:
+                    if c['context'] != self.bidi_ctx:
+                        try:
+                            await self._bidi_call('browsingContext.close',
+                                                  {'context': c['context']})
+                        except Exception:
+                            pass
+                try:
+                    await self._bidi_call('browsingContext.activate',
+                                          {'context': self.bidi_ctx})
+                except Exception:
+                    pass
+                # reload the intended page through BiDi so its media requests
+                # are captured (the launch-arg load happened before we subscribed)
+                if self._initial_url:
+                    try:
+                        await self._bidi_call(
+                            'browsingContext.navigate',
+                            {'context': self.bidi_ctx, 'url': self._initial_url,
+                             'wait': 'none'})
+                    except Exception:
+                        pass
+            await self._bidi_loop()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"BiDi loop ended for {self.room_id}: {e}")
+
+    def _handle_bidi_event(self, d):
+        method = d.get('method')
+        if method == 'network.responseCompleted':
+            self._note_media(d['params'].get('response', {}))
+        elif method == 'browsingContext.contextCreated':
+            p = d['params']
+            # a new top-level tab (e.g. target=_blank) becomes the live one
+            if not p.get('parent'):
+                self.bidi_ctx = p.get('context')
+                self.media = []
+                asyncio.create_task(self._activate_ctx(self.bidi_ctx))
+        elif method == 'browsingContext.load':
+            p = d['params']
+            if p.get('context') == self.bidi_ctx:
+                self.page_url = p.get('url')
+
+    async def _activate_ctx(self, ctx):
+        try:
+            await self._bidi_send('browsingContext.activate', {'context': ctx})
+        except Exception:
+            pass
+
+    async def _bidi_loop(self):
+        while self.status == 'running':
+            try:
+                msg = await self._bidi_ws.receive(timeout=30)
+            except asyncio.TimeoutError:
+                continue
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                break
+            self._handle_bidi_event(json.loads(msg.data))
+
+    def _note_media(self, resp):
+        url = resp.get('url', '')
+        if not url or url.startswith(('data:', 'blob:')):
+            return
+        mime = (resp.get('mimeType') or '').lower()
+        base = url.split('?')[0].lower()
+        is_media = (any(x in mime for x in
+                        ('video/', 'audio/', 'mpegurl', 'mp2t', 'dash+xml'))
+                    or base.endswith(MEDIA_EXT))
+        if not is_media:
+            return
+        if base.endswith(('.m3u8', '.mpd')):
+            kind = 'manifest'
+        elif base.endswith(('.ts', '.m4s')):
+            kind = 'segment'
+        else:
+            kind = 'file'
+        for m in self.media:
+            if m['url'] == url:
+                return
+        name = url.split('?')[0].rstrip('/').split('/')[-1] or url
+        self.media.append({'url': url, 'mime': mime or '?',
+                           'kind': kind, 'name': name[:80]})
+        if len(self.media) > MEDIA_MAX:
+            del self.media[0]
+
+    def get_media(self):
+        """DevTools-style list of media on the page, most useful first.
+        Segments are collapsed away when a manifest is present."""
+        manifests = [m for m in self.media if m['kind'] == 'manifest']
+        files = [m for m in self.media if m['kind'] == 'file']
+        out = manifests + files
+        if not out:   # only loose segments seen — offer them as a last resort
+            out = [m for m in self.media if m['kind'] == 'segment'][-10:]
+        return out[-30:]
 
     def _open_xlib(self):
         from Xlib import display as xdisplay
@@ -228,17 +415,41 @@ class CoBrowserSession:
     def _pick_display(self):
         used = {s.display for s in sessions.values() if s.display}
         for n in range(DISPLAY_BASE, DISPLAY_BASE + 10):
-            if f':{n}' not in used and not os.path.exists(f'/tmp/.X11-unix/X{n}'):
-                return n
+            if f':{n}' in used:
+                continue
+            lock = f'/tmp/.X{n}-lock'
+            # the X lock file holds the server's pid; if that pid is alive the
+            # display is really in use, otherwise the lock is stale
+            if os.path.exists(lock):
+                try:
+                    pid = int(open(lock).read().strip())
+                    os.kill(pid, 0)
+                    continue          # live X server -> taken
+                except PermissionError:
+                    continue          # exists but not ours -> taken
+                except (ValueError, ProcessLookupError, OSError):
+                    pass              # unreadable / dead -> stale, reclaim
+            for stale in (f'/tmp/.X11-unix/X{n}', lock):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            return n
         raise RuntimeError('no free display')
 
     async def stop(self):
         if self.status == 'stopped':
             return
         self.status = 'stopped'
-        for task in (self._reader_task, self._watchdog_task):
+        for task in (self._reader_task, self._watchdog_task, self._bidi_task):
             if task:
                 task.cancel()
+        for closable in (self._bidi_ws, self._bidi_sess):
+            if closable:
+                try:
+                    await closable.close()
+                except Exception:
+                    pass
         for name in ('enc', 'grab', 'ff', 'wm', 'x'):
             proc = self.procs.get(name)
             if proc and proc.returncode is None:
@@ -400,9 +611,32 @@ class CoBrowserSession:
             self.key('down', 'Enter' if ch == '\n' else ch)
 
     async def navigate(self, url):
-        """Focus the browser, then ctrl+l, type the url, enter."""
-        if not self._xd or self.status != 'running':
+        """Navigate via BiDi (reliable); fall back to faking Ctrl+L + typing."""
+        if self.status != 'running':
             return
+        if not url:
+            return
+        if '://' not in url and not url.startswith('about:'):
+            # bare text -> treat like the awesomebar (search or domain)
+            url = ('https://' + url if '.' in url and ' ' not in url
+                   else 'https://duckduckgo.com/?q=' + url.replace(' ', '+'))
+        # BiDi attaches a few seconds after launch; wait so early navigations
+        # don't lose their media capture to the keystroke fallback
+        for _ in range(24):
+            if self.bidi_ctx or self.status != 'running':
+                break
+            await asyncio.sleep(0.5)
+        self.media = []   # new page, forget the old page's media
+        if self._bidi_ws and self.bidi_ctx:
+            try:
+                await self._bidi_send('browsingContext.activate',
+                                      {'context': self.bidi_ctx})
+                await self._bidi_send('browsingContext.navigate',
+                                      {'context': self.bidi_ctx, 'url': url,
+                                       'wait': 'none'})
+                return
+            except Exception as e:
+                logger.debug(f"BiDi navigate failed, using keys: {e}")
         loop = asyncio.get_running_loop()
 
         def _nav():
@@ -447,10 +681,26 @@ class CoBrowserSession:
             'started_by': self.started_by,
             'viewers': len(self.viewers),
             'audio': self._audio_ok,
+            'page_url': self.page_url,
+            'media_count': len(self.get_media()),
         }
 
 
 sessions = {}   # room_id -> CoBrowserSession
+
+
+def cleanup_orphans():
+    """On bot startup, kill co-browser processes leaked by a previous run and
+    clear the X locks/sockets they left behind (they're detached, so a bot
+    restart doesn't take them down)."""
+    os.system(
+        "pkill -9 -f 'wt-rooms' 2>/dev/null; "
+        "for n in $(seq %d %d); do "
+        "  pkill -9 -f \"Xtightvnc :$n \" 2>/dev/null; "
+        "  pkill -9 -f \"Xvfb :$n \" 2>/dev/null; "
+        "  pkill -9 -f \"xfwm4 --display :$n\" 2>/dev/null; "
+        "  rm -f /tmp/.X$n-lock /tmp/.X11-unix/X$n 2>/dev/null; "
+        "done" % (DISPLAY_BASE, DISPLAY_BASE + 9))
 
 
 def get(room_id):
