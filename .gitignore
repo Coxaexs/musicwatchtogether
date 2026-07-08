@@ -1,0 +1,53 @@
+# ---- secrets (NEVER commit) ----
+.env
+.env.local
+*.key
+friend.conf
+friend*.conf
+*.pem
+env config
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+venv/
+
+# ---- large media / caches ----
+musics/
+lyrics/
+watch_cache/
+reels_cache/
+*.mp3
+*.m4a
+*.opus
+*.webm
+*.mp4
+*.mkv
+*.ts
+
+# vendored browser assets (re-downloadable; see webstatic/README)
+webstatic/adguard.xpi
+
+# ---- logs ----
+*.log
+logs/
+backups/
+
+# ---- runtime state (per-deployment, not source) ----
+player_state.json
+watch_tokens.json
+web_tokens.json
+reels_profiles.json
+room_settings.json
+favorites.json
+playlists.json
+stats.jsonl
+.cache
+
+# ---- editor / os ----
+.DS_Store
+.idea/
+.vscode/
