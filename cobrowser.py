@@ -122,6 +122,67 @@ def _classify_media(url, mime):
     return 'file'
 
 
+# mime types that are definitely NOT media (skip probing these)
+_NONMEDIA_MIME = ('text/html', 'text/css', 'application/json', 'image/',
+                  'font/', 'application/javascript', 'text/javascript',
+                  'application/x-javascript', 'application/font',
+                  'application/wasm', 'text/xml;charset', 'application/xml')
+# generic mimes that hide media (need a content probe to be sure)
+_GENERIC_MIME = ('text/plain', 'application/octet-stream',
+                 'binary/octet-stream', 'application/binary', '', '?')
+
+
+def _is_media_candidate(url, mime):
+    """A response worth *probing*: extension/mime are ambiguous but it could
+    be media in disguise (e.g. an .m3u8/.mp4 served as .txt / text/plain)."""
+    if not url or url.startswith(('data:', 'blob:')):
+        return False
+    if _classify_media(url, mime):
+        return False   # already known media, no probe needed
+    m = (mime or '').lower()
+    if any(x and x in m for x in _NONMEDIA_MIME):
+        return False
+    base = url.split('?')[0].lower()
+    if base.endswith(('.js', '.css', '.json', '.html', '.htm', '.svg',
+                      '.png', '.jpg', '.jpeg', '.gif', '.webp', '.woff',
+                      '.woff2', '.ico', '.xml')):
+        return False
+    # generic mime, or a hint word in the path, is enough to probe it
+    hinted = any(w in base for w in
+                 ('m3u8', 'mpd', 'hls', 'dash', 'playlist', 'chunklist',
+                  'manifest', 'segment', 'video', 'audio', 'stream', 'media',
+                  'chunk', '.txt', 'index'))
+    return any(m == g for g in _GENERIC_MIME) or hinted
+
+
+def _sniff_bytes(head):
+    """Identify media from the first bytes of a response body."""
+    if not head:
+        return None
+    txt_head = head[:64].lstrip()
+    if txt_head[:7] == b'#EXTM3U':
+        return 'manifest'          # HLS playlist (master or media)
+    low = head[:512].lower()
+    if txt_head[:5] == b'<?xml' and b'<mpd' in low:
+        return 'manifest'          # MPEG-DASH
+    if len(head) >= 12 and head[4:8] == b'ftyp':
+        return 'file'              # MP4 / MOV / fMP4
+    if head[:4] == b'\x1aE\xdf\xa3':
+        return 'file'              # WebM / Matroska (EBML)
+    if head[:3] == b'FLV':
+        return 'file'              # Flash video
+    if head[:4] == b'RIFF' and head[8:12] in (b'AVI ', b'WAVE'):
+        return 'file'              # AVI / WAV
+    if head[:3] == b'ID3' or head[:2] in (b'\xff\xfb', b'\xff\xf3', b'\xff\xf2'):
+        return 'file'              # MP3
+    if head[:4] == b'OggS':
+        return 'file'              # Ogg
+    # MPEG-TS: 0x47 sync byte at 0 and again 188 bytes later
+    if head[:1] == b'\x47' and len(head) > 188 and head[188:189] == b'\x47':
+        return 'segment'
+    return None
+
+
 def _bidi_req_headers(params):
     """Pull replayable request headers out of a BiDi network event."""
     out = {}
@@ -133,6 +194,47 @@ def _bidi_req_headers(params):
                 val = val.get('value')
             if isinstance(val, str) and val:
                 out[name.title() if name != 'user-agent' else 'User-Agent'] = val
+    return out
+
+
+async def _probe_candidate(session, cand):
+    """Fetch the first bytes of a disguised response and reclassify it by
+    content. Returns an updated media dict or None."""
+    hdrs = dict(cand.get('headers') or {})
+    hdrs['Range'] = 'bytes=0-2047'
+    try:
+        async with session.get(cand['url'], headers=hdrs,
+                               allow_redirects=True,
+                               timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status >= 400:
+                return None
+            head = await r.content.read(2048)
+    except Exception:
+        return None
+    kind = _sniff_bytes(head)
+    if not kind:
+        return None
+    label = {'manifest': 'HLS/DASH', 'segment': 'TS segment',
+             'file': 'video'}[kind]
+    name = cand['name']
+    return {**cand, 'kind': kind,
+            'name': f'{name}  ·  detected {label}',
+            'mime': cand.get('mime') or '?'}
+
+
+async def _probe_all(candidates, limit=16):
+    """Probe up to `limit` disguised candidates concurrently."""
+    if not candidates:
+        return []
+    async with aiohttp.ClientSession() as session:
+        tasks = [_probe_candidate(session, c) for c in candidates[:limit]]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    out = []
+    seen = set()
+    for r in results:
+        if isinstance(r, dict) and r['url'] not in seen:
+            seen.add(r['url'])
+            out.append(r)
     return out
 
 
@@ -160,6 +262,8 @@ class CoBrowserSession:
         self.bidi_ctx = None           # top-level browsing context id
         self.page_url = None
         self.media = []                # [{url, mime, kind, name}] seen on page
+        self.media_candidates = []     # disguised responses awaiting a probe
+        self._probed_urls = set()      # candidates already probed
         self._bidi_sess = None         # aiohttp ClientSession
         self._bidi_ws = None
         self._bidi_mid = 0
@@ -415,6 +519,8 @@ class CoBrowserSession:
             if not p.get('parent'):
                 self.bidi_ctx = p.get('context')
                 self.media = []
+                self.media_candidates = []
+                self._probed_urls = set()
                 asyncio.create_task(self._activate_ctx(self.bidi_ctx))
         elif method == 'browsingContext.load':
             p = d['params']
@@ -440,18 +546,43 @@ class CoBrowserSession:
     def _note_media(self, resp, headers=None):
         url = resp.get('url', '')
         mime = (resp.get('mimeType') or '').lower()
-        kind = _classify_media(url, mime)
-        if not kind:
+        if 'adguard' in url.lower():
             return
-        for m in self.media:
-            if m['url'] == url:
+        kind = _classify_media(url, mime)
+        if kind:
+            if any(m['url'] == url for m in self.media):
                 return
-        name = url.split('?')[0].rstrip('/').split('/')[-1] or url
-        self.media.append({'url': url, 'mime': mime or '?',
-                           'kind': kind, 'name': name[:80],
-                           'headers': headers or {}})
-        if len(self.media) > MEDIA_MAX:
-            del self.media[0]
+            name = url.split('?')[0].rstrip('/').split('/')[-1] or url
+            self.media.append({'url': url, 'mime': mime or '?',
+                               'kind': kind, 'name': name[:80],
+                               'headers': headers or {}})
+            if len(self.media) > MEDIA_MAX:
+                del self.media[0]
+        elif _is_media_candidate(url, mime):
+            if url in self._probed_urls or \
+                    any(c['url'] == url for c in self.media_candidates) or \
+                    len(self.media_candidates) >= 40:
+                return
+            name = url.split('?')[0].rstrip('/').split('/')[-1] or url
+            self.media_candidates.append({'url': url, 'mime': mime or '?',
+                                          'kind': 'file', 'name': name[:80],
+                                          'headers': headers or {}})
+
+    async def probe_candidates(self):
+        """Content-probe disguised responses and promote confirmed media into
+        the live list. Called when someone opens the media picker."""
+        pending = [c for c in self.media_candidates
+                   if c['url'] not in self._probed_urls]
+        if not pending:
+            return
+        for c in pending:
+            self._probed_urls.add(c['url'])
+        known = {m['url'] for m in self.media}
+        for m in await _probe_all(pending):
+            if m['url'] not in known:
+                self.media.append(m)
+                if len(self.media) > MEDIA_MAX:
+                    del self.media[0]
 
     def get_media(self):
         """DevTools-style list of media on the page, most useful first.
@@ -473,6 +604,12 @@ class CoBrowserSession:
                 h.setdefault('Referer', self.page_url or url)
                 return h
         return {'Referer': self.page_url} if self.page_url else {}
+
+    def media_kind(self, url):
+        for m in self.media:
+            if m['url'] == url:
+                return m.get('kind')
+        return None
 
     def _open_xlib(self):
         from Xlib import display as xdisplay
@@ -703,6 +840,8 @@ class CoBrowserSession:
                 break
             await asyncio.sleep(0.5)
         self.media = []   # new page, forget the old page's media
+        self.media_candidates = []
+        self._probed_urls = set()
         if self._bidi_ws and self.bidi_ctx:
             try:
                 await self._bidi_send('browsingContext.activate',
@@ -861,6 +1000,7 @@ async def sniff_media(page_url, wait=20, adblock=True):
             env={**os.environ, 'MOZ_ENABLE_WAYLAND': '0'},
             start_new_session=True)
         found = []
+        candidates = []   # disguised responses to content-probe afterwards
         sess = ws = None
         try:
             for _ in range(50):
@@ -885,15 +1025,24 @@ async def sniff_media(page_url, wait=20, adblock=True):
                 resp = p.get('response', {})
                 url = resp.get('url', '')
                 mime = (resp.get('mimeType') or '').lower()
-                kind = _classify_media(url, mime)
-                if not kind or any(m['url'] == url for m in found):
-                    return
                 if 'adguard' in url.lower():
                     return   # noise from our own injected adblock extension
-                name = url.split('?')[0].rstrip('/').split('/')[-1] or url
-                found.append({'url': url, 'mime': mime or '?', 'kind': kind,
-                              'name': name[:80],
-                              'headers': _bidi_req_headers(p)})
+                kind = _classify_media(url, mime)
+                if kind:
+                    if any(m['url'] == url for m in found):
+                        return
+                    name = url.split('?')[0].rstrip('/').split('/')[-1] or url
+                    found.append({'url': url, 'mime': mime or '?', 'kind': kind,
+                                  'name': name[:80],
+                                  'headers': _bidi_req_headers(p)})
+                elif _is_media_candidate(url, mime):
+                    if any(c['url'] == url for c in candidates) or \
+                            len(candidates) >= 40:
+                        return
+                    name = url.split('?')[0].rstrip('/').split('/')[-1] or url
+                    candidates.append({'url': url, 'mime': mime or '?',
+                                       'kind': 'file', 'name': name[:80],
+                                       'headers': _bidi_req_headers(p)})
 
             async def call(method, params=None, timeout=15):
                 mid[0] += 1
@@ -961,6 +1110,11 @@ async def sniff_media(page_url, wait=20, adblock=True):
             except (ProcessLookupError, PermissionError):
                 pass
             shutil.rmtree(prof, ignore_errors=True)
+        # content-probe disguised responses (e.g. an .m3u8 served as .txt) and
+        # fold the confirmed ones in, skipping any already found by extension
+        known = {m['url'] for m in found}
+        probed = await _probe_all([c for c in candidates if c['url'] not in known])
+        found.extend(probed)
         # manifests and files first; loose segments only if nothing better
         best = [m for m in found if m['kind'] != 'segment']
         return (best or [m for m in found if m['kind'] == 'segment'][-8:])[:20]

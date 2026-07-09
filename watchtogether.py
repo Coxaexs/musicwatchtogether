@@ -386,6 +386,58 @@ def _blocking_download(url, cache_dir, vertical, progress_cb,
     return os.path.basename(files[0]), info
 
 
+def _blocking_ffmpeg_dl(url, headers, cache_dir, uid, kind=None):
+    """Direct download with ffmpeg (stream-copy). Handles disguised media -
+    a .m3u8/.mp4 served as .txt/text-plain - that yt-dlp refuses. Uses the
+    browser's replay headers so protected CDNs accept the request."""
+    import subprocess
+    out = os.path.join(cache_dir, f'{uid}.mp4')
+    hdr_blob = ''.join(f'{k}: {v}\r\n' for k, v in (headers or {}).items()
+                       if k.lower() != 'range')
+    ua = (headers or {}).get('User-Agent')
+
+    def _base():
+        c = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y']
+        if hdr_blob:
+            c += ['-headers', hdr_blob]
+        if ua:
+            c += ['-user_agent', ua]
+        return c
+
+    # attempts: force the HLS demuxer first when we know it's a manifest (a
+    # .txt-disguised m3u8 won't auto-probe), then plain copy, then transcode
+    tail = ['-c', 'copy', '-bsf:a', 'aac_adtstoasc', '-movflags', '+faststart', out]
+    force_hls = ['-f', 'hls', '-i', url]
+    plain = ['-i', url]
+    transcode = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                 '-c:a', 'aac', '-movflags', '+faststart', out]
+    attempts = []
+    if kind == 'manifest':
+        attempts += [_base() + force_hls + tail, _base() + plain + tail,
+                     _base() + force_hls + transcode]
+    else:
+        attempts += [_base() + plain + tail, _base() + force_hls + tail,
+                     _base() + plain + transcode]
+
+    last = 'ffmpeg failed'
+    for cmd in attempts:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=3600)
+        except subprocess.TimeoutExpired:
+            last = 'ffmpeg timed out'
+            continue
+        if proc.returncode == 0 and os.path.isfile(out) and \
+                os.path.getsize(out) > 1024:
+            return os.path.basename(out)
+        last = proc.stderr.decode(errors='replace')[-200:] or last
+        if os.path.isfile(out):
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+    raise RuntimeError(last)
+
+
 def _trim_cache(cache_dir, keep, protected):
     try:
         files = [f for f in glob.glob(os.path.join(cache_dir, '*.*'))
@@ -471,8 +523,23 @@ async def _download_item(room, item):
             item['height'] = info.get('height')
             item['status'] = 'ready'
         except Exception as e:
-            logger.error(f"watch download failed for {item.get('url')}: {e}")
-            _set_embed_fallback(item, e)
+            # sniffed/picked direct URLs (which carry replay headers) can be
+            # disguised media yt-dlp won't touch — ffmpeg copy handles a bare
+            # .m3u8/.mp4 regardless of extension or mime
+            if hdrs is not None:
+                try:
+                    item['progress'] = 0
+                    fname = await loop.run_in_executor(
+                        None, _blocking_ffmpeg_dl, item['url'], hdrs,
+                        cache_dir, item['uid'], item.get('_media_kind'))
+                    item['file'] = fname
+                    item['status'] = 'ready'
+                except Exception as e2:
+                    logger.error(f"ffmpeg fallback failed for {item.get('url')}: {e2}")
+                    _set_embed_fallback(item, e2)
+            else:
+                logger.error(f"watch download failed for {item.get('url')}: {e}")
+                _set_embed_fallback(item, e)
         _trim_cache(cache_dir,
                     MAX_REELS_CACHE if room.mode == 'reels' else MAX_WATCH_CACHE,
                     _protected_files())
@@ -1070,6 +1137,12 @@ async def ws_handler(request):
             elif t == 'browser_media':
                 sess = cobrowser.get(room.id) if cobrowser else None
                 if sess:
+                    # content-probe any disguised responses (e.g. an .m3u8
+                    # served as .txt) before handing back the list
+                    try:
+                        await sess.probe_candidates()
+                    except Exception:
+                        pass
                     await ws.send_str(json.dumps(
                         {'t': 'bmedia', 'items': sess.get_media(),
                          'page': sess.page_url}))
@@ -1090,6 +1163,7 @@ async def ws_handler(request):
                         'status': 'pending', 'progress': 0, 'file': None,
                         'added_by': name, 'likes': 0, 'tags': [],
                         '_http_headers': sess.media_headers(url),
+                        '_media_kind': sess.media_kind(url),
                     }
                     room.queue.append(item)
                     await _broadcast_state(room)
@@ -1105,6 +1179,7 @@ async def ws_handler(request):
                     item['_http_headers'] = \
                         (item.get('_choice_headers') or {}).get(url) or {}
                     item['_http_headers'].setdefault('Referer', item['url'])
+                    item['_media_kind'] = chosen.get('kind')
                     item['url'] = url
                     item['title'] = chosen.get('name') or item['title']
                     item['status'] = 'pending'
