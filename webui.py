@@ -459,15 +459,46 @@ INDEX_HTML = r"""<!DOCTYPE html>
   :root {
     --bg: #12121a; --panel: #1c1c28; --panel2: #24243a; --text: #e8e8f0;
     --muted: #9a9ab0; --accent: #7c6cf0; --accent2: #4ec9a0; --danger: #e06c75;
-    --radius: 12px;
+    --border: #333350; --border2: #2a2a40; --card-border: transparent;
+    --bg-image: none; --radius: 12px;
+  }
+  body[data-theme="light"] {
+    --bg: #eef0f5; --panel: #ffffff; --panel2: #e7e9f2; --text: #23233a;
+    --muted: #6b6b80; --accent: #6a5ae0; --accent2: #1f9e77; --danger: #c94f4f;
+    --border: #d5d8e6; --border2: #e6e8f2; --card-border: #e0e2ee;
+  }
+  body[data-theme="modern"] {
+    --bg: #07090f; --panel: #10161f; --panel2: #1a2230; --text: #e6edf5;
+    --muted: #8b98ab; --accent: #38bdf8; --accent2: #4ade80; --danger: #f87171;
+    --border: #243044; --border2: #1c2636; --card-border: #ffffff12; --radius: 16px;
+    --bg-image: radial-gradient(900px 500px at 15% -10%, rgba(56,189,248,.13), transparent 60%),
+                radial-gradient(800px 500px at 100% 0%, rgba(124,108,240,.10), transparent 60%);
+  }
+  body[data-theme="vinyl-modern"] {
+    --bg: #161210; --panel: #211a15; --panel2: #2c231b; --text: #f2e9dd;
+    --muted: #a89a88; --accent: #e8843c; --accent2: #d4b06a; --danger: #d05f4a;
+    --border: #3a2f24; --border2: #332920; --card-border: #3a2f24; --radius: 14px;
+  }
+  body[data-theme="vinyl-classic"] {
+    --bg: #241708; --panel: #3b2713; --panel2: #4a3118; --text: #f4e6c8;
+    --muted: #c2a878; --accent: #c9932a; --accent2: #8fae5d; --danger: #c05436;
+    --border: #5a3d1e; --border2: #4d341a; --card-border: #5a3d1e;
+    --bg-image: repeating-linear-gradient(90deg, rgba(0,0,0,.10) 0px, rgba(0,0,0,.10) 2px, transparent 2px, transparent 7px),
+                linear-gradient(180deg, #2b1b0b, #201306);
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
+  body { margin: 0; background: var(--bg); background-image: var(--bg-image);
+         background-attachment: fixed; color: var(--text); min-height: 100vh;
          font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  body[data-theme="vinyl-classic"] { font-family: Georgia, 'Palatino Linotype', 'Times New Roman', serif; }
+  button, input, select { font-family: inherit; }
   .wrap { max-width: 860px; margin: 0 auto; padding: 16px; }
   h1 { font-size: 20px; margin: 8px 0 16px; display: flex; align-items: center; gap: 10px; }
   h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
   h1 .dot.on { background: var(--accent2); }
+  h1 select { margin-left: auto; background: var(--panel); color: var(--text);
+              border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px;
+              font-size: 13px; cursor: pointer; }
   .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
   .tab { background: var(--panel); border: 1px solid transparent; color: var(--text);
          padding: 8px 14px; border-radius: 999px; cursor: pointer; font-size: 14px;
@@ -475,7 +506,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .tab img { width: 20px; height: 20px; border-radius: 50%; }
   .tab.active { border-color: var(--accent); background: var(--panel2); }
   .tab .live { color: var(--accent2); font-size: 11px; }
-  .card { background: var(--panel); border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--card-border);
+          border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
+  body[data-theme="light"] .card { box-shadow: 0 1px 3px rgba(30,30,60,.08); }
+  body[data-theme="vinyl-classic"] .card { box-shadow: inset 0 1px 0 rgba(255,235,200,.05), 0 2px 8px rgba(0,0,0,.4); }
   .np { display: flex; gap: 16px; align-items: center; }
   .np img { width: 110px; height: 82px; object-fit: cover; border-radius: 8px; background: var(--panel2); }
   .np .title { font-size: 17px; font-weight: 600; margin-bottom: 4px; }
@@ -488,18 +522,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
            padding: 9px 14px; cursor: pointer; font-size: 14px; }
   button:hover { filter: brightness(1.2); }
   button.primary { background: var(--accent); }
+  body[data-theme="light"] button.primary { color: #fff; }
+  body[data-theme="modern"] button:not(.primary):not(.danger) { border: 1px solid var(--border); }
+  body[data-theme="modern"] button.primary { background: linear-gradient(135deg, #38bdf8, #6366f1); color: #fff; }
   button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
   button.toggled { outline: 2px solid var(--accent2); }
   .vol { display: flex; align-items: center; gap: 8px; margin-left: auto; color: var(--muted); font-size: 13px; }
   input[type=range] { accent-color: var(--accent); width: 120px; }
   .addrow { display: flex; gap: 8px; }
-  .addrow input[type=text] { flex: 1; background: var(--panel2); border: 1px solid #333350;
+  .addrow input[type=text] { flex: 1; background: var(--panel2); border: 1px solid var(--border);
       color: var(--text); border-radius: 8px; padding: 10px 12px; font-size: 14px; }
   .addrow input[type=text]:focus { outline: 1px solid var(--accent); }
   .qhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .qhead h2 { font-size: 15px; margin: 0; }
   .qitem { display: flex; align-items: center; gap: 10px; padding: 8px 6px;
-           border-bottom: 1px solid #2a2a40; font-size: 14px; }
+           border-bottom: 1px solid var(--border2); font-size: 14px; }
   .qitem:last-child { border-bottom: none; }
   .qitem .n { color: var(--muted); min-width: 22px; text-align: right; }
   .qitem .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -514,7 +551,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   #login { position: fixed; inset: 0; background: rgba(10,10,16,.92); display: none;
            align-items: center; justify-content: center; z-index: 10; }
   #login .box { background: var(--panel); padding: 24px; border-radius: var(--radius); width: 300px; }
-  #login input { width: 100%; margin: 12px 0; background: var(--panel2); border: 1px solid #333350;
+  #login input { width: 100%; margin: 12px 0; background: var(--panel2); border: 1px solid var(--border);
                  color: var(--text); border-radius: 8px; padding: 10px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
   .lyric-line {
@@ -530,11 +567,100 @@ INDEX_HTML = r"""<!DOCTYPE html>
     font-size: 18px;
     transform: scale(1.05);
   }
+
+  /* ---------- turntable (vinyl themes) ---------- */
+  .deck { position: relative; width: 380px; height: 336px; max-width: 100%;
+          margin: 0 auto; user-select: none; -webkit-user-select: none; }
+  .plinth { position: absolute; inset: 0 0 20px 0; border-radius: 18px; }
+  .platter { position: absolute; left: 22px; top: 28px; width: 264px; height: 264px; border-radius: 50%; }
+  .vinyl-wrap { position: absolute; left: 34px; top: 40px; width: 240px; height: 240px; }
+  .vinyl { position: absolute; inset: 0; border-radius: 50%; cursor: pointer;
+           box-shadow: 0 5px 16px rgba(0,0,0,.55); }
+  .disc { position: absolute; inset: 0; border-radius: 50%; will-change: transform;
+          background: repeating-radial-gradient(circle at 50% 50%, #101010 0px, #1b1b1b 1px, #0e0e0e 2px, #161616 3px);
+          box-shadow: inset 0 0 0 2px rgba(0,0,0,.8); }
+  .disc .label { position: absolute; inset: 33%; border-radius: 50%;
+                 background-size: cover; background-position: center;
+                 box-shadow: 0 0 0 3px rgba(0,0,0,.75), inset 0 0 10px rgba(0,0,0,.3); }
+  .vinyl .sheen { position: absolute; inset: 0; border-radius: 50%; pointer-events: none;
+    background: conic-gradient(from 40deg, transparent 0deg, rgba(255,255,255,.07) 24deg, transparent 60deg,
+                transparent 175deg, rgba(255,255,255,.05) 205deg, transparent 245deg); }
+  .vinyl .spindle { position: absolute; left: 50%; top: 50%; width: 9px; height: 9px;
+    margin: -4.5px 0 0 -4.5px; border-radius: 50%; z-index: 2;
+    background: radial-gradient(circle at 35% 30%, #eee, #888); box-shadow: 0 1px 2px rgba(0,0,0,.7); }
+  .arm-mount { position: absolute; right: 26px; top: 22px; width: 40px; height: 40px; z-index: 5; }
+  .tonearm { position: absolute; left: 50%; top: 50%; width: 12px; height: 204px;
+             margin-left: -6px; margin-top: -6px; transform-origin: 6px 6px;
+             cursor: grab; touch-action: none; will-change: transform; }
+  .tonearm:active { cursor: grabbing; }
+  .tonearm::before { content: ''; position: absolute; left: -14px; right: -14px; top: -32px; bottom: -8px; }
+  .tonearm .pivot { position: absolute; left: -4px; top: -4px; width: 20px; height: 20px;
+                    border-radius: 50%; box-shadow: 0 2px 5px rgba(0,0,0,.5); }
+  .tonearm .weight { position: absolute; left: -2px; top: -28px; width: 16px; height: 24px;
+                     border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,.4); }
+  .tonearm .shaft { position: absolute; left: 4px; top: 12px; width: 4px; height: 156px; border-radius: 2px; }
+  .tonearm .head { position: absolute; left: -2px; top: 166px; width: 16px; height: 28px;
+                   border-radius: 3px; box-shadow: 0 2px 4px rgba(0,0,0,.4); }
+  .tonearm .needle { position: absolute; left: 5px; top: 193px; width: 2px; height: 7px; }
+  .tonearm.lifted { filter: brightness(1.08); }
+  .tonearm.lifted .head { box-shadow: 0 12px 10px rgba(0,0,0,.5); }
+  .deck-hint { position: absolute; left: 0; right: 0; bottom: 0; text-align: center;
+               font-size: 11px; color: var(--muted); min-height: 14px; }
+  .vinyl-info { text-align: center; margin-top: 6px; }
+  .vinyl-info .title { font-size: 17px; font-weight: 600; margin-bottom: 4px; }
+  .vinyl-info .sub { color: var(--muted); font-size: 13px; }
+  .vinyl-info .times { justify-content: center; gap: 6px; margin-top: 6px; }
+  .vinyl-info .times span:first-child::after { content: ' /'; }
+  @media (max-width: 430px) {
+    .deck { transform: scale(.8); transform-origin: top center; margin-bottom: -60px; }
+  }
+
+  body[data-theme="vinyl-modern"] .plinth {
+    background: linear-gradient(180deg, #2b221a, #201913);
+    border: 1px solid #3d3126;
+    box-shadow: 0 12px 28px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.04);
+  }
+  body[data-theme="vinyl-modern"] .platter {
+    background: radial-gradient(circle, #0d0d0f 62%, #23232a 63%, #101014 72%, #17171c 100%);
+    box-shadow: 0 4px 12px rgba(0,0,0,.5), inset 0 0 0 1px rgba(255,255,255,.05);
+  }
+  body[data-theme="vinyl-modern"] .label { background-color: #e8843c; }
+  body[data-theme="vinyl-modern"] .pivot { background: radial-gradient(circle at 35% 30%, #d9d9de, #74747c); }
+  body[data-theme="vinyl-modern"] .weight { background: linear-gradient(90deg, #46464e, #2c2c33); }
+  body[data-theme="vinyl-modern"] .shaft { background: linear-gradient(90deg, #c2c2c9, #8b8b94); }
+  body[data-theme="vinyl-modern"] .head { background: #2b2b31; border: 1px solid #56565e; }
+  body[data-theme="vinyl-modern"] .needle { background: #e8e8ee; }
+
+  body[data-theme="vinyl-classic"] .plinth {
+    background:
+      repeating-linear-gradient(94deg, rgba(0,0,0,.13) 0px, rgba(0,0,0,.13) 3px, transparent 3px, transparent 10px),
+      linear-gradient(180deg, #6b4423, #4a2c12);
+    border: 1px solid #7a5230;
+    box-shadow: 0 14px 30px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,220,160,.15);
+  }
+  body[data-theme="vinyl-classic"] .platter {
+    background: radial-gradient(circle at 50% 46%, #3c3c40 57%, #c9c9cf 58%, #7e7e86 62%, #b9b9c0 65%, #55555c 69%, #3a3a40 100%);
+    box-shadow: 0 5px 14px rgba(0,0,0,.6), inset 0 0 0 1px rgba(255,255,255,.08);
+  }
+  body[data-theme="vinyl-classic"] .label { background-color: #8a2a1e; }
+  body[data-theme="vinyl-classic"] .pivot { background: radial-gradient(circle at 35% 30%, #f3d98a, #a3781c); }
+  body[data-theme="vinyl-classic"] .weight { background: radial-gradient(circle at 40% 30%, #eecf7d, #93701c); }
+  body[data-theme="vinyl-classic"] .shaft { background: linear-gradient(90deg, #e6c268, #a9821f); }
+  body[data-theme="vinyl-classic"] .head { background: linear-gradient(180deg, #caa14a, #7d6015); }
+  body[data-theme="vinyl-classic"] .needle { background: #f0e2b0; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1><span class="dot" id="statusDot"></span>🎵 Kivi Yeşili</h1>
+  <h1><span class="dot" id="statusDot"></span>🎵 Kivi Yeşili
+    <select id="themeSel" onchange="applyTheme(this.value)" title="Theme">
+      <option value="default">🌙 Kivi Dark</option>
+      <option value="vinyl-modern">💿 Vinyl · Modern</option>
+      <option value="vinyl-classic">🎻 Vinyl · Classic</option>
+      <option value="modern">✨ Modern</option>
+      <option value="light">☀️ Light</option>
+    </select>
+  </h1>
   <div class="tabs" id="tabs"></div>
   <div id="content"><div class="empty">Loading…</div></div>
   
@@ -573,6 +699,21 @@ let token = sessionStorage.getItem('mb_token') || localStorage.getItem('mb_token
 let guilds = [], selected = sessionStorage.getItem('mb_guild') || localStorage.getItem('mb_guild') || null;
 let state = null, lastStateAt = 0;
 let lyricsData = null, lastLyricsTitle = null, lyricsVisible = true;
+
+// ---------- themes ----------
+const THEMES = ['default', 'vinyl-modern', 'vinyl-classic', 'modern', 'light'];
+let theme = localStorage.getItem('mb_theme') || 'default';
+function isVinyl() { return theme === 'vinyl-modern' || theme === 'vinyl-classic'; }
+function applyTheme(t) {
+  if (!THEMES.includes(t)) t = 'default';
+  theme = t;
+  document.body.dataset.theme = t;
+  localStorage.setItem('mb_theme', t);
+  const sel = document.getElementById('themeSel');
+  if (sel && sel.value !== t) sel.value = t;
+  if (state) render();
+}
+applyTheme(theme);
 
 const basePath = window.location.pathname.endsWith('/') ? window.location.pathname : window.location.pathname + '/';
 
@@ -667,8 +808,28 @@ function render() {
   const s = state;
   let html = '';
 
+  // Detect track change for the vinyl record-swap animation
+  const curTitle = s.current ? s.current.title : null;
+  if (isVinyl() && curTitle && lastVinylTitle && curTitle !== lastVinylTitle &&
+      !swapAnim && Date.now() - lastManualSkipAt > 2500) {
+    swapAnim = {phase: 'in', start: performance.now()};
+  }
+  lastVinylTitle = curTitle;
+
   html += '<div class="card">';
-  if (s.current) {
+  if (isVinyl()) {
+    html += turntableHTML(s);
+    if (s.current) {
+      const c = s.current;
+      html += `<div class="vinyl-info">
+        <div class="title">${esc(c.title)}</div>
+        <div class="sub">requested by ${esc(c.requester)}${s.channel ? ' • 🔊 ' + esc(s.channel) : ''}${s.is_247 ? ' • 🔄 24/7' : ''}</div>
+        <div class="times"><span id="pos"></span><span>${esc(c.duration)}</span></div>
+      </div>`;
+    } else {
+      html += `<div class="empty">${s.connected ? 'No record on the platter — add a song below.' : 'Not in a voice channel. Use /join in Discord.'}</div>`;
+    }
+  } else if (s.current) {
     const c = s.current;
     html += `<div class="np">` +
       (c.thumbnail ? `<img src="${c.thumbnail}">` : '<img>') +
@@ -684,7 +845,7 @@ function render() {
   }
   html += `<div class="controls">
       <button onclick="act('${s.paused ? 'resume' : 'pause'}')">${s.paused ? '▶️ Resume' : '⏸ Pause'}</button>
-      <button onclick="act('skip')">⏭ Skip</button>
+      <button onclick="doSkip()">⏭ Skip</button>
       <button onclick="act('shuffle')">🔀 Shuffle</button>
       <button class="${s.loop !== 'off' ? 'toggled' : ''}" onclick="cycleLoop()">${s.loop === 'song' ? '🔂 Song' : s.loop === 'queue' ? '🔁 Queue' : '➡️ No loop'}</button>
       <button class="${s.autoplay ? 'toggled' : ''}" onclick="act('autoplay')">🎲 Autoplay</button>
@@ -866,6 +1027,166 @@ function handleAutocomplete(val) {
     }
   }, 250); // 250ms debounce
 }
+
+// ---------- turntable engine (vinyl themes) ----------
+// Geometry: tonearm pivot sits top-right; rotate() angle 0 = arm hanging straight
+// down, positive = tip swings left onto the record. Angles below are derived from
+// the .deck CSS layout (pivot at (334,42), record centre (154,160), needle 200px
+// from pivot) — keep them in sync if the deck geometry changes.
+const ARM_REST = 6, ARM_OUT = 25.5, ARM_IN = 44;
+let discAngle = 0, armAngle = ARM_REST, armDrag = null, swapAnim = null;
+let lastVinylTitle = null, lastManualSkipAt = 0, lastFrame = null;
+
+function turntableHTML(s) {
+  const c = s.current;
+  const label = c && c.thumbnail ? ` style="background-image:url('${c.thumbnail}')"` : '';
+  return `<div class="deck">
+      <div class="plinth"></div>
+      <div class="platter"></div>
+      <div class="vinyl-wrap" id="vinylWrap">
+        <div class="vinyl" onclick="vinylClick()" title="Click record: pause / resume">
+          <div class="disc" id="disc"><div class="label"${label}></div></div>
+          <div class="sheen"></div>
+          <div class="spindle"></div>
+        </div>
+      </div>
+      <div class="arm-mount" id="armMount">
+        <div class="tonearm" id="tonearm" title="Drag the arm to seek">
+          <div class="weight"></div><div class="pivot"></div>
+          <div class="shaft"></div><div class="head"></div><div class="needle"></div>
+        </div>
+      </div>
+      <div class="deck-hint" id="deckHint"></div>
+    </div>`;
+}
+
+function vinylClick() {
+  if (!state || !state.current || swapAnim || armDrag) return;
+  act(state.paused ? 'resume' : 'pause');
+}
+
+function doSkip() {
+  if (isVinyl() && state && state.current && !swapAnim) {
+    lastManualSkipAt = Date.now();
+    swapAnim = {phase: 'out', start: performance.now()};
+    act('skip');
+  } else {
+    act('skip');
+  }
+}
+
+function currentPosSeconds() {
+  const c = state && state.current;
+  if (!c) return 0;
+  let pos = c.position_seconds || 0;
+  if (state.playing && !state.paused) pos += (Date.now() - lastStateAt) / 1000;
+  return pos;
+}
+
+function armTargetAngle() {
+  if (!state || !state.current || (swapAnim && swapAnim.phase === 'out')) return ARM_REST;
+  if (armDrag) return armDrag.angle;
+  const c = state.current;
+  const p = c.duration_seconds ? Math.min(1, currentPosSeconds() / c.duration_seconds) : 0;
+  return ARM_OUT + p * (ARM_IN - ARM_OUT);
+}
+
+function updateDragAngle(e) {
+  const mount = document.getElementById('armMount');
+  if (!mount || !armDrag) return;
+  const r = mount.getBoundingClientRect();
+  const dx = e.clientX - (r.left + r.width / 2);
+  const dy = e.clientY - (r.top + r.height / 2);
+  let a = Math.atan2(-dx, dy) * 180 / Math.PI;
+  a = Math.max(ARM_OUT, Math.min(ARM_IN, a));
+  armDrag.angle = a;
+  const c = state && state.current;
+  const hint = document.getElementById('deckHint');
+  if (hint && c && c.duration_seconds) {
+    const p = (a - ARM_OUT) / (ARM_IN - ARM_OUT);
+    hint.textContent = '⏩ ' + fmt(p * c.duration_seconds);
+  }
+}
+
+document.addEventListener('pointerdown', e => {
+  if (!isVinyl() || !state || !state.current || swapAnim) return;
+  if (!e.target.closest('#tonearm')) return;
+  e.preventDefault();
+  armDrag = {angle: Math.max(ARM_OUT, Math.min(ARM_IN, armAngle))};
+  updateDragAngle(e);
+});
+document.addEventListener('pointermove', e => { if (armDrag) { e.preventDefault(); updateDragAngle(e); } });
+document.addEventListener('pointerup', () => {
+  if (!armDrag) return;
+  const p = (armDrag.angle - ARM_OUT) / (ARM_IN - ARM_OUT);
+  armDrag = null;
+  const c = state && state.current;
+  if (c && c.duration_seconds) {
+    const sec = Math.round(Math.max(0, Math.min(0.995, p)) * c.duration_seconds);
+    toast('⏩ Dropping the needle at ' + fmt(sec) + '…');
+    act('seek', {seconds: sec});
+  }
+});
+document.addEventListener('pointercancel', () => { armDrag = null; });
+
+function deckFrame(ts) {
+  requestAnimationFrame(deckFrame);
+  const dt = lastFrame ? Math.min(0.1, (ts - lastFrame) / 1000) : 0;
+  lastFrame = ts;
+  if (!isVinyl()) return;
+  const disc = document.getElementById('disc');
+  const tonearm = document.getElementById('tonearm');
+  const wrap = document.getElementById('vinylWrap');
+  if (!disc || !tonearm || !wrap) return;
+
+  // record spin (33 1/3 rpm = 200 deg/s)
+  const spinning = state && state.current && state.playing && !state.paused && !armDrag;
+  if (spinning) discAngle = (discAngle + dt * 200) % 360;
+  disc.style.transform = 'rotate(' + discAngle + 'deg)';
+
+  // tonearm follows its target with easing; lifted when not tracking a groove
+  const target = armTargetAngle();
+  armAngle += (target - armAngle) * Math.min(1, dt * 5);
+  tonearm.style.transform = 'rotate(' + armAngle + 'deg)';
+  const lifted = !state || !state.current || state.paused || !!armDrag || !!swapAnim;
+  tonearm.classList.toggle('lifted', lifted);
+
+  // record swap animation (skip / track change)
+  const hasTrack = !!(state && state.current);
+  wrap.style.display = (hasTrack || (swapAnim && swapAnim.phase === 'out')) ? 'block' : 'none';
+  if (swapAnim) {
+    const now = performance.now();
+    if (swapAnim.phase === 'out') {
+      const t = (now - swapAnim.start) / 550;
+      if (t >= 1) {
+        swapAnim = hasTrack ? {phase: 'in', start: now} : null;
+        if (!swapAnim) { wrap.style.transform = ''; wrap.style.opacity = '1'; }
+      } else {
+        const lift = Math.min(1, t * 2.5);
+        wrap.style.transform = 'translate(' + (-t * t * 320) + 'px, ' + (-26 * lift) + 'px)';
+        wrap.style.opacity = String(1 - Math.max(0, t - 0.55) / 0.45);
+      }
+    } else {
+      const t = (now - swapAnim.start) / 550;
+      if (t >= 1 || !hasTrack) {
+        swapAnim = null;
+        wrap.style.transform = '';
+        wrap.style.opacity = '1';
+      } else {
+        const ease = 1 - Math.pow(1 - t, 3);
+        wrap.style.transform = 'translate(0px, ' + (-140 * (1 - ease)) + 'px) scale(' + (0.96 + 0.04 * ease) + ')';
+        wrap.style.opacity = String(Math.min(1, t * 2));
+      }
+    }
+  }
+
+  const hint = document.getElementById('deckHint');
+  if (hint && !armDrag) {
+    const def = hasTrack ? 'tap the record to pause · drag the arm to seek' : '';
+    if (hint.textContent !== def) hint.textContent = def;
+  }
+}
+requestAnimationFrame(deckFrame);
 
 setInterval(refreshGuilds, 10000);
 setInterval(refreshState, 3000);
