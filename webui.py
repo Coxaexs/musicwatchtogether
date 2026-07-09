@@ -602,8 +602,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .tonearm .head { position: absolute; left: -2px; top: 166px; width: 16px; height: 28px;
                    border-radius: 3px; box-shadow: 0 2px 4px rgba(0,0,0,.4); }
   .tonearm .needle { position: absolute; left: 5px; top: 193px; width: 2px; height: 7px; }
-  .tonearm.lifted { filter: brightness(1.08); }
-  .tonearm.lifted .head { box-shadow: 0 12px 10px rgba(0,0,0,.5); }
+  /* lift shading transitions smoothly; the vertical rise itself is eased in JS */
+  .tonearm { transition: filter .28s ease; }
+  .tonearm.lifted { filter: brightness(1.16) drop-shadow(0 15px 10px rgba(0,0,0,.55)); }
+  .tonearm.lifted .head { box-shadow: 0 16px 12px rgba(0,0,0,.55); }
+  .tonearm.lifted .needle { box-shadow: 0 0 6px 1px rgba(255,255,255,.4); }
   .deck-hint { position: absolute; left: 0; right: 0; bottom: 0; text-align: center;
                font-size: 11px; color: var(--muted); min-height: 14px; }
   .vinyl-info { text-align: center; margin-top: 6px; }
@@ -1034,7 +1037,7 @@ function handleAutocomplete(val) {
 // the .deck CSS layout (pivot at (334,42), record centre (154,160), needle 200px
 // from pivot) — keep them in sync if the deck geometry changes.
 const ARM_REST = 6, ARM_OUT = 25.5, ARM_IN = 44;
-let discAngle = 0, armAngle = ARM_REST, armDrag = null, swapAnim = null;
+let discAngle = 0, armAngle = ARM_REST, armLift = 0, armDrag = null, swapAnim = null;
 let lastVinylTitle = null, lastManualSkipAt = 0, lastFrame = null;
 
 function turntableHTML(s) {
@@ -1147,9 +1150,15 @@ function deckFrame(ts) {
   // tonearm follows its target with easing; lifted when not tracking a groove
   const target = armTargetAngle();
   armAngle += (target - armAngle) * Math.min(1, dt * 5);
-  tonearm.style.transform = 'rotate(' + armAngle + 'deg)';
   const lifted = !state || !state.current || state.paused || !!armDrag || !!swapAnim;
-  tonearm.classList.toggle('lifted', lifted);
+  // ease the physical lift so the arm visibly rises off / lands on the record
+  armLift += ((lifted ? 1 : 0) - armLift) * Math.min(1, dt * 7);
+  // rise straight up on screen (translateY before rotate) and swing the tip
+  // a few degrees back off the groove — reads as the needle clearing the record
+  const rise = armLift * 16;
+  const tilt = armAngle - armLift * 5;
+  tonearm.style.transform = 'translateY(' + (-rise) + 'px) rotate(' + tilt + 'deg)';
+  tonearm.classList.toggle('lifted', armLift > 0.15);
 
   // record swap animation (skip / track change)
   const hasTrack = !!(state && state.current);
