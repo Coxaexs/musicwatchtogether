@@ -576,12 +576,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .vinyl-wrap { position: absolute; left: 34px; top: 40px; width: 240px; height: 240px; }
   .vinyl { position: absolute; inset: 0; border-radius: 50%; cursor: pointer;
            box-shadow: 0 5px 16px rgba(0,0,0,.55); }
+  /* Grooves are concentric (symmetric), so a rotating conic glint + a couple of
+     off-centre specks are what actually make the spin visible to the eye. */
   .disc { position: absolute; inset: 0; border-radius: 50%; will-change: transform;
-          background: repeating-radial-gradient(circle at 50% 50%, #101010 0px, #1b1b1b 1px, #0e0e0e 2px, #161616 3px);
+          background:
+            conic-gradient(from 0deg, rgba(255,255,255,.11), transparent 22%, transparent 48%,
+              rgba(255,255,255,.06) 60%, transparent 78%, rgba(255,255,255,.11) 100%),
+            repeating-radial-gradient(circle at 50% 50%, #101010 0px, #1b1b1b 1px, #0e0e0e 2px, #161616 3px);
           box-shadow: inset 0 0 0 2px rgba(0,0,0,.8); }
   .disc .label { position: absolute; inset: 33%; border-radius: 50%;
                  background-size: cover; background-position: center;
                  box-shadow: 0 0 0 3px rgba(0,0,0,.75), inset 0 0 10px rgba(0,0,0,.3); }
+  /* tiny reference mark near the rim — gives the eye something to track while spinning */
+  .disc .mark { position: absolute; left: 50%; top: 7%; width: 5px; height: 5px;
+                margin-left: -2.5px; border-radius: 50%; background: rgba(200,200,210,.5); }
   .vinyl .sheen { position: absolute; inset: 0; border-radius: 50%; pointer-events: none;
     background: conic-gradient(from 40deg, transparent 0deg, rgba(255,255,255,.07) 24deg, transparent 60deg,
                 transparent 175deg, rgba(255,255,255,.05) 205deg, transparent 245deg); }
@@ -1048,7 +1056,7 @@ function turntableHTML(s) {
       <div class="platter"></div>
       <div class="vinyl-wrap" id="vinylWrap">
         <div class="vinyl" onclick="vinylClick()" title="Click record: pause / resume">
-          <div class="disc" id="disc"><div class="label"${label}></div></div>
+          <div class="disc" id="disc"><div class="mark"></div><div class="label"${label}></div></div>
           <div class="sheen"></div>
           <div class="spindle"></div>
         </div>
@@ -1145,7 +1153,12 @@ function deckFrame(ts) {
   // record spin (33 1/3 rpm = 200 deg/s)
   const spinning = state && state.current && state.playing && !state.paused && !armDrag;
   if (spinning) discAngle = (discAngle + dt * 200) % 360;
-  disc.style.transform = 'rotate(' + discAngle + 'deg)';
+  // real records are slightly warped: they bob up/down and tilt once per revolution.
+  // translateY (screen-vertical bob) before rotate; skewX fakes the tilt of the far edge.
+  const rad = discAngle * Math.PI / 180;
+  const bob = Math.sin(rad) * 2.2;          // px — the "up and down just a bit"
+  const warp = Math.cos(rad) * 0.8;         // deg — subtle wobble of the plane
+  disc.style.transform = 'translateY(' + bob + 'px) skewX(' + warp + 'deg) rotate(' + discAngle + 'deg)';
 
   // tonearm follows its target with easing; lifted when not tracking a groove
   const target = armTargetAngle();
