@@ -35,16 +35,27 @@ HAS_XVFB = bool(shutil.which('Xvfb'))
 
 logger = logging.getLogger('MusicBot.CoBrowser')
 
-WIDTH, HEIGHT = 1280, 720
+WIDTH, HEIGHT = 1280, 720   # defaults; the room quality setting overrides
 FPS = 25   # mpeg1 only allows standard rates (24/25/29.97/...)
+# room quality -> capture size + mpeg1 bitrate (mpeg1 is inefficient, so
+# bitrates run high to keep page text readable)
+QUALITY_MAP = {
+    360: (640, 360, '1200k', '1600k'),
+    480: (856, 480, '2200k', '2800k'),
+    720: (1280, 720, '4500k', '5500k'),
+    1080: (1920, 1080, '8000k', '9500k'),
+}
 MAX_SESSIONS = 2
 IDLE_STOP = 180          # seconds with zero viewers before auto-stop
 MAX_LIFETIME = 4 * 3600
 DISPLAY_BASE = 91        # :91, :92, ...
 RDP_BASE = 9300          # Firefox WebDriver BiDi port = RDP_BASE + display num
+SNIFF_PORT = 9389        # headless sniffer (single, semaphore-guarded)
 MEDIA_EXT = ('.mp4', '.m3u8', '.mpd', '.webm', '.ts', '.m4s', '.mp3', '.m4a',
-             '.mov', '.mkv', '.ogg', '.flac', '.aac')
+             '.mov', '.mkv', '.ogg', '.flac', '.aac', '.avi', '.flv', '.wmv')
 MEDIA_MAX = 60
+# request headers worth replaying when downloading sniffed media
+KEEP_HEADERS = ('referer', 'user-agent', 'cookie', 'origin')
 PROFILE_ROOT = os.path.expanduser('~/snap/firefox/common/wt-rooms')
 ADGUARD_XPI = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'webstatic', 'adguard.xpi')
@@ -94,10 +105,43 @@ async def _run(*cmd, **kw):
     return proc.returncode, out.decode(errors='replace'), err.decode(errors='replace')
 
 
+def _classify_media(url, mime):
+    """Return 'manifest'/'segment'/'file' if this response looks like media."""
+    if not url or url.startswith(('data:', 'blob:')):
+        return None
+    base = url.split('?')[0].lower()
+    is_media = (any(x in mime for x in
+                    ('video/', 'audio/', 'mpegurl', 'mp2t', 'dash+xml'))
+                or base.endswith(MEDIA_EXT))
+    if not is_media:
+        return None
+    if base.endswith(('.m3u8', '.mpd')):
+        return 'manifest'
+    if base.endswith(('.ts', '.m4s')):
+        return 'segment'
+    return 'file'
+
+
+def _bidi_req_headers(params):
+    """Pull replayable request headers out of a BiDi network event."""
+    out = {}
+    for h in (params.get('request') or {}).get('headers') or []:
+        name = (h.get('name') or '').lower()
+        if name in KEEP_HEADERS:
+            val = h.get('value')
+            if isinstance(val, dict):
+                val = val.get('value')
+            if isinstance(val, str) and val:
+                out[name.title() if name != 'user-agent' else 'User-Agent'] = val
+    return out
+
+
 class CoBrowserSession:
     def __init__(self, room_id):
         self.room_id = room_id
         self.display = None            # e.g. ':91'
+        self.width, self.height = WIDTH, HEIGHT
+        self.v_bitrate, self.v_maxrate = '4500k', '5500k'
         self.sink = None               # pipewire null-sink name
         self.procs = {}                # name -> Process
         self.viewers = {}              # ws -> asyncio.Queue
@@ -124,8 +168,10 @@ class CoBrowserSession:
 
     # ------------------------------------------------------------ lifecycle
 
-    async def start(self, url, adblock=True):
+    async def start(self, url, adblock=True, quality=720):
         self._initial_url = url
+        self.width, self.height, self.v_bitrate, self.v_maxrate = \
+            QUALITY_MAP.get(int(quality or 720), QUALITY_MAP[720])
         num = self._pick_display()
         self.display = f':{num}'
         self.sink = f'wt{num}'
@@ -138,6 +184,17 @@ class CoBrowserSession:
                 os.remove(os.path.join(profile, lock))
             except OSError:
                 pass
+        # make Firefox open maximized at the display size (deterministic; the
+        # runtime EWMH maximize is just a backup for when this is overridden)
+        try:
+            with open(os.path.join(profile, 'xulstore.json'), 'w') as f:
+                json.dump({'chrome://browser/content/browser.xhtml': {
+                    'main-window': {
+                        'screenX': '0', 'screenY': '0',
+                        'width': str(self.width), 'height': str(self.height),
+                        'sizemode': 'maximized'}}}, f)
+        except OSError:
+            pass
         # adblock: sideload AdGuard into the profile (or drop it if disabled)
         ext_dir = os.path.join(profile, 'extensions')
         ext_path = os.path.join(ext_dir, f'{ADGUARD_ID}.xpi')
@@ -151,9 +208,10 @@ class CoBrowserSession:
         # 1. virtual display (Xvfb if installed; Xtightvnc otherwise)
         if HAS_XVFB:
             xcmd = ['Xvfb', self.display, '-screen', '0',
-                    f'{WIDTH}x{HEIGHT}x24', '-nolisten', 'tcp']
+                    f'{self.width}x{self.height}x24', '-nolisten', 'tcp']
         else:
-            xcmd = ['Xtightvnc', self.display, '-geometry', f'{WIDTH}x{HEIGHT}',
+            xcmd = ['Xtightvnc', self.display, '-geometry',
+                    f'{self.width}x{self.height}',
                     '-depth', '24', '-rfbport', str(15900 + num), '-localhost',
                     '-nolisten', 'tcp']
         self.procs['x'] = await asyncio.create_subprocess_exec(
@@ -211,7 +269,8 @@ class CoBrowserSession:
             # draw_mouse 0: the client renders a synthetic cursor for everyone
             # (also the only option on the xwd path), so keep it consistent
             cmd += ['-f', 'x11grab', '-draw_mouse', '0', '-framerate', str(FPS),
-                    '-video_size', f'{WIDTH}x{HEIGHT}', '-i', self.display]
+                    '-video_size', f'{self.width}x{self.height}',
+                    '-i', self.display]
         else:
             r_fd, w_fd = os.pipe()
             self.procs['grab'] = await asyncio.create_subprocess_exec(
@@ -226,13 +285,15 @@ class CoBrowserSession:
                     '-f', 'image2pipe', '-vcodec', 'xwd', '-i', '-']
         if self._audio_ok:
             cmd += ['-f', 'pulse', '-i', f'{self.sink}.monitor']
-        # higher bitrate keeps text/UI readable (mpeg1 is not efficient)
-        cmd += ['-c:v', 'mpeg1video', '-b:v', '4000k', '-maxrate', '5000k',
-                '-bufsize', '1200k', '-bf', '0', '-g', str(FPS),
+        # bitrate follows the room quality setting; small VBV buffer + zero mux
+        # delay + per-packet flushing keep end-to-end latency low
+        cmd += ['-c:v', 'mpeg1video', '-b:v', self.v_bitrate,
+                '-maxrate', self.v_maxrate, '-bufsize', '600k',
+                '-bf', '0', '-g', str(FPS),
                 '-r', str(FPS), '-fps_mode', 'cfr']
         if self._audio_ok:
             cmd += ['-c:a', 'mp2', '-b:a', '128k', '-ar', '44100', '-ac', '2']
-        cmd += ['-f', 'mpegts', '-muxdelay', '0.05', 'pipe:1']
+        cmd += ['-f', 'mpegts', '-muxdelay', '0', '-flush_packets', '1', 'pipe:1']
         self.procs['enc'] = await asyncio.create_subprocess_exec(
             *cmd, stdin=enc_stdin, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
@@ -249,6 +310,9 @@ class CoBrowserSession:
         # BiDi is best-effort: navigation falls back to keystrokes and media
         # sniffing just stays empty if it can't connect
         self._bidi_task = asyncio.create_task(self._bidi_connect())
+        # Firefox opens at its own remembered size; maximize it to fill the
+        # display so there are no black margins (esp. at 1080p)
+        self._maximize_task = asyncio.create_task(self._keep_maximized())
         logger.info(f"🌐 co-browser up for {self.room_id} on {self.display} "
                     f"(audio={'yes' if self._audio_ok else 'no'})")
 
@@ -343,7 +407,8 @@ class CoBrowserSession:
     def _handle_bidi_event(self, d):
         method = d.get('method')
         if method == 'network.responseCompleted':
-            self._note_media(d['params'].get('response', {}))
+            self._note_media(d['params'].get('response', {}),
+                             _bidi_req_headers(d['params']))
         elif method == 'browsingContext.contextCreated':
             p = d['params']
             # a new top-level tab (e.g. target=_blank) becomes the live one
@@ -372,41 +437,42 @@ class CoBrowserSession:
                 break
             self._handle_bidi_event(json.loads(msg.data))
 
-    def _note_media(self, resp):
+    def _note_media(self, resp, headers=None):
         url = resp.get('url', '')
-        if not url or url.startswith(('data:', 'blob:')):
-            return
         mime = (resp.get('mimeType') or '').lower()
-        base = url.split('?')[0].lower()
-        is_media = (any(x in mime for x in
-                        ('video/', 'audio/', 'mpegurl', 'mp2t', 'dash+xml'))
-                    or base.endswith(MEDIA_EXT))
-        if not is_media:
+        kind = _classify_media(url, mime)
+        if not kind:
             return
-        if base.endswith(('.m3u8', '.mpd')):
-            kind = 'manifest'
-        elif base.endswith(('.ts', '.m4s')):
-            kind = 'segment'
-        else:
-            kind = 'file'
         for m in self.media:
             if m['url'] == url:
                 return
         name = url.split('?')[0].rstrip('/').split('/')[-1] or url
         self.media.append({'url': url, 'mime': mime or '?',
-                           'kind': kind, 'name': name[:80]})
+                           'kind': kind, 'name': name[:80],
+                           'headers': headers or {}})
         if len(self.media) > MEDIA_MAX:
             del self.media[0]
 
     def get_media(self):
         """DevTools-style list of media on the page, most useful first.
-        Segments are collapsed away when a manifest is present."""
+        Segments are collapsed away when a manifest is present. Headers are
+        stripped (cookies must never reach the room clients)."""
         manifests = [m for m in self.media if m['kind'] == 'manifest']
         files = [m for m in self.media if m['kind'] == 'file']
         out = manifests + files
         if not out:   # only loose segments seen — offer them as a last resort
             out = [m for m in self.media if m['kind'] == 'segment'][-10:]
-        return out[-30:]
+        return [{k: m[k] for k in ('url', 'mime', 'kind', 'name')}
+                for m in out[-30:]]
+
+    def media_headers(self, url):
+        """Server-side: replayable request headers for a sniffed media url."""
+        for m in self.media:
+            if m['url'] == url:
+                h = dict(m.get('headers') or {})
+                h.setdefault('Referer', self.page_url or url)
+                return h
+        return {'Referer': self.page_url} if self.page_url else {}
 
     def _open_xlib(self):
         from Xlib import display as xdisplay
@@ -441,7 +507,8 @@ class CoBrowserSession:
         if self.status == 'stopped':
             return
         self.status = 'stopped'
-        for task in (self._reader_task, self._watchdog_task, self._bidi_task):
+        for task in (self._reader_task, self._watchdog_task, self._bidi_task,
+                     getattr(self, '_maximize_task', None)):
             if task:
                 task.cancel()
         for closable in (self._bidi_ws, self._bidi_sess):
@@ -504,6 +571,15 @@ class CoBrowserSession:
                 if not chunk:
                     break
                 for q in list(self.viewers.values()):
+                    # backlog clamp: JSMpeg consumes at real-time rate, so any
+                    # queued backlog becomes *permanent* latency for that
+                    # viewer - drop their backlog and let them glitch to live
+                    if q.qsize() > 40:   # ~320 KB ≈ 0.5 s at 4.5 Mbps
+                        try:
+                            while True:
+                                q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
                     try:
                         q.put_nowait(chunk)
                     except asyncio.QueueFull:
@@ -549,8 +625,8 @@ class CoBrowserSession:
         from Xlib.ext import xtest
         d = self._xd
         try:
-            px = max(0, min(WIDTH - 1, int(x * WIDTH)))
-            py = max(0, min(HEIGHT - 1, int(y * HEIGHT)))
+            px = max(0, min(self.width - 1, int(x * self.width)))
+            py = max(0, min(self.height - 1, int(y * self.height)))
             if action == 'move':
                 xtest.fake_input(d, X.MotionNotify, x=px, y=py)
             elif action == 'down':
@@ -650,28 +726,76 @@ class CoBrowserSession:
             self.key('down', 'Enter')
         await loop.run_in_executor(None, _nav)
 
-    def _focus_firefox(self):
+    def _find_firefox_window(self):
         from Xlib import X
         d = self._xd
+        best = None
+        for w in d.screen().root.query_tree().children:
+            try:
+                cls = w.get_wm_class()
+                if cls and any('firefox' in c.lower() for c in cls):
+                    if w.get_attributes().map_state != X.IsViewable:
+                        continue
+                    g = w.get_geometry()
+                    area = g.width * g.height
+                    if best is None or area > best[1]:
+                        best = (w, area)
+            except Exception:
+                continue
+        return best[0] if best else None
+
+    def _focus_firefox(self):
+        from Xlib import X
         try:
-            root = d.screen().root
-            best = None
-            for w in root.query_tree().children:
-                try:
-                    cls = w.get_wm_class()
-                    if cls and any('firefox' in c.lower() for c in cls):
-                        if w.get_attributes().map_state != X.IsViewable:
-                            continue
-                        g = w.get_geometry()
-                        if best is None or g.width * g.height > best[1]:
-                            best = (w, g.width * g.height)
-                except Exception:
-                    continue
-            if best:
-                best[0].set_input_focus(X.RevertToParent, X.CurrentTime)
-                d.sync()
+            w = self._find_firefox_window()
+            if w:
+                w.set_input_focus(X.RevertToParent, X.CurrentTime)
+                self._xd.sync()
         except Exception as e:
             logger.debug(f"focus failed: {e}")
+
+    def _maximize_once(self):
+        """EWMH-maximize the Firefox window so it fills the whole display."""
+        from Xlib import X, Xatom
+        d = self._xd
+        w = self._find_firefox_window()
+        if not w:
+            return False
+        g = w.get_geometry()
+        # already covers (nearly) the whole display -> done
+        if g.width >= self.width - 8 and g.height >= self.height - 40:
+            return True
+        root = d.screen().root
+        try:
+            wm_state = d.intern_atom('_NET_WM_STATE')
+            mv = d.intern_atom('_NET_WM_STATE_MAXIMIZED_VERT')
+            mh = d.intern_atom('_NET_WM_STATE_MAXIMIZED_HORZ')
+            from Xlib.protocol import event as Xevent
+            ev = Xevent.ClientMessage(
+                window=w, client_type=wm_state,
+                data=(32, [1, mv, mh, 1, 0]))   # 1 = _NET_WM_STATE_ADD
+            root.send_event(ev, event_mask=(X.SubstructureRedirect |
+                                            X.SubstructureNotify))
+            d.sync()
+        except Exception as e:
+            logger.debug(f"maximize failed: {e}")
+        return False
+
+    async def _keep_maximized(self):
+        loop = asyncio.get_running_loop()
+        try:
+            # windows map a few seconds after launch; retry until it sticks
+            for _ in range(30):
+                await asyncio.sleep(1)
+                if self.status != 'running':
+                    return
+                try:
+                    if await loop.run_in_executor(None, self._maximize_once):
+                        return
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            return
 
     def public_state(self):
         return {
@@ -708,7 +832,142 @@ def get(room_id):
     return s if s and s.status != 'stopped' else None
 
 
-async def start(room_id, url, started_by=None, on_change=None, adblock=True):
+# ---------------------------------------------------------------- sniffer
+
+_sniff_sem = asyncio.Semaphore(1)
+
+
+async def sniff_media(page_url, wait=20, adblock=True):
+    """Load a page in *headless* Firefox and return the media URLs it
+    requests (like reading the DevTools network tab). Used when yt-dlp can't
+    resolve a page on its own. Returns [{url, mime, kind, name, headers}]."""
+    async with _sniff_sem:
+        prof = os.path.join(PROFILE_ROOT, '_sniff')
+        shutil.rmtree(prof, ignore_errors=True)
+        os.makedirs(prof, exist_ok=True)
+        with open(os.path.join(prof, 'user.js'), 'w') as f:
+            f.write(FIREFOX_PREFS)
+        if adblock and os.path.isfile(ADGUARD_XPI):
+            # adblock in the sniffer = fewer ad requests polluting the results
+            ext_dir = os.path.join(prof, 'extensions')
+            os.makedirs(ext_dir, exist_ok=True)
+            shutil.copyfile(ADGUARD_XPI,
+                            os.path.join(ext_dir, f'{ADGUARD_ID}.xpi'))
+        proc = await asyncio.create_subprocess_exec(
+            'firefox', '--headless', '--no-remote', '--new-instance',
+            '--profile', prof, f'--remote-debugging-port={SNIFF_PORT}',
+            '--remote-allow-hosts=localhost', 'about:blank',
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            env={**os.environ, 'MOZ_ENABLE_WAYLAND': '0'},
+            start_new_session=True)
+        found = []
+        sess = ws = None
+        try:
+            for _ in range(50):
+                try:
+                    sess = aiohttp.ClientSession()
+                    ws = await sess.ws_connect(
+                        f'ws://127.0.0.1:{SNIFF_PORT}/session', max_msg_size=0)
+                    break
+                except Exception:
+                    await sess.close()
+                    sess = ws = None
+                    await asyncio.sleep(0.5)
+            if not ws:
+                raise RuntimeError('headless firefox never came up')
+
+            mid = [0]
+
+            def note(d):
+                if d.get('method') != 'network.responseCompleted':
+                    return
+                p = d['params']
+                resp = p.get('response', {})
+                url = resp.get('url', '')
+                mime = (resp.get('mimeType') or '').lower()
+                kind = _classify_media(url, mime)
+                if not kind or any(m['url'] == url for m in found):
+                    return
+                if 'adguard' in url.lower():
+                    return   # noise from our own injected adblock extension
+                name = url.split('?')[0].rstrip('/').split('/')[-1] or url
+                found.append({'url': url, 'mime': mime or '?', 'kind': kind,
+                              'name': name[:80],
+                              'headers': _bidi_req_headers(p)})
+
+            async def call(method, params=None, timeout=15):
+                mid[0] += 1
+                i = mid[0]
+                await ws.send_json({'id': i, 'method': method,
+                                    'params': params or {}})
+                end = asyncio.get_event_loop().time() + timeout
+                while asyncio.get_event_loop().time() < end:
+                    msg = await ws.receive(
+                        timeout=max(1, end - asyncio.get_event_loop().time()))
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        raise RuntimeError('sniffer socket closed')
+                    d = json.loads(msg.data)
+                    if d.get('id') == i:
+                        if d.get('type') == 'error':
+                            raise RuntimeError(d.get('message', 'bidi error'))
+                        return d.get('result', {})
+                    note(d)
+                raise asyncio.TimeoutError(method)
+
+            await call('session.new', {'capabilities': {}})
+            await call('session.subscribe',
+                       {'events': ['network.responseCompleted']})
+            tree = await call('browsingContext.getTree', {})
+            ctx = tree['contexts'][0]['context']
+            await call('browsingContext.navigate',
+                       {'context': ctx, 'url': page_url, 'wait': 'none'})
+            nudged = False
+            start_t = asyncio.get_event_loop().time()
+            while asyncio.get_event_loop().time() - start_t < wait:
+                try:
+                    msg = await ws.receive(timeout=2)
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        break
+                    note(json.loads(msg.data))
+                except asyncio.TimeoutError:
+                    pass
+                elapsed = asyncio.get_event_loop().time() - start_t
+                if not nudged and elapsed > 6:
+                    nudged = True
+                    try:   # poke players into loading their streams
+                        await call('script.evaluate', {
+                            'expression':
+                                "document.querySelectorAll('video,audio')"
+                                ".forEach(m=>{try{m.muted=true;m.play()}"
+                                "catch(e){}}); window.scrollBy(0,400); true",
+                            'target': {'context': ctx},
+                            'awaitPromise': False}, timeout=8)
+                    except Exception:
+                        pass
+                interesting = [m for m in found if m['kind'] != 'segment']
+                if len(interesting) >= 4 and elapsed > 9:
+                    break
+        except Exception as e:
+            logger.warning(f"sniff of {page_url} failed: {e}")
+        finally:
+            for closable in (ws, sess):
+                if closable:
+                    try:
+                        await closable.close()
+                    except Exception:
+                        pass
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            shutil.rmtree(prof, ignore_errors=True)
+        # manifests and files first; loose segments only if nothing better
+        best = [m for m in found if m['kind'] != 'segment']
+        return (best or [m for m in found if m['kind'] == 'segment'][-8:])[:20]
+
+
+async def start(room_id, url, started_by=None, on_change=None, adblock=True,
+                quality=720):
     if get(room_id):
         return sessions[room_id]
     if len(sessions) >= MAX_SESSIONS:
@@ -720,7 +979,7 @@ async def start(room_id, url, started_by=None, on_change=None, adblock=True):
     s.on_change = on_change
     sessions[room_id] = s
     try:
-        await s.start(url, adblock=adblock)
+        await s.start(url, adblock=adblock, quality=quality)
     except Exception:
         await s.stop()
         raise

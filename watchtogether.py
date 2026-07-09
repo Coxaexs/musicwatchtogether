@@ -242,7 +242,8 @@ def _item_public(item):
     return {k: item.get(k) for k in
             ('uid', 'vid', 'title', 'duration', 'thumbnail', 'status',
              'progress', 'file', 'added_by', 'uploader', 'likes', 'error',
-             'embed_kind', 'embed', 'url', 'live_dl')}
+             'embed_kind', 'embed', 'url', 'live_dl', 'choices',
+             'width', 'height')}
 
 
 def _set_embed_fallback(item, err=''):
@@ -356,8 +357,11 @@ def _blocking_hls_formats(url, quality):
 
 
 def _blocking_download(url, cache_dir, vertical, progress_cb,
-                       quality=720, sponsorblock=False):
+                       quality=720, sponsorblock=False, http_headers=None):
     opts = _dl_opts(cache_dir, vertical, quality, sponsorblock)
+    if http_headers:
+        # replay the browser's headers (Referer/UA/cookies) for sniffed media
+        opts['http_headers'] = dict(http_headers)
     if progress_cb:
         last = {'t': 0.0}
 
@@ -441,19 +445,20 @@ async def _download_item(room, item):
                     _broadcast(room, {'t': 'progress', 'uid': item['uid'], 'pct': pct})))
 
         cfg = get_settings(room.id)
+        hdrs = item.get('_http_headers')
         try:
             try:
                 fname, info = await loop.run_in_executor(
                     None, _blocking_download, item['url'], cache_dir,
                     room.mode == 'reels', progress_cb,
-                    cfg['quality'], cfg['sponsorblock'])
+                    cfg['quality'], cfg['sponsorblock'], hdrs)
             except Exception:
                 if not cfg['sponsorblock'] or room.mode == 'reels':
                     raise
                 # SponsorBlock post-processing can fail on its own; retry clean
                 fname, info = await loop.run_in_executor(
                     None, _blocking_download, item['url'], cache_dir,
-                    False, progress_cb, cfg['quality'], False)
+                    False, progress_cb, cfg['quality'], False, hdrs)
             item['file'] = fname
             item['vid'] = info.get('id') or item.get('vid')
             item['title'] = info.get('title') or item.get('title')
@@ -462,6 +467,8 @@ async def _download_item(room, item):
             if info.get('thumbnail'):
                 item['thumbnail'] = info['thumbnail']
             item['tags'] = (info.get('tags') or [])[:10]
+            item['width'] = info.get('width')
+            item['height'] = info.get('height')
             item['status'] = 'ready'
         except Exception as e:
             logger.error(f"watch download failed for {item.get('url')}: {e}")
@@ -608,7 +615,14 @@ async def _add_query(room, query, added_by, play_next=False):
         'status': 'pending', 'progress': 0, 'file': None,
         'added_by': added_by, 'likes': 0, 'tags': [],
     }
-    if play_next and 0 <= room.index < len(room.queue):
+    if room.mode == 'reels':
+        # pasted reels queue up right after the current one, FIFO
+        pos = max(0, room.index + 1)
+        while pos < len(room.queue) and \
+                room.queue[pos].get('added_by') != '✨ feed':
+            pos += 1
+        room.queue.insert(pos, item)
+    elif play_next and 0 <= room.index < len(room.queue):
         room.queue.insert(room.index + 1, item)
     else:
         room.queue.append(item)
@@ -617,12 +631,10 @@ async def _add_query(room, query, added_by, play_next=False):
     try:
         info = await loop.run_in_executor(None, _blocking_extract, query)
     except Exception as e:
-        _set_embed_fallback(item, e)
-        await _after_ready(room, item)
+        await _sniff_or_fallback(room, item, e)
         return
     if not info:
-        _set_embed_fallback(item, 'No results found')
-        await _after_ready(room, item)
+        await _sniff_or_fallback(room, item, 'No results found')
         return
     item['vid'] = info.get('id')
     item['url'] = info.get('webpage_url') or info.get('url') or query
@@ -631,6 +643,11 @@ async def _add_query(room, query, added_by, play_next=False):
     item['thumbnail'] = info.get('thumbnail')
     item['uploader'] = info.get('uploader')
     item['tags'] = (info.get('tags') or [])[:10]
+    if room.mode == 'reels':
+        # the feed learns from what people paste and won't re-serve it
+        if item['vid']:
+            room.seen.add(item['vid'])
+        _learn(room, item, 3)
     await _broadcast_state(room)
     if room.mode == 'watch' and (info.get('duration') or 0) >= HLS_MIN_DURATION:
         asyncio.create_task(_hls_item(room, item))
@@ -638,7 +655,49 @@ async def _add_query(room, query, added_by, play_next=False):
         asyncio.create_task(_download_item(room, item))
 
 
+async def _sniff_or_fallback(room, item, err):
+    """yt-dlp couldn't resolve the page. If it's a real URL, read its network
+    traffic in a headless browser (DevTools-style) and let the room pick from
+    the media it loads — sniffing can catch ads, hence the picker."""
+    url = item.get('url') or ''
+    if room.mode != 'watch' or not URL_RE.match(url) or not cobrowser:
+        _set_embed_fallback(item, err)
+        await _after_ready(room, item)
+        return
+    item['status'] = 'sniffing'
+    item['error'] = str(err)[:200]
+    await _broadcast_state(room)
+    try:
+        found = await cobrowser.sniff_media(
+            url, adblock=get_settings(room.id)['adblock'])
+    except Exception as e:
+        logger.warning(f"sniff failed for {url}: {e}")
+        found = []
+    if not found:
+        _set_embed_fallback(item, err)
+        await _after_ready(room, item)
+        return
+    item['choices'] = [{k: m[k] for k in ('url', 'mime', 'kind', 'name')}
+                       for m in found]
+    item['_choice_headers'] = {m['url']: m.get('headers') or {} for m in found}
+    item['status'] = 'choice'
+    await _notice(room, f'📹 Found {len(found)} media file(s) on that page — '
+                        f'pick the right one (some could be ads)')
+    await _after_ready(room, item)
+
+
 # ---------------------------------------------------------------- reels brain
+
+def _is_vertical(info):
+    """Reels must actually be vertical (shorts/reels/tiktok format)."""
+    w, h = info.get('width'), info.get('height')
+    if w and h:
+        return h > w
+    ar = info.get('aspect_ratio')
+    if ar:
+        return ar < 1
+    return '/shorts/' in (info.get('webpage_url') or '')
+
 
 def _tokenize(item):
     words = re.findall(r'[a-zA-ZğüşöçıİĞÜŞÖÇ0-9]{3,}', (item.get('title') or '').lower())
@@ -680,13 +739,15 @@ async def _reels_topup(room):
     query = _pick_query(room)
     try:
         entries = await loop.run_in_executor(
-            None, _blocking_search, f'{query} #shorts', 10)
+            None, _blocking_search, f'{query} #shorts', 12)
     except Exception as e:
         logger.warning(f"reels search failed ({query!r}): {e}")
         return
     added = 0
+    checked = 0
     for e in entries:
-        if added >= 2 or len(room.queue) - (room.index + 1) >= REELS_READY_AHEAD:
+        if added >= 2 or checked >= 6 or \
+                len(room.queue) - (room.index + 1) >= REELS_READY_AHEAD:
             break
         vid = e.get('id')
         dur = e.get('duration')
@@ -695,14 +756,29 @@ async def _reels_topup(room):
         if dur and dur > REELS_MAX_DURATION:
             continue
         room.seen.add(vid)
+        checked += 1
+        # flat search results carry no dimensions - fully resolve each
+        # candidate and only accept actual VERTICAL shorts
+        url = e.get('url') or f'https://www.youtube.com/watch?v={vid}'
+        try:
+            info = await loop.run_in_executor(None, _blocking_extract, url)
+        except Exception:
+            continue
+        if not info or not _is_vertical(info):
+            continue
+        if (info.get('duration') or 0) > REELS_MAX_DURATION:
+            continue
         item = {
-            'uid': secrets.token_hex(6), 'vid': vid,
-            'url': e.get('url') or f'https://www.youtube.com/watch?v={vid}',
-            'title': e.get('title') or 'Reel', 'duration': dur,
-            'thumbnail': (e.get('thumbnails') or [{}])[-1].get('url'),
-            'uploader': e.get('uploader') or e.get('channel'),
+            'uid': secrets.token_hex(6), 'vid': info.get('id') or vid,
+            'url': info.get('webpage_url') or url,
+            'title': info.get('title') or 'Reel',
+            'duration': info.get('duration'),
+            'thumbnail': info.get('thumbnail'),
+            'uploader': info.get('uploader') or info.get('channel'),
+            'width': info.get('width'), 'height': info.get('height'),
             'status': 'pending', 'progress': 0, 'file': None,
-            'added_by': '✨ feed', 'likes': 0, 'tags': [],
+            'added_by': '✨ feed', 'likes': 0,
+            'tags': (info.get('tags') or [])[:10],
         }
         room.queue.append(item)
         added += 1
@@ -845,6 +921,17 @@ async def ws_handler(request):
                         room.index -= 1
                     await _broadcast_state(room)
 
+            elif t == 'remove_current':
+                # drop the item being watched (e.g. a dead/unpickable one)
+                if 0 <= room.index < len(room.queue):
+                    room.queue.pop(room.index)
+                    if room.index >= len(room.queue):
+                        room.index = len(room.queue) - 1
+                    room._advanced_past = room.index - 1
+                    room.set_position(0, playing=room.index >= 0)
+                    await _notice(room, f'🗑 {name} removed the current item')
+                    await _broadcast_state(room)
+
             elif t == 'ended':
                 idx = int(data.get('index', -1))
                 if idx == room.index and idx > room._advanced_past:
@@ -912,9 +999,11 @@ async def ws_handler(request):
                 async def on_change():
                     await _broadcast_state(room)
                 try:
+                    cfg = get_settings(room.id)
                     await cobrowser.start(room.id, url, started_by=name,
                                           on_change=on_change,
-                                          adblock=get_settings(room.id)['adblock'])
+                                          adblock=cfg['adblock'],
+                                          quality=cfg['quality'])
                 except Exception as e:
                     await _notice(room, f'❌ Browser failed to start: {e}')
                 await _broadcast_state(room)
@@ -990,7 +1079,40 @@ async def ws_handler(request):
                 url = str(data.get('url') or '').strip()
                 if sess and url:
                     await _notice(room, f'📹 {name} grabbed media from the page')
-                    asyncio.create_task(_add_query(room, url, name))
+                    # direct media URL: skip re-extraction, replay the
+                    # browser's own headers so the CDN accepts the download
+                    item = {
+                        'uid': secrets.token_hex(6), 'vid': None, 'url': url,
+                        'title': url.split('?')[0].rstrip('/').split('/')[-1] or url,
+                        'duration': None, 'thumbnail': None,
+                        'uploader': (sess.page_url or '').split('/')[2]
+                                    if '://' in (sess.page_url or '') else None,
+                        'status': 'pending', 'progress': 0, 'file': None,
+                        'added_by': name, 'likes': 0, 'tags': [],
+                        '_http_headers': sess.media_headers(url),
+                    }
+                    room.queue.append(item)
+                    await _broadcast_state(room)
+                    asyncio.create_task(_download_item(room, item))
+
+            elif t == 'pick_choice':
+                uid = str(data.get('uid') or '')
+                url = str(data.get('url') or '')
+                item = next((i for i in room.queue if i['uid'] == uid), None)
+                if item and url and item.get('choices') \
+                        and any(c['url'] == url for c in item['choices']):
+                    chosen = next(c for c in item['choices'] if c['url'] == url)
+                    item['_http_headers'] = \
+                        (item.get('_choice_headers') or {}).get(url) or {}
+                    item['_http_headers'].setdefault('Referer', item['url'])
+                    item['url'] = url
+                    item['title'] = chosen.get('name') or item['title']
+                    item['status'] = 'pending'
+                    item['choices'] = None
+                    item.pop('_choice_headers', None)
+                    await _notice(room, f"📹 {name} picked: {chosen.get('name','media')}")
+                    await _broadcast_state(room)
+                    asyncio.create_task(_download_item(room, item))
     finally:
         room.sockets.pop(ws, None)
         if joined:
@@ -1224,13 +1346,8 @@ WATCH_HTML = r"""<!DOCTYPE html>
                 style="width:100%;height:100%;display:block;outline:none"></canvas>
         <div id="bcursor"><svg viewBox="0 0 24 24"><path d="M4 2 L4 20 L9 15 L12.5 22 L15 21 L11.5 14 L18 14 Z" fill="#fff" stroke="#222" stroke-width="1.2"/></svg></div>
       </div>
-      <div class="overlay hidden" id="failOvl">
-        <div class="big">🚫</div>
-        <div id="failText">This one couldn't be downloaded.</div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
-          <button class="primary" onclick="openInBrowser()">🌐 Open in shared browser</button>
-          <button onclick="send({t:'skip'})">⏭ Skip it</button>
-        </div>
+      <div class="overlay hidden" id="failOvl" style="overflow-y:auto">
+        <div id="failBody" style="max-width:560px;width:92%"></div>
       </div>
       <div class="overlay" id="ovl">
         <div class="big">🍿</div>
@@ -1247,6 +1364,7 @@ WATCH_HTML = r"""<!DOCTYPE html>
                style="flex:1;min-width:140px;background:var(--panel2);border:1px solid #333350;color:var(--text);border-radius:8px;padding:8px 10px;font-size:13px"
                onkeydown="if(event.key==='Enter'&&this.value.trim()){send({t:'browser_nav',url:this.value.trim()});this.value=''}">
         <button id="bmediaBtn" onclick="requestMedia()">📹 Media <span id="bmediaN"></span></button>
+        <button title="Jump to live (fixes lag)" onclick="resyncStream()">⟳</button>
         <button class="danger" onclick="send({t:'browser_stop'})">✖ Close browser</button>
       </div>
       <div id="bmediaList" class="hidden" style="margin-top:10px;border-top:1px solid #2a2a40;padding-top:10px"></div>
@@ -1375,11 +1493,9 @@ function applyState(d){
     failOvl.classList.add('hidden');
     document.getElementById('ovl').classList.add('hidden');
     if(!v.paused) v.pause();
-  } else if(cur && (cur.status==='embed' || cur.status==='error')){
-    // yt-dlp couldn't grab it: offer the shared browser
+  } else if(cur && ['embed','error','sniffing','choice'].includes(cur.status)){
     v.removeAttribute('src'); v.load();
-    document.getElementById('failText').textContent =
-      (cur.title||'This one') + " couldn't be downloaded.";
+    renderFailOverlay(cur);
     failOvl.classList.remove('hidden');
     document.getElementById('ovl').classList.add('hidden');
   } else {
@@ -1395,6 +1511,43 @@ function applyState(d){
     }
   }
   applySync({index:d.index, playing:d.playing, position:d.position});
+}
+
+// ---- fail / sniff / pick overlay ----
+let failKey = null;
+function renderFailOverlay(cur){
+  const key = cur.uid + '|' + cur.status + '|' + (cur.choices ? cur.choices.length : 0);
+  if(key === failKey) return;   // don't rebuild (keeps buttons clickable)
+  failKey = key;
+  const el = document.getElementById('failBody');
+  if(cur.status === 'sniffing'){
+    el.innerHTML = `<div class="big" style="font-size:42px">🔍</div>
+      <div style="margin:8px 0">yt-dlp couldn't grab <b>${esc(cur.title||'this')}</b> directly.<br>
+      Scanning the page's network traffic for media…</div>
+      <div class="spin" style="width:34px;height:34px;border:4px solid #333;border-top-color:var(--accent);border-radius:50%;margin:12px auto;animation:spin 1s linear infinite"></div>
+      <style>@keyframes spin{to{transform:rotate(360deg)}}</style>`;
+  } else if(cur.status === 'choice' && cur.choices && cur.choices.length){
+    el.innerHTML = `<div class="big" style="font-size:38px">📹</div>
+      <div style="margin:6px 0 10px">Found on the page — <b>pick the right one</b> (some could be ads):</div>
+      <div style="background:var(--panel);border-radius:10px;padding:6px 12px;text-align:left;max-height:40vh;overflow-y:auto">` +
+      cur.choices.map(c =>
+        `<div class="mediaitem"><span class="mi-kind">${esc(c.kind)}</span>`+
+        `<span class="mi-name" title="${esc(c.url)}">${esc(c.name)} <span style="color:var(--muted)">${esc(c.mime)}</span></span>`+
+        `<button class="primary" onclick='send({t:"pick_choice",uid:${JSON.stringify(cur.uid)},url:${JSON.stringify(c.url)}})'>▶ This one</button></div>`
+      ).join('') + `</div>
+      <div style="display:flex;gap:10px;justify-content:center;margin-top:12px;flex-wrap:wrap">
+        <button onclick="openInBrowser()">🌐 Open in shared browser instead</button>
+        <button onclick="send({t:'skip'})">⏭ Skip</button>
+        <button class="danger" onclick="send({t:'remove_current'})">✖ Remove</button>
+      </div>`;
+  } else {
+    el.innerHTML = `<div class="big" style="font-size:42px">🚫</div>
+      <div style="margin:8px 0">${esc(cur.title||'This one')} couldn't be downloaded.</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:10px">
+        <button class="primary" onclick="openInBrowser()">🌐 Open in shared browser</button>
+        <button onclick="send({t:'skip'})">⏭ Skip it</button>
+      </div>`;
+  }
 }
 
 // ---- video source (plain file or progressive HLS while downloading) ----
@@ -1496,12 +1649,13 @@ function startStream(){
   bPlayer = new JSMpeg.Player(url, {
     canvas: document.getElementById('bcanvas'),
     audio: true, pauseWhenHidden: false,
-    videoBufferSize: 2*1024*1024, audioBufferSize: 512*1024,
+    videoBufferSize: 768*1024, audioBufferSize: 256*1024,
   });
 }
 function stopStream(){
   if(bPlayer){ try{bPlayer.destroy()}catch(_){} bPlayer=null; }
 }
+function resyncStream(){ stopStream(); startStream(); toast('⟳ jumped to live'); }
 function startBrowser(){
   send({t:'browser_start'});
   toast('🌐 Starting the shared browser… (takes ~10s)');
@@ -1570,7 +1724,7 @@ function applySync(d){
   }
   if(browserActive()) return;
   const cur = curItem();
-  if(cur && (cur.status==='embed' || cur.status==='error')) return;
+  if(cur && ['embed','error','sniffing','choice'].includes(cur.status)) return;
   if(!cur || !cur.file) return;
   const target = d.position;
   if(Math.abs(v.currentTime - target) > 1.6){ sup.seek++; v.currentTime = target; }
@@ -1605,6 +1759,8 @@ function renderQueue(){
     let status='';
     if(it.status==='pending') status='⏳';
     else if(it.status==='downloading') status='⬇️ '+(it.progress||0)+'%';
+    else if(it.status==='sniffing') status='🔍';
+    else if(it.status==='choice') status='📹 pick';
     else if(it.status==='error') status='❌';
     else if(it.status==='embed') status='🌐';
     else if(it.live_dl) status='▶️⬇ '+(it.progress||0)+'%';
@@ -1651,7 +1807,7 @@ function sendChat(){
 setInterval(()=>{
   if(!st || !st.playing || browserActive()) return;
   const cur = curItem();
-  if(cur && (cur.status==='embed' || cur.status==='error')) return;
+  if(cur && ['embed','error','sniffing','choice'].includes(cur.status)) return;
   if(v.paused || !v.duration) return;
   const target = st.position + (Date.now()-syncAt)/1000;
   if(Math.abs(v.currentTime-target) > 1.6){ sup.seek++; v.currentTime = target; }
@@ -1779,13 +1935,24 @@ REELS_HTML = r"""<!DOCTYPE html>
 </div>
 <div class="rail">
   <button class="rbtn" id="likeBtn">🤍</button><div class="rcount" id="likeCount">0</div>
-  <button class="rbtn" onclick="promptAdd()">➕</button>
+  <button class="rbtn" onclick="toggleAddPanel()">➕</button>
   <button class="rbtn" onclick="copyLink()">🔗</button>
   <button class="rbtn" onclick="toggleFullscreen()">⛶</button>
   <button class="rbtn" onclick="doSwipe()">⬆️</button>
 </div>
 <div class="meta"><div class="t" id="mtitle"></div><div class="u" id="muser"></div></div>
 <div class="chatfeed" id="chatfeed"></div>
+<div id="addPanel" class="hidden" style="position:fixed;left:10px;right:70px;bottom:66px;
+     z-index:11;display:flex;gap:8px">
+  <input id="addq" maxlength="300"
+         placeholder="Paste a reel / short / tiktok link, or search — plays next & teaches the feed"
+         style="flex:1;background:rgba(255,255,255,.12);backdrop-filter:blur(8px);
+                border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:999px;
+                padding:11px 16px;font-size:14px;outline:none"
+         onkeydown="if(event.key==='Enter')submitAdd()">
+  <button class="rbtn" style="width:auto;border-radius:999px;padding:0 16px;font-size:14px"
+          onclick="submitAdd()">Add</button>
+</div>
 <div class="chatrow">
   <input id="chatq" placeholder="Chat…" maxlength="200"
          onkeydown="if(event.key==='Enter')sendChat()">
@@ -1964,9 +2131,18 @@ function onHeart(d){
   if(d.by&&d.by!==myName)toast('❤️ '+d.by);
 }
 document.getElementById('likeBtn').onclick=doLike;
-function promptAdd(){
-  const q=prompt('Paste a link (Reel / Short / TikTok / anything) or search:');
-  if(q&&q.trim()){send({t:'add',q:q.trim()});toast('⏳ Adding to the feed…')}
+function toggleAddPanel(){
+  const p=document.getElementById('addPanel');
+  p.classList.toggle('hidden');
+  if(!p.classList.contains('hidden')) document.getElementById('addq').focus();
+}
+function submitAdd(){
+  const i=document.getElementById('addq'), q=i.value.trim();
+  if(!q) return;
+  send({t:'add', q});
+  i.value=''; i.blur();
+  document.getElementById('addPanel').classList.add('hidden');
+  toast('➕ Queued — plays next, and the feed learns from it');
 }
 function addMsg(d){
   const box=document.getElementById('chatfeed');
