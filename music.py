@@ -19,6 +19,7 @@ import logging.handlers
 import glob
 import math
 import time
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
@@ -1493,9 +1494,10 @@ class MusicPlayer:
                 for song in self.twentyfourseven_songs:
                     self.queue.append(song)
 
-            # Autoplay: keep the music going with a random song from the local library
+            # Autoplay: continue the current listening lane instead of jumping
+            # randomly across the whole library.
             if not self.queue and self.autoplay and not self.is_247_mode:
-                song = self._pick_random_library_song()
+                song = self._pick_similar_library_song(self.current)
                 if song:
                     logger.info(f"🎲 Autoplay picked: {song.title}")
                     self.queue.append(song)
@@ -1655,24 +1657,61 @@ class MusicPlayer:
         finally:
             self._play_next_running = False
     
-    def _pick_random_library_song(self) -> Optional[Song]:
-        """Pick a random downloaded song from the musics folder for autoplay."""
-        try:
-            # Bias toward songs people favorited so autoplay feels curated
-            cog = self.bot.get_cog('MusicCog')
-            if cog and random.random() < 0.4:
-                favorite = cog.pick_random_favorite(self.guild, exclude_urls={s.url for s in self.history})
-                if favorite:
-                    logger.info(f"🎲 Autoplay picked a favorite: {favorite.title}")
-                    return favorite
+    @staticmethod
+    def _song_identity(song: Optional[Song]) -> tuple[str, str]:
+        """Best-effort (artist, track) identity from folders and common title forms."""
+        if not song:
+            return '', ''
+        title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', song.title or '').strip()
+        artist = ''
+        if song.source_type == 'local':
+            parent = os.path.basename(os.path.dirname(song.url))
+            if parent and os.path.abspath(os.path.dirname(song.url)) != os.path.abspath(MUSICS_FOLDER):
+                artist = parent
+        parts = re.split(r'\s+[-–—]\s+', title, maxsplit=1)
+        if len(parts) == 2:
+            left, right = parts
+            # Downloaded files normally use "artist - title"; YouTube titles do too.
+            if not artist:
+                artist = left
+            title = right
+        clean = lambda value: re.sub(r'[^a-z0-9]+', ' ', value.lower()).strip()
+        return clean(artist), clean(title)
 
+    def _pick_similar_library_song(self, seed: Optional[Song]) -> Optional[Song]:
+        """Pick a related library track, strongly preferring the same artist/album folder."""
+        try:
             files = glob.glob(os.path.join(MUSICS_FOLDER, '**', '*.mp3'), recursive=True)
             if not files:
                 return None
-            # Avoid repeating what was just played when the library is big enough
             recent_urls = {song.url for song in self.history}
             fresh = [f for f in files if f not in recent_urls]
-            path = random.choice(fresh or files)
+            candidates = fresh or files
+            seed_artist, seed_track = self._song_identity(seed)
+
+            def score(path: str) -> float:
+                raw_title = os.path.splitext(os.path.basename(path))[0]
+                candidate = Song(raw_title, path, 'Unknown', self.guild.me, 'local')
+                artist, track = self._song_identity(candidate)
+                points = random.random() * 0.35  # variety among equally good matches
+                if seed_artist and artist:
+                    if seed_artist == artist:
+                        points += 100
+                    else:
+                        points += SequenceMatcher(None, seed_artist, artist).ratio() * 12
+                        shared = set(seed_artist.split()) & set(artist.split())
+                        points += len(shared) * 5
+                # Album/artist folders are the strongest metadata local files offer.
+                if seed and seed.source_type == 'local' and os.path.dirname(path) == os.path.dirname(seed.url):
+                    points += 35
+                if seed_track and track:
+                    points += SequenceMatcher(None, seed_track, track).ratio() * 2
+                return points
+
+            ranked = sorted(candidates, key=score, reverse=True)
+            # Randomize just the top few so autoplay does not become a fixed playlist.
+            pool = ranked[:min(4, len(ranked))]
+            path = random.choice(pool)
             title = os.path.splitext(os.path.basename(path))[0]
             title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', title).strip()
             return Song(
@@ -1683,7 +1722,7 @@ class MusicPlayer:
                 source_type='local'
             )
         except Exception as e:
-            logger.warning(f"Autoplay pick failed: {e}")
+            logger.warning(f"Similar autoplay pick failed: {e}")
             return None
 
     async def seek_to(self, position_seconds: int) -> bool:
@@ -3189,16 +3228,19 @@ class MusicCog(commands.Cog):
             description = f"**{song.title}**"
 
         embed = discord.Embed(
-            title=f"{source_emoji} Now Playing",
+            title=f"{source_emoji} Now playing",
             description=description,
             color=source_color
         )
         if player:
             self._add_progress_field(embed, song, player)
             loop_status = "🔂 Song" if player.loop else ("🔁 Queue" if player.loop_queue else "➡️ Off")
-            embed.add_field(name="Volume", value=f"🔊 {int(player.volume * 100)}%", inline=True)
-            embed.add_field(name="Loop", value=loop_status, inline=True)
-            embed.add_field(name="Requested by", value=song.requester.mention, inline=True)
+            requester = getattr(song.requester, 'mention', 'Autoplay')
+            embed.add_field(
+                name="Playback",
+                value=f"🔊 **{int(player.volume * 100)}%**  •  {loop_status}  •  👤 {requester}",
+                inline=False,
+            )
 
             if player.audio_filter or player.crossfade_seconds:
                 effects = []
@@ -3270,7 +3312,7 @@ class MusicCog(commands.Cog):
             while True:
                 # 5s keeps the progress bar moving without hitting Discord's
                 # message-edit rate limits (1s edits queue up and lag badly)
-                await asyncio.sleep(1,5)
+                await asyncio.sleep(5)
 
                 guild = self.bot.get_guild(guild_id)
                 if not guild:
@@ -3545,7 +3587,7 @@ class MusicCog(commands.Cog):
         else:
             await interaction.followup.send("❌ Can't replay this song (only downloaded/local tracks support it).")
 
-    @app_commands.command(name="autoplay", description="Toggle autoplay: random songs from my library when the queue is empty")
+    @app_commands.command(name="autoplay", description="Toggle smart autoplay with similar artists and albums")
     async def autoplay(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         player.autoplay = not player.autoplay
@@ -3554,7 +3596,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("🎲 Autoplay is now **off**.")
             return
 
-        await interaction.response.send_message("🎲 Autoplay is now **on** - when the queue runs out I'll keep playing random songs from my library.")
+        await interaction.response.send_message("✨ Smart autoplay is **on** — when the queue ends, I'll stay close to the current artist, album, and sound.")
 
         # If we're sitting idle in voice, start playing right away
         vc = interaction.guild.voice_client
