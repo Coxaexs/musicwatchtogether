@@ -926,6 +926,10 @@ class Song:
     requester: discord.Member
     source_type: str  # 'youtube', 'spotify', 'local'
     thumbnail: Optional[str] = None
+    artist: Optional[str] = None
+    album: Optional[str] = None
+    genres: tuple[str, ...] = ()
+    played_at: Optional[int] = None
 
 
 class YTDLSource(discord.PCMVolumeTransformer):
@@ -1164,7 +1168,7 @@ class MusicControlView(View):
             return cog.get_player(self.bot.get_guild(self.guild_id))
         return None
     
-    @discord.ui.button(label="⏮️", style=discord.ButtonStyle.secondary, custom_id="previous")
+    @discord.ui.button(label="⏮️", style=discord.ButtonStyle.secondary, custom_id="previous", row=0)
     async def previous_button(self, interaction: discord.Interaction, button: Button):
         player = self.get_player()
         if not player:
@@ -1202,7 +1206,7 @@ class MusicControlView(View):
             player.last_message_channel = interaction.channel
             await player.play_next()
     
-    @discord.ui.button(label="⏯️", style=discord.ButtonStyle.primary, custom_id="pause_resume")
+    @discord.ui.button(label="⏯️", style=discord.ButtonStyle.primary, custom_id="pause_resume", row=0)
     async def pause_resume_button(self, interaction: discord.Interaction, button: Button):
         voice_client = interaction.guild.voice_client
         if not voice_client:
@@ -1224,7 +1228,7 @@ class MusicControlView(View):
         else:
             await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
     
-    @discord.ui.button(label="⏭️", style=discord.ButtonStyle.secondary, custom_id="skip")
+    @discord.ui.button(label="⏭️", style=discord.ButtonStyle.secondary, custom_id="skip", row=0)
     async def skip_button(self, interaction: discord.Interaction, button: Button):
         voice_client = interaction.guild.voice_client
         if not voice_client or not voice_client.is_playing():
@@ -1253,7 +1257,7 @@ class MusicControlView(View):
         else:
             await interaction.followup.send("⏭️ Skipped! No more songs.")
     
-    @discord.ui.button(label="🔊", style=discord.ButtonStyle.secondary, custom_id="volume_up")
+    @discord.ui.button(label="🔊", style=discord.ButtonStyle.secondary, custom_id="volume_up", row=1)
     async def volume_up_button(self, interaction: discord.Interaction, button: Button):
         player = self.get_player()
         if not player:
@@ -1269,7 +1273,7 @@ class MusicControlView(View):
         
         await interaction.response.send_message(f"🔊 Volume: {int(new_volume * 100)}%", ephemeral=True)
     
-    @discord.ui.button(label="🔉", style=discord.ButtonStyle.secondary, custom_id="volume_down")
+    @discord.ui.button(label="🔉", style=discord.ButtonStyle.secondary, custom_id="volume_down", row=1)
     async def volume_down_button(self, interaction: discord.Interaction, button: Button):
         player = self.get_player()
         if not player:
@@ -1285,7 +1289,7 @@ class MusicControlView(View):
         
         await interaction.response.send_message(f"🔉 Volume: {int(new_volume * 100)}%", ephemeral=True)
     
-    @discord.ui.button(label="🔀", style=discord.ButtonStyle.secondary, custom_id="shuffle", row=1)
+    @discord.ui.button(label="🔀", style=discord.ButtonStyle.secondary, custom_id="shuffle", row=2)
     async def shuffle_button(self, interaction: discord.Interaction, button: Button):
         import random
         player = self.get_player()
@@ -1307,7 +1311,7 @@ class MusicControlView(View):
         
         await interaction.response.send_message("🔀 Queue shuffled!", ephemeral=True)
     
-    @discord.ui.button(label="⏹️", style=discord.ButtonStyle.danger, custom_id="stop", row=1)
+    @discord.ui.button(label="✕", style=discord.ButtonStyle.danger, custom_id="stop", row=0)
     async def stop_button(self, interaction: discord.Interaction, button: Button):
         player = self.get_player()
         if player:
@@ -1341,6 +1345,31 @@ class MusicControlView(View):
             await interaction.response.send_message(f"❤️ Added **{title}** to your favorites! See them with `/favorites list`", ephemeral=True)
         else:
             await interaction.response.send_message(f"💔 Removed **{title}** from your favorites.", ephemeral=True)
+
+    @discord.ui.button(label="🎤", style=discord.ButtonStyle.secondary, custom_id="lyrics", row=1)
+    async def lyrics_button(self, interaction: discord.Interaction, button: Button):
+        player = self.get_player()
+        cog = self.bot.get_cog('MusicCog')
+        if not player or not player.current or not cog:
+            await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        query = cog._clean_lyrics_query(player.current.title)
+        lyrics_data = await cog._fetch_synced_lyrics(query)
+        if not lyrics_data or not lyrics_data.get('lines'):
+            await interaction.followup.send(
+                f"🎤 No synced lyrics found for **{player.current.title}**.", ephemeral=True
+            )
+            return
+        text = "\n".join(line for _, line in lyrics_data['lines'] if line.strip())
+        embed = discord.Embed(
+            title=f"🎤 {lyrics_data.get('track') or player.current.title}",
+            description=text[:3900] + ("\n…" if len(text) > 3900 else ""),
+            color=discord.Color.from_rgb(124, 92, 255),
+        )
+        embed.set_footer(text=lyrics_data.get('artist') or "Synced lyrics")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="📜", style=discord.ButtonStyle.secondary, custom_id="queue", row=1)
     async def queue_button(self, interaction: discord.Interaction, button: Button):
@@ -1387,6 +1416,83 @@ class MusicControlView(View):
             embed.set_footer(text=" | ".join(status))
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🔁", style=discord.ButtonStyle.secondary, custom_id="loop_cycle", row=2)
+    async def loop_button(self, interaction: discord.Interaction, button: Button):
+        player = self.get_player()
+        if not player:
+            await interaction.response.send_message("❌ No player found!", ephemeral=True)
+            return
+        if not player.loop and not player.loop_queue:
+            player.loop, label = True, "song"
+        elif player.loop:
+            player.loop = False
+            player.loop_queue, label = True, "queue"
+        else:
+            player.loop_queue, label = False, "off"
+        await interaction.response.send_message(f"🔁 Loop: **{label}**", ephemeral=True)
+
+    @discord.ui.button(label="✨", style=discord.ButtonStyle.secondary, custom_id="smart_autoplay", row=2)
+    async def autoplay_button(self, interaction: discord.Interaction, button: Button):
+        player = self.get_player()
+        if not player:
+            await interaction.response.send_message("❌ No player found!", ephemeral=True)
+            return
+        player.autoplay = not player.autoplay
+        state = "on — artist, album and genre radio" if player.autoplay else "off"
+        await interaction.response.send_message(f"✨ Smart Autoplay **{state}**", ephemeral=True)
+
+    @discord.ui.button(label="🎛️", style=discord.ButtonStyle.secondary, custom_id="automix_toggle", row=2)
+    async def automix_button(self, interaction: discord.Interaction, button: Button):
+        player = self.get_player()
+        if not player:
+            await interaction.response.send_message("❌ No player found!", ephemeral=True)
+            return
+        player.automix_enabled = not player.automix_enabled
+        player.preloaded_sources.clear()
+        if player.automix_enabled:
+            player.schedule_automix()
+        else:
+            player.cancel_automix()
+        await interaction.response.send_message(
+            f"🎛️ AutoMix **{'on' if player.automix_enabled else 'off'}**", ephemeral=True
+        )
+
+
+class HistoryReplaySelect(discord.ui.Select):
+    def __init__(self, cog, guild_id: int, songs: list[Song]):
+        self.cog = cog
+        self.guild_id = guild_id
+        self.songs = songs
+        options = [
+            discord.SelectOption(
+                label=f"{index}. {song.title}"[:100],
+                value=str(index - 1),
+                description=f"{song.artist or 'Recently played'} • {song.duration}"[:100],
+                emoji="➕",
+            )
+            for index, song in enumerate(songs, 1)
+        ]
+        super().__init__(placeholder="Add a recent track to the queue…", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        song = self.songs[int(self.values[0])]
+        player = self.cog.get_player(interaction.guild)
+        player.queue.append(song)
+        player.last_message_channel = interaction.channel
+        vc = interaction.guild.voice_client
+        started = bool(vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused())
+        await interaction.response.send_message(
+            f"➕ Added **{song.title}** to the queue.", ephemeral=True
+        )
+        if started:
+            await player.play_next()
+
+
+class HistoryReplayView(View):
+    def __init__(self, cog, guild_id: int, songs: list[Song]):
+        super().__init__(timeout=180)
+        self.add_item(HistoryReplaySelect(cog, guild_id, songs))
 
 
 class ServerInviteSelect(discord.ui.Select):
@@ -1728,6 +1834,9 @@ class MusicPlayer:
                         next_song.title = yt_song.title
                         next_song.duration = yt_song.duration
                         next_song.thumbnail = yt_song.thumbnail
+                        next_song.artist = yt_song.artist or next_song.artist
+                        next_song.album = yt_song.album or next_song.album
+                        next_song.genres = yt_song.genres or next_song.genres
                 
                 # Now preload the stream
                 source = await YTDLSource.from_url(
@@ -1788,7 +1897,7 @@ class MusicPlayer:
                 for song in self.twentyfourseven_songs:
                     self.queue.append(song)
             if not self.queue and self.autoplay and not self.is_247_mode:
-                pick = self._pick_random_library_song()
+                pick = await self._pick_autoplay_song()
                 if pick:
                     self.queue.append(pick)
         except Exception as e:
@@ -1820,10 +1929,11 @@ class MusicPlayer:
             # (-ss) and speed filters/atempo consume the file faster than wall time
             speed = FILTER_SPEED_FACTORS.get(self.audio_filter, 1.0) * self._automix_speed
             blend = float(self.automix_blend_seconds)
+            effective_blend = min(blend, 6.0)
             end_at = out_info['end_at']
             if end_at - self._automix_file_offset < AUTOMIX_MIN_TRACK_SECONDS:
                 return  # too short to be worth blending out of
-            trigger_at = end_at - blend * speed - 0.2  # file position where the blend starts
+            trigger_at = end_at - effective_blend * speed - 0.2
 
             in_info = None
             in_path = None
@@ -1868,6 +1978,14 @@ class MusicPlayer:
                         analyzed_song = next_song
                         in_path = path
                         in_info = info
+                        # Use the longer requested blend only when both tracks
+                        # have compatible, trustworthy tempos. Otherwise the
+                        # shorter transition avoids a long vocal-on-vocal wash.
+                        if info and out_info.get('bpm_tail') and info.get('bpm_head'):
+                            ratio = _tempo_match_ratio(out_info['bpm_tail'], info['bpm_head'])
+                            if ratio:
+                                effective_blend = blend
+                                trigger_at = end_at - effective_blend * speed - 0.2
                         continue  # analysis took time; recompute the position first
 
                 if remaining <= 0.05:
@@ -1878,7 +1996,10 @@ class MusicPlayer:
             if next_song is None:
                 return
 
-            plan = AutoMixPlan(song=next_song, fade_seconds=blend)
+            # A long blind overlap can sound muddy when tempo analysis is not
+            # available. Keep the user's full blend for confidently matched
+            # tracks and use a shorter, cleaner handoff otherwise.
+            plan = AutoMixPlan(song=next_song, fade_seconds=effective_blend)
             if in_info and analyzed_song is next_song and in_path:
                 plan.file_path = in_path
                 plan.start_seconds = in_info['start_at']
@@ -1924,9 +2045,9 @@ class MusicPlayer:
 
             # Autoplay: keep the music going with a random song from the local library
             if not self.queue and self.autoplay and not self.is_247_mode:
-                song = self._pick_random_library_song()
+                song = await self._pick_autoplay_song()
                 if song:
-                    logger.info(f"🎲 Autoplay picked: {song.title}")
+                    logger.info(f"🎶 Smart autoplay picked: {song.title}")
                     self.queue.append(song)
 
             if not self.queue:
@@ -1953,6 +2074,7 @@ class MusicPlayer:
 
             # Record in history (skip immediate repeats from /loop)
             if not self.history or self.history[0].url != self.current.url:
+                self.current.played_at = int(time.time())
                 self.history.appendleft(self.current)
 
             # Record in persistent listening stats (skip bot-requested plays
@@ -2036,6 +2158,9 @@ class MusicPlayer:
                             self.current.title = yt_song.title
                             self.current.duration = yt_song.duration
                             self.current.thumbnail = yt_song.thumbnail
+                            self.current.artist = yt_song.artist or self.current.artist
+                            self.current.album = yt_song.album or self.current.album
+                            self.current.genres = yt_song.genres or self.current.genres
 
                     # Now get the stream
                     source = await asyncio.wait_for(
@@ -2141,6 +2266,24 @@ class MusicPlayer:
         finally:
             self._play_next_running = False
     
+    async def _pick_autoplay_song(self) -> Optional[Song]:
+        """Pick a context-aware follow-up, falling back to the local library."""
+        cog = self.bot.get_cog('MusicCog')
+        if cog:
+            has_artist_context = bool(cog._song_artist(self.current))
+            try:
+                recommendation = await cog.pick_autoplay_recommendation(self)
+                if recommendation:
+                    return recommendation
+            except Exception as e:
+                logger.debug(f"Smart autoplay recommendation failed: {e}")
+            # If we know the artist, silence is preferable to an unrelated
+            # random jump. The local random fallback is only for old/unknown
+            # files that carry no usable music context.
+            if has_artist_context:
+                return None
+        return self._pick_random_library_song()
+
     def _pick_random_library_song(self) -> Optional[Song]:
         """Pick a random downloaded song from the musics folder for autoplay."""
         try:
@@ -2363,11 +2506,173 @@ class MusicCog(commands.Cog):
         self._wrapped_task = None
         self._state_restored = False
         self._last_saved_state = None
+        self._autoplay_station_cache = {}
     
     def get_player(self, guild) -> MusicPlayer:
         if guild.id not in self.players:
             self.players[guild.id] = MusicPlayer(self.bot, guild)
         return self.players[guild.id]
+
+    @staticmethod
+    def _artist_key(value: Optional[str]) -> str:
+        """Normalize artist/channel names for recommendation matching."""
+        value = (value or '').lower()
+        value = re.sub(r'(?:official|vevo|topic)(?:\s+(?:music|artist|channel))*$', '', value.strip())
+        value = re.sub(r'\b(official|vevo|topic|music)\b', ' ', value)
+        return re.sub(r'[^a-z0-9\u00c0-\u024f]+', '', value)
+
+    def _song_artist(self, song: Optional[Song]) -> Optional[str]:
+        if not song:
+            return None
+        if song.artist and self._artist_key(song.artist):
+            return re.sub(
+                r'\s*(?:[-–|]\s*)?(?:topic|official|vevo)(?:\s+(?:music|artist|channel))*\s*$',
+                '', song.artist, flags=re.IGNORECASE
+            ).strip()
+        if song.source_type == 'local' and song.url:
+            parent = os.path.basename(os.path.dirname(song.url))
+            if parent and parent not in {os.path.basename(MUSICS_FOLDER), os.path.basename(DOWNLOADS_FOLDER)}:
+                return parent
+        # Most music uploads use "Artist - Track". This is deliberately only
+        # a last resort because metadata and artist folders are more reliable.
+        parts = re.split(r'\s+[-–—|]\s+', song.title or '', maxsplit=1)
+        return parts[0].strip() if len(parts) == 2 else None
+
+    async def _autoplay_station(self, artist: str) -> list[dict]:
+        """Build an artist radio from Deezer's public catalogue, cached for 6h."""
+        key = self._artist_key(artist)
+        cached = self._autoplay_station_cache.get(key)
+        if cached and cached[0] > time.time():
+            return cached[1]
+
+        timeout = aiohttp.ClientTimeout(total=10)
+        station = []
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"https://api.deezer.com/search/artist?q={quote(artist)}&limit=8"
+                ) as response:
+                    if response.status != 200:
+                        return []
+                    matches = (await response.json()).get('data') or []
+                if not matches:
+                    return []
+                seed = min(matches, key=lambda item: (
+                    self._artist_key(item.get('name')) != key,
+                    -int(item.get('nb_fan') or 0),
+                ))
+
+                async with session.get(
+                    f"https://api.deezer.com/artist/{seed['id']}/related?limit=8"
+                ) as response:
+                    related = (await response.json()).get('data') or [] if response.status == 200 else []
+
+                # Favor the current artist while still making roughly half of
+                # the station genuinely adjacent artists.
+                artists = [seed] * 2 + related[:6]
+                unique_artists = {item['id']: item for item in artists}.values()
+
+                async def top_tracks(item):
+                    try:
+                        async with session.get(
+                            f"https://api.deezer.com/artist/{item['id']}/top?limit=12"
+                        ) as response:
+                            data = (await response.json()).get('data') or [] if response.status == 200 else []
+                        return [{
+                            'title': track.get('title_short') or track.get('title'),
+                            'artist': (track.get('artist') or {}).get('name') or item.get('name'),
+                            'album': (track.get('album') or {}).get('title'),
+                            'related': item['id'] != seed['id'],
+                        } for track in data]
+                    except Exception:
+                        return []
+
+                groups = await asyncio.gather(*(top_tracks(item) for item in unique_artists))
+                station = [track for group in groups for track in group if track.get('title')]
+        except Exception as e:
+            logger.debug(f"Could not build autoplay station for {artist}: {e}")
+
+        self._autoplay_station_cache[key] = (
+            time.time() + (6 * 3600 if station else 5 * 60), station
+        )
+        return station
+
+    async def pick_autoplay_recommendation(self, player: MusicPlayer) -> Optional[Song]:
+        """Choose the next track by artist/album affinity instead of at random."""
+        seed = player.current or (player.history[0] if player.history else None)
+        artist = self._song_artist(seed)
+        if not artist:
+            return None
+
+        station = await self._autoplay_station(artist)
+        seed_key = self._artist_key(artist)
+        related_keys = {self._artist_key(item.get('artist')) for item in station}
+        recent_urls = {song.url for song in player.history}
+        recent_titles = {
+            re.sub(r'\W+', '', (song.title or '').lower()) for song in player.history
+        }
+
+        # Reuse relevant downloads first: same artist/album wins, followed by
+        # artists from the related-artist station. Unrelated library tracks are
+        # intentionally not candidates here.
+        local_candidates = []
+        roots = {MUSICS_FOLDER, DOWNLOADS_FOLDER}
+        for root in roots:
+            for path in glob.glob(os.path.join(root, '**', '*.mp3'), recursive=True):
+                if path in recent_urls:
+                    continue
+                folder_artist = os.path.basename(os.path.dirname(path))
+                candidate_key = self._artist_key(folder_artist)
+                score = 0
+                if candidate_key == seed_key:
+                    score = 100
+                elif candidate_key in related_keys:
+                    score = 65
+                if seed and seed.album and self._artist_key(seed.album) in self._artist_key(path):
+                    score += 35
+                if score:
+                    local_candidates.append((score, path, folder_artist))
+
+        if local_candidates:
+            local_candidates.sort(key=lambda item: item[0], reverse=True)
+            score, path, folder_artist = random.choice(local_candidates[:10])
+            title = os.path.splitext(os.path.basename(path))[0]
+            title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', title).strip()
+            logger.info(f"🎶 Autoplay local affinity {score}: {folder_artist} - {title}")
+            return Song(title=title or 'Unknown', url=path, duration='Unknown',
+                        requester=player.guild.me, source_type='local', artist=folder_artist)
+
+        fresh = [item for item in station
+                 if re.sub(r'\W+', '', item['title'].lower()) not in recent_titles]
+        if not fresh:
+            # Catalogue outages still get a same-artist fallback; never jump
+            # to a random artist just because related-artist lookup failed.
+            for suffix in ('official audio', 'deep cut official audio'):
+                song = await self.process_youtube(f"{artist} {suffix}", player.guild.me)
+                if song and song.url not in recent_urls:
+                    song.artist = artist
+                    return song
+            return None
+        # 60/40 current-vs-related keeps an artist radio coherent without
+        # getting stuck playing an entire discography.
+        same_artist = [item for item in fresh if self._artist_key(item.get('artist')) == seed_key]
+        related = [item for item in fresh if self._artist_key(item.get('artist')) != seed_key]
+        album_key = self._artist_key(seed.album) if seed and seed.album else ''
+        same_album = [item for item in fresh
+                      if album_key and self._artist_key(item.get('album')) == album_key]
+        if same_album and random.random() < 0.35:
+            pool = same_album
+        else:
+            pool = same_artist if same_artist and (not related or random.random() < 0.60) else related
+        pick = random.choice(pool or fresh)
+        song = await self.process_youtube(
+            f"{pick['artist']} - {pick['title']} official audio", player.guild.me
+        )
+        if song:
+            song.artist = pick['artist']
+            song.album = pick.get('album')
+            logger.info(f"🎶 Autoplay radio: {pick['artist']} - {pick['title']}")
+        return song
 
     def _get_invite_channel(self, guild: discord.Guild):
         bot_member = guild.get_member(self.bot.user.id) if self.bot.user else None
@@ -2858,6 +3163,15 @@ class MusicCog(commands.Cog):
                 if data:
                     title = data.get('title', 'Unknown')
                     url = data.get('webpage_url') or data.get('original_url') or data.get('url') or query
+                    raw_genres = data.get('genres') or data.get('categories') or []
+                    if isinstance(raw_genres, str):
+                        raw_genres = [raw_genres]
+                    artist_name = data.get('artist') or data.get('uploader') or data.get('channel')
+                    if artist_name:
+                        artist_name = re.sub(
+                            r'\s*(?:[-–|]\s*)?(?:topic|official|vevo)(?:\s+(?:music|artist|channel))*\s*$',
+                            '', artist_name, flags=re.IGNORECASE
+                        ).strip()
                     print(f"Found: {title} -> {url}")
                     return Song(
                         title=title,
@@ -2865,7 +3179,10 @@ class MusicCog(commands.Cog):
                         duration=self.format_duration(data.get('duration', 0)),
                         requester=requester,
                         source_type='youtube',
-                        thumbnail=data.get('thumbnail')
+                        thumbnail=data.get('thumbnail'),
+                        artist=artist_name,
+                        album=data.get('album'),
+                        genres=tuple(str(genre) for genre in raw_genres[:8])
                     )
 
                 print("No results from yt-dlp")
@@ -3663,32 +3980,31 @@ class MusicCog(commands.Cog):
         else:
             progress_value = f"{state_emoji} `{elapsed_text}`"
 
-        embed.add_field(name="Progress", value=progress_value, inline=False)
+        embed.add_field(name="\u200b", value=progress_value, inline=False)
 
     def create_now_playing_embed(self, song: Song, player: Optional[MusicPlayer] = None) -> discord.Embed:
         source_emoji = {'youtube': '🔴', 'spotify': '💚', 'local': '📁'}.get(song.source_type, '🎵')
-        source_color = {
-            'youtube': discord.Color.from_rgb(255, 0, 0),
-            'spotify': discord.Color.from_rgb(30, 215, 96),
-            'local': discord.Color.blurple(),
-        }.get(song.source_type, discord.Color.blurple())
+        source_color = discord.Color.from_rgb(124, 92, 255)
 
         if song.source_type != 'local' and str(song.url).startswith('http'):
-            description = f"**[{song.title}]({song.url})**"
+            description = f"## [{song.title}]({song.url})"
         else:
-            description = f"**{song.title}**"
+            description = f"## {song.title}"
+        details = [part for part in (song.artist, song.album) if part]
+        if details:
+            description += "\n" + " • ".join(details)
 
         embed = discord.Embed(
-            title=f"{source_emoji} Now Playing",
+            title="Now playing",
             description=description,
             color=source_color
         )
         if player:
             self._add_progress_field(embed, song, player)
-            loop_status = "🔂 Song" if player.loop else ("🔁 Queue" if player.loop_queue else "➡️ Off")
-            embed.add_field(name="Volume", value=f"🔊 {int(player.volume * 100)}%", inline=True)
-            embed.add_field(name="Loop", value=loop_status, inline=True)
-            embed.add_field(name="Requested by", value=song.requester.mention, inline=True)
+            loop_status = "Song" if player.loop else ("Queue" if player.loop_queue else "Off")
+            status = [f"🔊 {int(player.volume * 100)}%", f"🔁 {loop_status}"]
+            if player.autoplay:
+                status.append("✨ Smart Autoplay")
 
             if player.audio_filter or player.crossfade_seconds or player.automix_enabled:
                 effects = []
@@ -3698,7 +4014,7 @@ class MusicCog(commands.Cog):
                     effects.append(f"AutoMix {player.automix_blend_seconds}s")
                 elif player.crossfade_seconds:
                     effects.append(f"crossfade {player.crossfade_seconds}s")
-                embed.add_field(name="Effects", value="🎛️ " + " • ".join(effects), inline=True)
+                status.append("🎛️ " + " • ".join(effects))
 
             # Read cached live lyrics if available
             try:
@@ -3739,10 +4055,17 @@ class MusicCog(commands.Cog):
                 if len(next_title) > 70:
                     next_title = next_title[:67] + "..."
                 embed.add_field(
-                    name=f"Up Next • {len(player.queue)} in queue",
-                    value=next_title,
+                    name=f"Up next • {len(player.queue)} queued",
+                    value=f"⏭️ {next_title}",
                     inline=False
                 )
+            requester = getattr(song.requester, 'display_name', None) or 'Autoplay'
+            channel = getattr(getattr(player.guild, 'voice_client', None), 'channel', None)
+            footer = f"{source_emoji} {requester}"
+            if channel:
+                footer += f" • 🔊 {channel.name}"
+            footer += " • " + " • ".join(status)
+            embed.set_footer(text=footer[:2048])
         else:
             embed.add_field(name="Duration", value=song.duration, inline=True)
             embed.add_field(name="Requested by", value=song.requester.mention, inline=True)
@@ -3762,7 +4085,7 @@ class MusicCog(commands.Cog):
             while True:
                 # 5s keeps the progress bar moving without hitting Discord's
                 # message-edit rate limits (1s edits queue up and lag badly)
-                await asyncio.sleep(1,5)
+                await asyncio.sleep(5)
 
                 guild = self.bot.get_guild(guild_id)
                 if not guild:
@@ -3981,11 +4304,12 @@ class MusicCog(commands.Cog):
         if not player.current:
             await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
             return
-        
+
+        await interaction.response.defer()
         self._stop_now_playing_task(interaction.guild.id)
-        embed = self.create_now_playing_embed(player.current, player)
+        embed = await self.create_now_playing_with_lyrics_embed(player.current, player)
         view = MusicControlView(self.bot, interaction.guild.id)
-        await interaction.response.send_message(embed=embed, view=view)
+        await interaction.edit_original_response(embed=embed, view=view)
 
         message = await interaction.original_response()
         task = asyncio.create_task(self._run_now_playing_live(interaction.guild.id, message, player.current_song_key))
@@ -4037,16 +4361,19 @@ class MusicCog(commands.Cog):
         else:
             await interaction.followup.send("❌ Can't replay this song (only downloaded/local tracks support it).")
 
-    @app_commands.command(name="autoplay", description="Toggle autoplay: random songs from my library when the queue is empty")
+    @app_commands.command(name="autoplay", description="Toggle smart artist/album radio when the queue is empty")
     async def autoplay(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         player.autoplay = not player.autoplay
 
         if not player.autoplay:
-            await interaction.response.send_message("🎲 Autoplay is now **off**.")
+            await interaction.response.send_message("✨ Smart Autoplay is **off**.")
             return
 
-        await interaction.response.send_message("🎲 Autoplay is now **on** - when the queue runs out I'll keep playing random songs from my library.")
+        await interaction.response.send_message(
+            "✨ Smart Autoplay is **on** - when the queue runs out, I'll continue with "
+            "the same artist, album, or closely related artists."
+        )
 
         # If we're sitting idle in voice, start playing right away
         vc = interaction.guild.voice_client
@@ -4062,18 +4389,25 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("❌ Nothing has been played yet!", ephemeral=True)
             return
 
+        songs = list(player.history)[:10]
         lines = []
-        for i, song in enumerate(list(player.history)[:10], 1):
+        for i, song in enumerate(songs, 1):
             title = song.title if len(song.title) <= 60 else song.title[:57] + "..."
-            lines.append(f"`{i}.` {title}")
+            when = f" • <t:{song.played_at}:R>" if song.played_at else ""
+            artist = f" — {song.artist}" if song.artist and self._artist_key(song.artist) not in self._artist_key(title) else ""
+            lines.append(f"**{i}.** {title}{artist}\n　`{song.duration}`{when}")
 
         embed = discord.Embed(
-            title="🕘 Recently Played",
-            description="\n".join(lines),
-            color=discord.Color.blurple()
+            title="🕘 Your listening history",
+            description="\n\n".join(lines),
+            color=discord.Color.from_rgb(124, 92, 255)
         )
-        embed.set_footer(text="1 = most recent • use /play to queue one again")
-        await interaction.response.send_message(embed=embed)
+        unique = len({song.url for song in player.history})
+        embed.set_author(name=f"{len(player.history)} tracks played • {unique} unique")
+        embed.set_footer(text="Choose a track below to put it back in the queue")
+        await interaction.response.send_message(
+            embed=embed, view=HistoryReplayView(self, interaction.guild.id, songs)
+        )
 
     @app_commands.command(name="search", description="Search YouTube and pick from the top 5 results")
     @app_commands.describe(query="What to search for")
@@ -4603,6 +4937,10 @@ class MusicCog(commands.Cog):
             'duration': song.duration,
             'source_type': song.source_type,
             'thumbnail': song.thumbnail,
+            'artist': song.artist,
+            'album': song.album,
+            'genres': list(song.genres),
+            'played_at': song.played_at,
             'requester_id': getattr(song.requester, 'id', None),
         }
 
@@ -4615,6 +4953,10 @@ class MusicCog(commands.Cog):
             requester=requester or guild.me,
             source_type=entry.get('source_type', 'youtube'),
             thumbnail=entry.get('thumbnail'),
+            artist=entry.get('artist'),
+            album=entry.get('album'),
+            genres=tuple(entry.get('genres') or ()),
+            played_at=entry.get('played_at'),
         )
 
     def snapshot_player_state(self) -> dict:
@@ -4824,7 +5166,7 @@ class MusicCog(commands.Cog):
             note = " Crossfade is set aside while AutoMix is on." if player.crossfade_seconds else ""
             await interaction.response.send_message(
                 f"🎧 AutoMix **on** - each song will blend into the next like a DJ set "
-                f"(~{player.automix_blend_seconds}s overlap, beat-matched when the tempos line up).{note}")
+                f"(up to {player.automix_blend_seconds}s overlap; longer blends are used when tempos line up).{note}")
         else:
             player.cancel_automix()
             await interaction.response.send_message("🎧 AutoMix **off** - songs will play back to back again.")
