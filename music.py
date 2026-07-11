@@ -5,6 +5,8 @@ from discord.ui import View, Button
 import asyncio
 import yt_dlp
 import os
+import audioop
+import subprocess
 import tempfile
 from collections import deque
 from dataclasses import dataclass
@@ -94,6 +96,24 @@ FILTER_SPEED_FACTORS = {
 
 MAX_CROSSFADE_SECONDS = 10
 
+# ---------- AutoMix (DJ-style transitions) ----------
+# AutoMix overlaps the end of the playing song with the start of the next one
+# (equal-power blend, like a DJ) instead of the plain fade-out/fade-in that
+# /crossfade does. When both songs have a detectable steady tempo that is
+# close enough, the incoming song is stretched with atempo so the beats line
+# up during the blend. Analysis needs a local file, which is the normal case
+# since downloads are cached as mp3; streams fall back to a plain blend.
+AUTOMIX_MIN_BLEND_SECONDS = 4
+AUTOMIX_MAX_BLEND_SECONDS = 15
+AUTOMIX_DEFAULT_BLEND_SECONDS = 8
+AUTOMIX_MIN_TRACK_SECONDS = 45     # don't blend out of very short tracks
+AUTOMIX_TEMPO_TOLERANCE = 0.08     # max tempo stretch when beat-matching (8%)
+AUTOMIX_ANALYSIS_RATE = 11025      # mono decode rate for tempo/silence analysis
+AUTOMIX_BPM_MIN = 60.0
+AUTOMIX_BPM_MAX = 200.0
+AUTOMIX_BPM_MIN_CONFIDENCE = 0.30  # normalized autocorrelation peak to trust a tempo
+AUTOMIX_MIN_ONSET_FLUX = 0.025     # mean log-energy rise; below this there is no beat to find
+
 # Give up on loading a song after this long so one giant/slow download can't
 # freeze the whole player (the queue just moves on to the next song)
 SONG_LOAD_TIMEOUT_SECONDS = 300
@@ -128,7 +148,8 @@ def parse_duration_to_seconds(duration: str) -> Optional[int]:
 def build_audio_options(filter_name: Optional[str] = None,
                         crossfade_seconds: int = 0,
                         duration_seconds: Optional[int] = None,
-                        start_seconds: int = 0) -> str:
+                        start_seconds: int = 0,
+                        extra_filters: Optional[list] = None) -> str:
     """Build the FFmpeg output options string (-vn -af "...") for a song.
 
     The fade-out start is computed in output timestamps: after an input seek
@@ -139,6 +160,8 @@ def build_audio_options(filter_name: Optional[str] = None,
     if filter_name and filter_name in AUDIO_FILTERS:
         chain.append(AUDIO_FILTERS[filter_name])
     chain.append(LOUDNORM_FILTER)
+    if extra_filters:
+        chain.extend(extra_filters)
 
     if crossfade_seconds > 0:
         chain.append(f'afade=t=in:st=0:d={crossfade_seconds}')
@@ -151,6 +174,263 @@ def build_audio_options(filter_name: Optional[str] = None,
                 chain.append(f'afade=t=out:st={fade_out_start:.1f}:d={crossfade_seconds}')
 
     return f'-vn -af "{",".join(chain)}"'
+
+
+# ---------- AutoMix analysis & mixing ----------
+
+def _probe_duration_seconds(path: str) -> Optional[float]:
+    """Real duration of an audio file via ffprobe (queue metadata can be stale)."""
+    cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+           '-of', 'default=noprint_wrappers=1:nokey=1', path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return float(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def _decode_pcm_mono(path: str, start: float, duration: float,
+                     rate: int = AUTOMIX_ANALYSIS_RATE) -> Optional[bytes]:
+    """Decode a slice of an audio file to raw mono s16 PCM for analysis."""
+    cmd = [
+        'ffmpeg', '-v', 'error', '-nostdin',
+        '-ss', f'{max(0.0, start):.2f}', '-t', f'{max(0.1, duration):.2f}',
+        '-i', path, '-map', 'a:0', '-ac', '1', '-ar', str(rate),
+        '-f', 's16le', 'pipe:1',
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+    except Exception:
+        return None
+    data = result.stdout
+    if not data or len(data) < rate:  # less than half a second of audio
+        return None
+    if len(data) % 2:
+        data = data[:-1]
+    return data
+
+
+def _rms_envelope(pcm: bytes, hop_samples: int) -> list:
+    """Per-window RMS levels of mono s16 PCM."""
+    frame_bytes = hop_samples * 2
+    return [audioop.rms(pcm[i:i + frame_bytes], 2)
+            for i in range(0, len(pcm) - frame_bytes + 1, frame_bytes)]
+
+
+def _estimate_bpm(pcm: bytes, rate: int = AUTOMIX_ANALYSIS_RATE):
+    """Estimate tempo of mono s16 PCM via onset-energy autocorrelation.
+
+    Returns (bpm, confidence). Confidence is the autocorrelation peak
+    normalized by the onset signal's energy (0..~1): a steady dance beat
+    scores high, rubato/ambient audio scores near zero. Half/double-time
+    readings are acceptable here because _tempo_match_ratio treats them
+    as the same groove.
+    """
+    hop, win = 128, 256
+    total_samples = len(pcm) // 2
+    if total_samples < rate * 10:  # need ~10s to lock onto a tempo
+        return None, 0.0
+
+    energies = [audioop.rms(pcm[2 * s: 2 * (s + win)], 2)
+                for s in range(0, total_samples - win, hop)]
+
+    # Onset strength: rectified rise in log energy
+    onsets = [0.0]
+    prev = math.log(energies[0] + 1)
+    for e in energies[1:]:
+        cur = math.log(e + 1)
+        onsets.append(max(0.0, cur - prev))
+        prev = cur
+    mean_onset = sum(onsets) / len(onsets)
+    if mean_onset < AUTOMIX_MIN_ONSET_FLUX:
+        return None, 0.0  # too little energy movement: drone/silence, no beat
+    onsets = [o - mean_onset for o in onsets]
+
+    frames_per_sec = rate / hop
+    min_lag = max(1, int(frames_per_sec * 60.0 / AUTOMIX_BPM_MAX))
+    max_lag = int(frames_per_sec * 60.0 / AUTOMIX_BPM_MIN)
+    if max_lag + 1 >= len(onsets):
+        return None, 0.0
+
+    count = len(onsets) - max_lag
+    zero_lag = sum(o * o for o in onsets[:count]) / count
+    scores = {}
+    for lag in range(min_lag, max_lag + 1):
+        total = 0.0
+        for i in range(count):
+            total += onsets[i] * onsets[i + lag]
+        scores[lag] = total / count
+
+    best_lag = max(scores, key=scores.get)
+    best = scores[best_lag]
+    if best <= 0 or zero_lag <= 0:
+        return None, 0.0
+    confidence = best / zero_lag
+
+    # Parabolic interpolation around the peak for sub-frame lag precision
+    refined = float(best_lag)
+    if min_lag < best_lag < max_lag:
+        y0, y1, y2 = scores[best_lag - 1], scores[best_lag], scores[best_lag + 1]
+        denom = y0 - 2 * y1 + y2
+        if abs(denom) > 1e-12:
+            refined += 0.5 * (y0 - y2) / denom
+
+    return 60.0 * frames_per_sec / refined, confidence
+
+
+def _tempo_match_ratio(bpm_out: float, bpm_in: float) -> Optional[float]:
+    """atempo ratio that beat-matches the incoming song to the outgoing one.
+
+    Half/double-time readings count as a match (85 vs 170 BPM is the same
+    groove). Returns None when no reading is within the stretch tolerance.
+    """
+    best = None
+    for mult in (0.5, 1.0, 2.0):
+        ratio = bpm_out / (bpm_in * mult)
+        if abs(ratio - 1.0) <= AUTOMIX_TEMPO_TOLERANCE:
+            if best is None or abs(ratio - 1.0) < abs(best - 1.0):
+                best = ratio
+    return best
+
+
+def analyze_track_edges(path: str) -> Optional[dict]:
+    """Analyze a local audio file for AutoMix transitions.
+
+    Returns the track's real duration, where its audible content starts and
+    ends (silence trimmed), and tempo estimates for the first and last ~30
+    seconds. Blocking (ffmpeg + math, ~1s) - call in an executor.
+    """
+    duration = _probe_duration_seconds(path)
+    if not duration or duration <= 0:
+        return None
+
+    rate = AUTOMIX_ANALYSIS_RATE
+    head = _decode_pcm_mono(path, 0.0, min(30.0, duration))
+    tail_len = min(40.0, duration)
+    tail_start = max(0.0, duration - tail_len)
+    tail = _decode_pcm_mono(path, tail_start, tail_len + 1.0)
+    if head is None or tail is None:
+        return None
+
+    hop = 512  # ~46ms resolution is plenty for silence trimming
+    head_env = _rms_envelope(head, hop)
+    tail_env = _rms_envelope(tail, hop)
+    if not head_env or not tail_env:
+        return None
+    peak = max(max(head_env), max(tail_env)) or 1
+    floor = peak * 0.02  # ≈ -34dB below peak: silence / noise floor
+
+    start_at = 0.0
+    for i, level in enumerate(head_env):
+        if level >= floor:
+            start_at = i * hop / rate
+            break
+
+    end_at = duration
+    for i in range(len(tail_env) - 1, -1, -1):
+        if tail_env[i] >= floor:
+            end_at = min(duration, tail_start + (i + 1) * hop / rate)
+            break
+
+    bpm_head, conf_head = _estimate_bpm(head[int(start_at * rate) * 2:])
+    tail_cut = int(max(0.0, end_at - tail_start) * rate) * 2
+    bpm_tail, conf_tail = _estimate_bpm(tail[:tail_cut])
+
+    return {
+        'duration': duration,
+        'start_at': start_at,
+        'end_at': end_at,
+        'bpm_head': bpm_head if conf_head >= AUTOMIX_BPM_MIN_CONFIDENCE else None,
+        'bpm_tail': bpm_tail if conf_tail >= AUTOMIX_BPM_MIN_CONFIDENCE else None,
+    }
+
+
+@dataclass
+class AutoMixPlan:
+    """How to blend the next song in when the current one is about to end."""
+    song: 'Song'                     # queue entry this plan was built for
+    fade_seconds: float
+    file_path: Optional[str] = None  # local file for a trimmed/beat-matched start
+    start_seconds: float = 0.0       # lead-in silence to skip
+    atempo: float = 1.0              # tempo stretch to match the outgoing song
+    bpm_out: Optional[float] = None
+    bpm_in: Optional[float] = None
+
+
+class AutoMixTransition(discord.AudioSource):
+    """Blends the currently playing source into the next song's source.
+
+    Swapped in live via voice_client.source, so the player thread and its
+    after-callback keep running. During the blend both sources are read and
+    mixed with an equal-power curve; the fade advances per frame, so pausing
+    pauses the blend too. Afterwards it passes the incoming source through
+    (a follow-up transition unwraps it again via active_source()).
+    """
+
+    def __init__(self, outgoing, incoming, fade_seconds: float):
+        if isinstance(outgoing, AutoMixTransition):
+            outgoing = outgoing.active_source()  # don't nest finished transitions
+        self.outgoing = outgoing
+        self.incoming = incoming
+        self.total_frames = max(1, int(fade_seconds * 1000 / 20))  # 20ms frames
+        self.frames_done = 0
+        self._outgoing_finished = False
+
+    def active_source(self):
+        return self.incoming if self._outgoing_finished else self
+
+    @property
+    def volume(self):
+        return getattr(self.incoming, 'volume', 1.0)
+
+    @volume.setter
+    def volume(self, value):
+        for source in (self.incoming, self.outgoing):
+            if hasattr(source, 'volume'):
+                source.volume = value
+
+    def is_opus(self) -> bool:
+        return False
+
+    def _finish_outgoing(self):
+        self._outgoing_finished = True
+        try:
+            self.outgoing.cleanup()
+        except Exception:
+            pass
+
+    def read(self) -> bytes:
+        in_frame = self.incoming.read()
+        if self._outgoing_finished:
+            return in_frame
+        out_frame = self.outgoing.read()
+        if not out_frame:
+            self._finish_outgoing()
+            return in_frame
+
+        self.frames_done += 1
+        progress = min(1.0, self.frames_done / self.total_frames)
+        faded_out = audioop.mul(out_frame, 2, math.cos(progress * math.pi / 2))
+        if self.frames_done >= self.total_frames:
+            self._finish_outgoing()  # blend done; drop the old song's remainder
+        if not in_frame:
+            return faded_out  # incoming ran dry mid-blend; let the old song carry it
+
+        if len(in_frame) < len(faded_out):
+            in_frame += b'\x00' * (len(faded_out) - len(in_frame))
+        faded_in = audioop.mul(in_frame, 2, math.sin(progress * math.pi / 2))
+        if len(faded_out) < len(faded_in):
+            faded_out += b'\x00' * (len(faded_in) - len(faded_out))
+        return audioop.add(faded_out, faded_in, 2)
+
+    def cleanup(self):
+        for source in (self.outgoing, self.incoming):
+            try:
+                source.cleanup()
+            except Exception:
+                pass
+
+
 INVITE_ALLOWED_USER_IDS = {
     532622134615343124,
     604289866943037441,
@@ -1328,13 +1608,20 @@ class MusicPlayer:
         self.crossfade_seconds = 0  # Fade in/out duration between songs (0 = off)
         self.skip_votes = set()  # User IDs that voted to skip the current song
         self.karaoke_mode = False  # Vocal removal + live lyrics on every song
+        self.automix_enabled = False  # DJ-style overlapping, beat-matched transitions
+        self.automix_blend_seconds = AUTOMIX_DEFAULT_BLEND_SECONDS
+        self._automix_task: Optional[asyncio.Task] = None  # Per-song transition watcher
+        self._automix_speed = 1.0  # atempo AutoMix applied to the current song
+        self._automix_file_offset = 0.0  # File position where the current source started
 
     def build_source_options(self, song: Optional[Song] = None, start_seconds: int = 0) -> str:
         """FFmpeg output options for this guild's active filter/crossfade settings."""
         duration_seconds = parse_duration_to_seconds(song.duration) if song else None
+        # AutoMix blends live; a baked-in afade would fight the mixer
+        crossfade = 0 if self.automix_enabled else self.crossfade_seconds
         return build_audio_options(
             filter_name=self.audio_filter,
-            crossfade_seconds=self.crossfade_seconds,
+            crossfade_seconds=crossfade,
             duration_seconds=duration_seconds,
             start_seconds=start_seconds,
         )
@@ -1465,7 +1752,149 @@ class MusicPlayer:
         except Exception as e:
             print(f"Preload error: {e}")
 
-    async def play_next(self):
+    # ---------- AutoMix ----------
+
+    def _resolve_local_file(self, song: Optional[Song]) -> Optional[str]:
+        """Local audio file for a song, when one exists (upload or download cache)."""
+        if not song:
+            return None
+        if song.source_type == 'local':
+            return song.url if os.path.exists(song.url) else None
+        video_id = extract_youtube_video_id(song.url)
+        return find_cached_song(video_id) if video_id else None
+
+    def cancel_automix(self):
+        task = self._automix_task
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        self._automix_task = None
+
+    def schedule_automix(self):
+        """(Re)start the transition watcher for the song that is playing now."""
+        self.cancel_automix()
+        if self.automix_enabled:
+            self._automix_task = asyncio.create_task(self._automix_watcher())
+
+    async def _automix_top_up_queue(self):
+        """Refill an empty queue early (playlist/24-7/autoplay) so AutoMix has a next song."""
+        try:
+            if not self.queue and self.pending_playlist:
+                await self.load_next_from_playlist()
+            if not self.queue and self.is_247_mode and self.twentyfourseven_songs:
+                try:
+                    random.shuffle(self.twentyfourseven_songs)
+                except Exception:
+                    pass
+                for song in self.twentyfourseven_songs:
+                    self.queue.append(song)
+            if not self.queue and self.autoplay and not self.is_247_mode:
+                pick = self._pick_random_library_song()
+                if pick:
+                    self.queue.append(pick)
+        except Exception as e:
+            logger.debug(f"AutoMix queue top-up failed: {e}")
+
+    async def _automix_watcher(self):
+        """Watch the current song and hand playback to AutoMix near its end.
+
+        Analyzes the playing file and the next queued file in the background
+        (silence trim + tempo estimate), then calls play_next() with an
+        AutoMixPlan right when the blend should start.
+        """
+        try:
+            song = self.current
+            song_key = self.current_song_key
+            if not song or not self.automix_enabled or self.loop:
+                return
+
+            await asyncio.sleep(2.0)  # let playback settle and preloading start
+
+            out_path = self._resolve_local_file(song)
+            if not out_path:
+                return  # can't know a stream's true ending; play it out normally
+            out_info = await self.bot.loop.run_in_executor(None, analyze_track_edges, out_path)
+            if not out_info or self.current is not song or self.current_song_key != song_key:
+                return
+
+            # Position math is in file time: the source may have started mid-file
+            # (-ss) and speed filters/atempo consume the file faster than wall time
+            speed = FILTER_SPEED_FACTORS.get(self.audio_filter, 1.0) * self._automix_speed
+            blend = float(self.automix_blend_seconds)
+            end_at = out_info['end_at']
+            if end_at - self._automix_file_offset < AUTOMIX_MIN_TRACK_SECONDS:
+                return  # too short to be worth blending out of
+            trigger_at = end_at - blend * speed - 0.2  # file position where the blend starts
+
+            in_info = None
+            in_path = None
+            analyzed_song = None
+            preload_kicked = False
+
+            while True:
+                if (self.current is not song or self.current_song_key != song_key
+                        or not self.automix_enabled or self.loop):
+                    return
+                voice_client = self.guild.voice_client
+                if not voice_client or not voice_client.is_connected():
+                    return
+                if voice_client.is_paused():
+                    await asyncio.sleep(0.5)
+                    continue
+                if not voice_client.is_playing():
+                    return
+
+                position = self.get_playback_position_seconds()
+                file_pos = self._automix_file_offset + max(0.0, position - self._automix_file_offset) * speed
+                remaining = (trigger_at - file_pos) / speed
+
+                # Line up the next song early so there is something to blend into
+                if remaining < 45:
+                    if not self.queue:
+                        await self._automix_top_up_queue()
+                        if self.current is not song or self.current_song_key != song_key:
+                            return
+                    next_song = self.queue[0] if self.queue else None
+                    if (next_song and not preload_kicked
+                            and not self._resolve_local_file(next_song)):
+                        preload_kicked = True
+                        asyncio.create_task(self.preload_next_song())
+
+                # Analyze the upcoming song once its file lands in the cache
+                next_song = self.queue[0] if self.queue else None
+                if next_song is not None and next_song is not analyzed_song and remaining > 6:
+                    path = self._resolve_local_file(next_song)
+                    if path:
+                        info = await self.bot.loop.run_in_executor(None, analyze_track_edges, path)
+                        analyzed_song = next_song
+                        in_path = path
+                        in_info = info
+                        continue  # analysis took time; recompute the position first
+
+                if remaining <= 0.05:
+                    break
+                await asyncio.sleep(min(1.0, max(0.05, remaining - 0.03)))
+
+            next_song = self.queue[0] if self.queue else None
+            if next_song is None:
+                return
+
+            plan = AutoMixPlan(song=next_song, fade_seconds=blend)
+            if in_info and analyzed_song is next_song and in_path:
+                plan.file_path = in_path
+                plan.start_seconds = in_info['start_at']
+                plan.bpm_out = out_info.get('bpm_tail')
+                plan.bpm_in = in_info.get('bpm_head')
+                if plan.bpm_out and plan.bpm_in:
+                    ratio = _tempo_match_ratio(plan.bpm_out, plan.bpm_in)
+                    if ratio:
+                        plan.atempo = ratio
+            await self.play_next(automix_plan=plan)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"AutoMix watcher error: {e}", exc_info=True)
+
+    async def play_next(self, automix_plan: Optional[AutoMixPlan] = None):
         """Play the next song in queue"""
         if self._play_next_running:
             logger.info("play_next already running; skipping duplicate call")
@@ -1503,6 +1932,7 @@ class MusicPlayer:
             if not self.queue:
                 self.current = None
                 self.preloaded_sources.clear()  # Clear preload cache
+                self.cancel_automix()
                 self.reset_playback_clock()
                 self.schedule_idle_disconnect()
                 logger.info("Queue is empty, nothing to play")
@@ -1555,8 +1985,35 @@ class MusicPlayer:
                 return
 
             try:
+                # AutoMix handoff: the previous song is still playing and the
+                # watcher asked us to blend this one in on top of it
+                handoff = None
+                if (automix_plan and automix_plan.song is self.current
+                        and voice_client.is_playing() and voice_client.source is not None):
+                    handoff = automix_plan
+
+                if handoff and handoff.file_path:
+                    # Open the analyzed local file directly: skip lead-in
+                    # silence and stretch tempo to beat-match the outgoing song
+                    extra_filters = []
+                    if abs(handoff.atempo - 1.0) >= 0.003:
+                        extra_filters.append(f'atempo={handoff.atempo:.4f}')
+                    before = f'-ss {handoff.start_seconds:.2f}' if handoff.start_seconds > 0.05 else None
+                    raw = discord.FFmpegPCMAudio(
+                        handoff.file_path,
+                        before_options=before,
+                        options=build_audio_options(filter_name=self.audio_filter,
+                                                    extra_filters=extra_filters),
+                    )
+                    source = discord.PCMVolumeTransformer(raw, volume=self.volume)
+                    stale = self.preloaded_sources.pop(song_key, None)  # built for a normal start
+                    if stale:
+                        try:
+                            stale.cleanup()
+                        except Exception:
+                            pass
                 # Check if we have a preloaded source
-                if song_key in self.preloaded_sources:
+                elif song_key in self.preloaded_sources:
                     print(f"🚀 Using preloaded source for: {self.current.title}")
                     source = self.preloaded_sources.pop(song_key)
                     source.volume = self.volume
@@ -1619,8 +2076,34 @@ class MusicPlayer:
                     except Exception as e:
                         logger.error(f"Error in play_next: {e}", exc_info=True)
 
-                voice_client.play(source, after=after_playing)
-                self.song_started_at = time.monotonic()
+                started_at_offset = 0.0
+                self._automix_speed = 1.0
+                if handoff:
+                    transition = AutoMixTransition(voice_client.source, source, handoff.fade_seconds)
+                    swapped = False
+                    try:
+                        voice_client.source = transition
+                        swapped = voice_client.is_playing()
+                    except Exception as e:
+                        logger.debug(f"AutoMix source swap failed: {e}")
+                    if swapped:
+                        if handoff.file_path:
+                            started_at_offset = handoff.start_seconds
+                            self._automix_speed = handoff.atempo
+                        if handoff.bpm_out and handoff.bpm_in and abs(handoff.atempo - 1.0) >= 0.003:
+                            logger.info(
+                                f"🎧 AutoMix: beat-matched blend into {self.current.title} "
+                                f"({handoff.bpm_in:.0f}→{handoff.bpm_in * handoff.atempo:.0f} BPM "
+                                f"to match {handoff.bpm_out:.0f})")
+                        else:
+                            logger.info(f"🎧 AutoMix: blending into {self.current.title}")
+                    else:
+                        # The old song ended in the race window; start normally
+                        voice_client.play(transition.active_source(), after=after_playing)
+                else:
+                    voice_client.play(source, after=after_playing)
+                self.song_started_at = time.monotonic() - started_at_offset
+                self._automix_file_offset = started_at_offset
                 self.paused_started_at = None
                 self.total_paused_seconds = 0.0
                 self.current_song_key = song_key
@@ -1635,6 +2118,9 @@ class MusicPlayer:
                 # Start preloading the next song in background
                 if self.queue:
                     asyncio.create_task(self.preload_next_song())
+
+                # Watch for the end of this song to blend the next one in
+                self.schedule_automix()
 
             except Exception as e:
                 print(f"Error playing song: {e}")
@@ -1741,6 +2227,10 @@ class MusicPlayer:
             self.song_started_at = time.monotonic() - max(0, position_seconds)
             self.paused_started_at = None
             self.total_paused_seconds = 0.0
+            # The rebuilt source has no AutoMix atempo and starts at the seek point
+            self._automix_speed = 1.0
+            self._automix_file_offset = max(0, position_seconds)
+            self.schedule_automix()
             return True
         except Exception as e:
             logger.error(f"Seek failed: {e}", exc_info=True)
@@ -3200,11 +3690,13 @@ class MusicCog(commands.Cog):
             embed.add_field(name="Loop", value=loop_status, inline=True)
             embed.add_field(name="Requested by", value=song.requester.mention, inline=True)
 
-            if player.audio_filter or player.crossfade_seconds:
+            if player.audio_filter or player.crossfade_seconds or player.automix_enabled:
                 effects = []
                 if player.audio_filter:
                     effects.append(player.audio_filter)
-                if player.crossfade_seconds:
+                if player.automix_enabled:
+                    effects.append(f"AutoMix {player.automix_blend_seconds}s")
+                elif player.crossfade_seconds:
                     effects.append(f"crossfade {player.crossfade_seconds}s")
                 embed.add_field(name="Effects", value="🎛️ " + " • ".join(effects), inline=True)
 
@@ -4150,6 +4642,8 @@ class MusicCog(commands.Cog):
                     'audio_filter': player.audio_filter,
                     'crossfade_seconds': player.crossfade_seconds,
                     'karaoke_mode': player.karaoke_mode,
+                    'automix': player.automix_enabled,
+                    'automix_blend': player.automix_blend_seconds,
                 }
             except Exception as e:
                 logger.debug(f"State snapshot failed for guild {guild_id}: {e}")
@@ -4201,6 +4695,8 @@ class MusicCog(commands.Cog):
                 player.audio_filter = entry.get('audio_filter')
                 player.crossfade_seconds = entry.get('crossfade_seconds', 0)
                 player.karaoke_mode = entry.get('karaoke_mode', False)
+                player.automix_enabled = entry.get('automix', False)
+                player.automix_blend_seconds = entry.get('automix_blend', AUTOMIX_DEFAULT_BLEND_SECONDS)
 
                 text_channel = guild.get_channel(entry.get('text_channel_id') or 0)
                 if text_channel:
@@ -4301,9 +4797,37 @@ class MusicCog(commands.Cog):
         player.preloaded_sources.clear()  # Preloads were built with the old fade settings
 
         if seconds:
-            await interaction.response.send_message(f"🌊 Crossfade set to **{seconds}s** - songs will fade in and out starting with the next one.")
+            note = " (AutoMix is on and takes over transitions until you turn it off.)" if player.automix_enabled else ""
+            await interaction.response.send_message(f"🌊 Crossfade set to **{seconds}s** - songs will fade in and out starting with the next one.{note}")
         else:
             await interaction.response.send_message("🌊 Crossfade turned off.")
+
+    @app_commands.command(name="automix", description="DJ-style AutoMix: blend each song into the next, beat-matched when possible")
+    @app_commands.describe(mode="Turn AutoMix on or off",
+                           blend="How long songs overlap, in seconds (default 8)")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="On", value="on"),
+        app_commands.Choice(name="Off", value="off"),
+    ])
+    async def automix(self, interaction: discord.Interaction, mode: str,
+                      blend: Optional[app_commands.Range[int, AUTOMIX_MIN_BLEND_SECONDS, AUTOMIX_MAX_BLEND_SECONDS]] = None):
+        player = self.get_player(interaction.guild)
+        if blend is not None:
+            player.automix_blend_seconds = blend
+        enabled = mode == 'on'
+        if player.automix_enabled != enabled:
+            player.preloaded_sources.clear()  # Preloads were built with the old fade settings
+        player.automix_enabled = enabled
+
+        if enabled:
+            player.schedule_automix()  # Pick up the song that is already playing
+            note = " Crossfade is set aside while AutoMix is on." if player.crossfade_seconds else ""
+            await interaction.response.send_message(
+                f"🎧 AutoMix **on** - each song will blend into the next like a DJ set "
+                f"(~{player.automix_blend_seconds}s overlap, beat-matched when the tempos line up).{note}")
+        else:
+            player.cancel_automix()
+            await interaction.response.send_message("🎧 AutoMix **off** - songs will play back to back again.")
 
     # ---------- karaoke mode ----------
 
