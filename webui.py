@@ -248,6 +248,7 @@ class WebUI:
                 player.loop = False
                 player.loop_queue = False
                 player.preloaded_sources.clear()
+                player.cancel_autoplay_prefetch()
                 player.reset_playback_clock()
                 if vc:
                     vc.stop()
@@ -274,6 +275,10 @@ class WebUI:
                 player.loop_queue = mode == 'queue'
             elif action == 'autoplay':
                 player.autoplay = not player.autoplay
+                if player.autoplay:
+                    player.schedule_autoplay_prefetch()
+                else:
+                    player.cancel_autoplay_prefetch()
             elif action == 'remove':
                 index = int(body.get('index', -1))
                 queue_list = list(player.queue)

@@ -72,6 +72,7 @@ if DOWNLOADS_FOLDER != MUSICS_FOLDER:
 
 LYRICSNOW_AHEAD_SECONDS = 2
 IDLE_DISCONNECT_SECONDS = 300
+AUTOPLAY_PREFETCH_SECONDS = 75  # lookup must finish well before the last 20s / AutoMix window
 
 # ---------- audio filter chains ----------
 # Every source is decoded through FFmpeg, so filters are plain -af chains.
@@ -1321,6 +1322,7 @@ class MusicControlView(View):
             player.loop_queue = False
             player.pending_playlist = None
             player.preloaded_sources.clear()  # Clear preloaded cache
+            player.cancel_autoplay_prefetch()
         
         voice_client = interaction.guild.voice_client
         if voice_client:
@@ -1439,6 +1441,10 @@ class MusicControlView(View):
             await interaction.response.send_message("❌ No player found!", ephemeral=True)
             return
         player.autoplay = not player.autoplay
+        if player.autoplay:
+            player.schedule_autoplay_prefetch()
+        else:
+            player.cancel_autoplay_prefetch()
         state = "on — artist, album and genre radio" if player.autoplay else "off"
         await interaction.response.send_message(f"✨ Smart Autoplay **{state}**", ephemeral=True)
 
@@ -1697,6 +1703,7 @@ class MusicPlayer:
         self.pending_playlist = None  # For just-in-time playlist loading
         self.preloaded_sources = {}  # Cache for pre-downloaded audio sources
         self._preload_task = None  # Background preload task
+        self._preloading_song_keys = set()
         self._play_next_running = False
         self.is_247_mode = False  # 24/7 mode flag
         self.twentyfourseven_songs = []  # Cached 24/7 playlist songs
@@ -1708,7 +1715,9 @@ class MusicPlayer:
         self.idle_disconnect_task: Optional[asyncio.Task] = None
         self.nowplaying_message: Optional[discord.Message] = None  # Last auto-posted now-playing message
         self._suppress_after = False  # Set during /seek so after_playing doesn't advance the queue
-        self.autoplay = False  # Keep playing random library songs when the queue runs out
+        self.autoplay = False  # Keep playing related music when the queue runs out
+        self._autoplay_prefetch_task: Optional[asyncio.Task] = None
+        self._autoplay_pick_lock = asyncio.Lock()
         self.history = deque(maxlen=25)  # Recently played songs, newest first
         self.audio_filter: Optional[str] = None  # Active /filter preset name
         self.crossfade_seconds = 0  # Fade in/out duration between songs (0 = off)
@@ -1743,6 +1752,75 @@ class MusicPlayer:
         if task and not task.done():
             task.cancel()
         self.idle_disconnect_task = None
+
+    def cancel_autoplay_prefetch(self):
+        task = self._autoplay_prefetch_task
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        self._autoplay_prefetch_task = None
+
+    async def _ensure_autoplay_queued(self, expected_song: Optional[Song] = None,
+                                      expected_key: Optional[str] = None) -> Optional[Song]:
+        """Choose exactly one autoplay follow-up, even if two watchers race."""
+        async with self._autoplay_pick_lock:
+            if not self.autoplay or self.is_247_mode or self.queue:
+                return self.queue[0] if self.queue else None
+            if expected_song is not None and self.current is not expected_song:
+                return None
+            if expected_key is not None and self.current_song_key != expected_key:
+                return None
+
+            pick = await self._pick_autoplay_song()
+            if not pick:
+                return None
+            # Re-check after network lookups: playback or the queue may have
+            # changed while the recommendation was being resolved.
+            if not self.autoplay or self.queue:
+                return self.queue[0] if self.queue else None
+            if expected_song is not None and self.current is not expected_song:
+                return None
+            if expected_key is not None and self.current_song_key != expected_key:
+                return None
+            self.queue.append(pick)
+            logger.info(f"⏱️ Autoplay prefetched: {pick.title}")
+            return pick
+
+    async def _autoplay_prefetch_watcher(self, song: Song, song_key: str):
+        """Resolve the next autoplay track well before AutoMix needs it."""
+        try:
+            duration = parse_duration_to_seconds(song.duration)
+            if not duration:
+                return
+            speed = FILTER_SPEED_FACTORS.get(self.audio_filter, 1.0) * self._automix_speed
+            position = self.get_playback_position_seconds()
+            file_position = self._automix_file_offset + max(
+                0.0, position - self._automix_file_offset
+            ) * speed
+            remaining_wall_time = max(0.0, (
+                max(0.0, duration - file_position) / max(0.01, speed)
+            ) - AUTOPLAY_PREFETCH_SECONDS)
+            await asyncio.sleep(remaining_wall_time)
+            if (self.current is not song or self.current_song_key != song_key
+                    or not self.autoplay or self.queue):
+                return
+            pick = await self._ensure_autoplay_queued(song, song_key)
+            if pick and self.current is song and self.current_song_key == song_key:
+                # Download/cache immediately so AutoMix can analyze the intro.
+                await self.preload_next_song()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.debug(f"Autoplay prefetch failed: {e}")
+        finally:
+            if self._autoplay_prefetch_task is asyncio.current_task():
+                self._autoplay_prefetch_task = None
+
+    def schedule_autoplay_prefetch(self):
+        self.cancel_autoplay_prefetch()
+        if self.autoplay and self.current and not self.queue and not self.is_247_mode:
+            self._autoplay_prefetch_task = asyncio.create_task(
+                self._autoplay_prefetch_watcher(self.current, self.current_song_key)
+            )
 
     async def _idle_disconnect_after_timeout(self):
         try:
@@ -1815,6 +1893,9 @@ class MusicPlayer:
         # Skip if already preloaded
         if song_key in self.preloaded_sources:
             return
+        if song_key in self._preloading_song_keys:
+            return
+        self._preloading_song_keys.add(song_key)
         
         try:
             print(f"🔄 Preloading: {next_song.title}")
@@ -1860,6 +1941,8 @@ class MusicPlayer:
                 
         except Exception as e:
             print(f"Preload error: {e}")
+        finally:
+            self._preloading_song_keys.discard(song_key)
 
     # ---------- AutoMix ----------
 
@@ -1897,9 +1980,7 @@ class MusicPlayer:
                 for song in self.twentyfourseven_songs:
                     self.queue.append(song)
             if not self.queue and self.autoplay and not self.is_247_mode:
-                pick = await self._pick_autoplay_song()
-                if pick:
-                    self.queue.append(pick)
+                await self._ensure_autoplay_queued(self.current, self.current_song_key)
         except Exception as e:
             logger.debug(f"AutoMix queue top-up failed: {e}")
 
@@ -2043,17 +2124,17 @@ class MusicPlayer:
                 for song in self.twentyfourseven_songs:
                     self.queue.append(song)
 
-            # Autoplay: keep the music going with a random song from the local library
+            # Smart Autoplay: use the prefetched related song, or resolve one now
             if not self.queue and self.autoplay and not self.is_247_mode:
-                song = await self._pick_autoplay_song()
+                song = await self._ensure_autoplay_queued()
                 if song:
                     logger.info(f"🎶 Smart autoplay picked: {song.title}")
-                    self.queue.append(song)
 
             if not self.queue:
                 self.current = None
                 self.preloaded_sources.clear()  # Clear preload cache
                 self.cancel_automix()
+                self.cancel_autoplay_prefetch()
                 self.reset_playback_clock()
                 self.schedule_idle_disconnect()
                 logger.info("Queue is empty, nothing to play")
@@ -2068,6 +2149,20 @@ class MusicPlayer:
                 logger.error("ERROR: Popped None from queue!")
                 await self.play_next()
                 return
+
+            # Local autoplay/cache entries used to be created with an unknown
+            # duration. Probe the actual audio before publishing player state
+            # so Discord and the web dashboard both receive a real length.
+            if (self.current.source_type == 'local'
+                    and not parse_duration_to_seconds(self.current.duration)
+                    and os.path.exists(self.current.url)):
+                duration_seconds = await self.bot.loop.run_in_executor(
+                    None, _probe_duration_seconds, self.current.url
+                )
+                if duration_seconds:
+                    cog = self.bot.get_cog('MusicCog')
+                    if cog:
+                        self.current.duration = cog.format_duration(duration_seconds)
 
             # New song: previous skip votes no longer apply
             self.skip_votes.clear()
@@ -2234,6 +2329,10 @@ class MusicPlayer:
                 self.current_song_key = song_key
                 logger.info(f"▶️ Now playing: {self.current.title}")
 
+                # Smart Autoplay needs to finish recommendation lookup and
+                # caching before AutoMix reaches the outro.
+                self.schedule_autoplay_prefetch()
+
                 # Send now playing embed with lyrics to the last message channel
                 if self.last_message_channel:
                     cog = self.bot.get_cog('MusicCog')
@@ -2304,10 +2403,12 @@ class MusicPlayer:
             path = random.choice(fresh or files)
             title = os.path.splitext(os.path.basename(path))[0]
             title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', title).strip()
+            duration_seconds = _probe_duration_seconds(path)
             return Song(
                 title=title or 'Unknown',
                 url=path,
-                duration="Unknown",
+                duration=cog.format_duration(duration_seconds)
+                if cog and duration_seconds else "Unknown",
                 requester=self.guild.me,
                 source_type='local'
             )
@@ -2374,6 +2475,7 @@ class MusicPlayer:
             self._automix_speed = 1.0
             self._automix_file_offset = max(0, position_seconds)
             self.schedule_automix()
+            self.schedule_autoplay_prefetch()
             return True
         except Exception as e:
             logger.error(f"Seek failed: {e}", exc_info=True)
@@ -2638,8 +2740,10 @@ class MusicCog(commands.Cog):
             score, path, folder_artist = random.choice(local_candidates[:10])
             title = os.path.splitext(os.path.basename(path))[0]
             title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', title).strip()
+            duration_seconds = await self.bot.loop.run_in_executor(None, _probe_duration_seconds, path)
             logger.info(f"🎶 Autoplay local affinity {score}: {folder_artist} - {title}")
-            return Song(title=title or 'Unknown', url=path, duration='Unknown',
+            return Song(title=title or 'Unknown', url=path,
+                        duration=self.format_duration(duration_seconds) if duration_seconds else 'Unknown',
                         requester=player.guild.me, source_type='local', artist=folder_artist)
 
         fresh = [item for item in station
@@ -4083,9 +4187,9 @@ class MusicCog(commands.Cog):
     async def _run_now_playing_live(self, guild_id: int, message: discord.Message, song_key: str):
         try:
             while True:
-                # 5s keeps the progress bar moving without hitting Discord's
-                # message-edit rate limits (1s edits queue up and lag badly)
-                await asyncio.sleep(5)
+                # 1.5s keeps the progress bar responsive without hammering
+                # Discord's message-edit rate limits.
+                await asyncio.sleep(1.5)
 
                 guild = self.bot.get_guild(guild_id)
                 if not guild:
@@ -4232,6 +4336,7 @@ class MusicCog(commands.Cog):
         player.loop = False
         player.loop_queue = False
         player.preloaded_sources.clear()  # Clear preloaded cache
+        player.cancel_autoplay_prefetch()
         player.reset_playback_clock()
         self._stop_lyricsnow_task(interaction.guild.id)
         
@@ -4367,8 +4472,11 @@ class MusicCog(commands.Cog):
         player.autoplay = not player.autoplay
 
         if not player.autoplay:
+            player.cancel_autoplay_prefetch()
             await interaction.response.send_message("✨ Smart Autoplay is **off**.")
             return
+
+        player.schedule_autoplay_prefetch()
 
         await interaction.response.send_message(
             "✨ Smart Autoplay is **on** - when the queue runs out, I'll continue with "
