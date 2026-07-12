@@ -6,7 +6,9 @@ A Discord music bot (`music.py`) with a browser-based control dashboard and a
 ## Features
 
 - 🎵 **Music** — YouTube / Spotify / local library playback, queue, lyrics,
-  24/7 mode, web dashboard (`webui.py`).
+  24/7 mode, web dashboard (`webui.py`). `/settings` exposes every safe
+  per-server playback option plus this channel's WatchTogether preferences;
+  the dashboard mirrors the playback controls.
 - 🎬 **Watch Together** (`watchtogether.py`) — synced video rooms with chat.
   Add anything yt-dlp resolves (YouTube, Shorts, Reels, TikTok, Twitter…).
   Long videos stream while they download (progressive HLS). Per-room settings

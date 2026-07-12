@@ -148,6 +148,26 @@ def get_settings(room_id):
     return s
 
 
+def update_settings(room_id, *, adblock=None, sponsorblock=None, quality=None):
+    """Persist validated room settings for Discord and web control surfaces."""
+    cfg = get_settings(room_id)
+    if adblock is not None:
+        cfg['adblock'] = bool(adblock)
+    if sponsorblock is not None:
+        cfg['sponsorblock'] = bool(sponsorblock)
+    if quality is not None:
+        try:
+            quality = int(quality)
+        except (TypeError, ValueError):
+            quality = 0
+        if quality not in (360, 480, 720, 1080):
+            raise ValueError('quality must be 360, 480, 720, or 1080')
+        cfg['quality'] = quality
+    room_settings[room_id] = cfg
+    _save_json(SETTINGS_FILE, room_settings)
+    return cfg
+
+
 def get_room_link(channel_id, channel_name, mode):
     """Used by the /watch and /reels slash commands in music.py."""
     room_id = ('w' if mode == 'watch' else 'r') + str(channel_id)

@@ -1216,6 +1216,11 @@ class MusicControlView(View):
         if cog:
             return cog.get_player(self.bot.get_guild(self.guild_id))
         return None
+
+    def save_player_settings(self, player):
+        cog = self.bot.get_cog('MusicCog')
+        if cog and player:
+            cog.save_player_settings(player)
     
     @discord.ui.button(label="⏮️", style=discord.ButtonStyle.secondary, custom_id="previous", row=0)
     async def previous_button(self, interaction: discord.Interaction, button: Button):
@@ -1315,6 +1320,7 @@ class MusicControlView(View):
         
         new_volume = min(player.volume + 0.1, 1.0)
         player.volume = new_volume
+        self.save_player_settings(player)
         
         voice_client = interaction.guild.voice_client
         if voice_client and voice_client.source:
@@ -1331,6 +1337,7 @@ class MusicControlView(View):
         
         new_volume = max(player.volume - 0.1, 0.0)
         player.volume = new_volume
+        self.save_player_settings(player)
         
         voice_client = interaction.guild.voice_client
         if voice_client and voice_client.source:
@@ -1480,6 +1487,7 @@ class MusicControlView(View):
             player.loop_queue, label = True, "queue"
         else:
             player.loop_queue, label = False, "off"
+        self.save_player_settings(player)
         await interaction.response.send_message(f"🔁 Loop: **{label}**", ephemeral=True)
 
     @discord.ui.button(label="✨", style=discord.ButtonStyle.secondary, custom_id="smart_autoplay", row=2)
@@ -1493,6 +1501,7 @@ class MusicControlView(View):
             player.schedule_autoplay_prefetch()
         else:
             player.cancel_autoplay_prefetch()
+        self.save_player_settings(player)
         state = "on — artist, album and genre radio" if player.autoplay else "off"
         await interaction.response.send_message(f"✨ Smart Autoplay **{state}**", ephemeral=True)
 
@@ -1508,6 +1517,7 @@ class MusicControlView(View):
             player.schedule_automix()
         else:
             player.cancel_automix()
+        self.save_player_settings(player)
         await interaction.response.send_message(
             f"🎛️ AutoMix **{'on' if player.automix_enabled else 'off'}**", ephemeral=True
         )
@@ -1761,6 +1771,7 @@ class MusicPlayer:
         self.current_song_key: Optional[str] = None
         self.last_message_channel: Optional[discord.TextChannel] = None  # For sending now playing updates
         self.idle_disconnect_task: Optional[asyncio.Task] = None
+        self.idle_disconnect_seconds = IDLE_DISCONNECT_SECONDS
         self.nowplaying_message: Optional[discord.Message] = None  # Last auto-posted now-playing message
         self._suppress_after = False  # Set during /seek so after_playing doesn't advance the queue
         self.autoplay = False  # Keep playing related music when the queue runs out
@@ -1888,7 +1899,7 @@ class MusicPlayer:
 
     async def _idle_disconnect_after_timeout(self):
         try:
-            await asyncio.sleep(IDLE_DISCONNECT_SECONDS)
+            await asyncio.sleep(self.idle_disconnect_seconds)
 
             voice_client = self.guild.voice_client
             if not voice_client or not voice_client.is_connected():
@@ -1898,7 +1909,10 @@ class MusicPlayer:
             if self.current or self.queue or self.pending_playlist or self.is_247_mode:
                 return
 
-            logger.info(f"Idle timeout reached in {self.guild.name}, disconnecting after {IDLE_DISCONNECT_SECONDS}s of inactivity")
+            logger.info(
+                f"Idle timeout reached in {self.guild.name}, disconnecting after "
+                f"{self.idle_disconnect_seconds}s of inactivity"
+            )
             self.reset_playback_clock()
             await voice_client.disconnect(force=False)
         except asyncio.CancelledError:
@@ -1910,7 +1924,7 @@ class MusicPlayer:
                 self.idle_disconnect_task = None
 
     def schedule_idle_disconnect(self):
-        if self.is_247_mode:
+        if self.is_247_mode or self.idle_disconnect_seconds <= 0:
             return
 
         voice_client = self.guild.voice_client
@@ -2708,17 +2722,66 @@ class MusicCog(commands.Cog):
     def set_artist_diversity(self, player: MusicPlayer, enabled: bool):
         """Persist the Smart Autoplay artist-streak preference for a server."""
         player.artist_diversity = bool(enabled)
+        self.save_player_settings(player)
+
+    def save_player_settings(self, player: MusicPlayer):
+        """Persist every durable, per-server playback preference."""
         guild_key = str(player.guild.id)
-        settings = dict(self.guild_settings.get(guild_key, {}))
-        settings['artist_diversity'] = player.artist_diversity
-        self.guild_settings[guild_key] = settings
+        self.guild_settings[guild_key] = {
+            'volume': player.volume,
+            'loop': player.loop,
+            'loop_queue': player.loop_queue,
+            'autoplay': player.autoplay,
+            'artist_diversity': player.artist_diversity,
+            'audio_filter': player.audio_filter,
+            'crossfade_seconds': player.crossfade_seconds,
+            'karaoke_mode': player.karaoke_mode,
+            'automix': player.automix_enabled,
+            'automix_blend': player.automix_blend_seconds,
+            'idle_disconnect_seconds': player.idle_disconnect_seconds,
+        }
         self._save_guild_settings()
     
     def get_player(self, guild) -> MusicPlayer:
         if guild.id not in self.players:
             player = MusicPlayer(self.bot, guild)
             settings = self.guild_settings.get(str(guild.id), {})
+            try:
+                player.volume = max(0.0, min(1.0, float(settings.get('volume', 0.5))))
+            except (TypeError, ValueError):
+                pass
+            player.loop = bool(settings.get('loop', False))
+            player.loop_queue = bool(settings.get('loop_queue', False))
+            player.autoplay = bool(settings.get('autoplay', False))
             player.artist_diversity = bool(settings.get('artist_diversity', True))
+            audio_filter = settings.get('audio_filter')
+            player.audio_filter = audio_filter if audio_filter in AUDIO_FILTERS else None
+            try:
+                player.crossfade_seconds = max(
+                    0, min(MAX_CROSSFADE_SECONDS,
+                           int(settings.get('crossfade_seconds', 0)))
+                )
+            except (TypeError, ValueError):
+                pass
+            player.karaoke_mode = bool(settings.get('karaoke_mode', False))
+            if player.karaoke_mode:
+                player.audio_filter = 'karaoke'
+            player.automix_enabled = bool(settings.get('automix', False))
+            try:
+                player.automix_blend_seconds = max(
+                    AUTOMIX_MIN_BLEND_SECONDS,
+                    min(AUTOMIX_MAX_BLEND_SECONDS,
+                        int(settings.get('automix_blend', AUTOMIX_DEFAULT_BLEND_SECONDS)))
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                player.idle_disconnect_seconds = max(
+                    0, min(60 * 60,
+                           int(settings.get('idle_disconnect_seconds', IDLE_DISCONNECT_SECONDS)))
+                )
+            except (TypeError, ValueError):
+                pass
             self.players[guild.id] = player
         return self.players[guild.id]
 
@@ -4872,6 +4935,7 @@ class MusicCog(commands.Cog):
     async def autoplay(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         player.autoplay = not player.autoplay
+        self.save_player_settings(player)
 
         if not player.autoplay:
             player.cancel_autoplay_prefetch()
@@ -4891,39 +4955,276 @@ class MusicCog(commands.Cog):
             player.last_message_channel = interaction.channel
             await player.play_next()
 
-    @app_commands.command(name="settings", description="View or change this server's music settings")
-    @app_commands.describe(
-        artist_diversity="Switch to a related artist after 3 songs by the same artist"
-    )
-    async def settings(self, interaction: discord.Interaction,
-                       artist_diversity: Optional[bool] = None):
-        player = self.get_player(interaction.guild)
-        changed = artist_diversity is not None
-        if changed:
-            self.set_artist_diversity(player, artist_diversity)
+    def _settings_embed(self, player: MusicPlayer, notices: Optional[list[str]] = None,
+                        watch_settings: Optional[dict] = None):
+        """Complete status card shared by /settings and tests."""
+        loop_mode = "Song" if player.loop else ("Queue" if player.loop_queue else "Off")
+        filter_labels = {
+            None: "Off", 'bassboost': "Bass Boost", 'nightcore': "Nightcore",
+            'slowed': "Slowed", '8d': "8D", 'karaoke': "Karaoke",
+        }
+        if player.sleep_timer_ends_at:
+            remaining = max(0, int((player.sleep_timer_ends_at - time.time()) / 60))
+            sleep_status = f"{remaining} min remaining • <t:{int(player.sleep_timer_ends_at)}:R>"
+        else:
+            sleep_status = "Off"
+        idle_status = ("Never" if player.idle_disconnect_seconds <= 0 else
+                       f"{player.idle_disconnect_seconds // 60} min")
 
-        loop_mode = "song" if player.loop else ("queue" if player.loop_queue else "off")
+        description = "All durable options below are saved per server."
+        if notices:
+            description += "\n\n" + "\n".join(f"• {notice}" for notice in notices)
         embed = discord.Embed(
             title="⚙️ Music settings",
-            description=(
-                "These settings apply to this server. Use the optional "
-                "`artist_diversity` choice to change the AutoPlay behavior."
-            ),
+            description=description,
             color=discord.Color.from_rgb(124, 92, 255),
         )
         embed.add_field(
-            name="Artist variety after 3 songs",
-            value=("✅ Enabled — switch to a related artist"
-                   if player.artist_diversity else
-                   "⏸️ Disabled — the same artist may continue"),
-            inline=False,
+            name="🔊 Playback",
+            value=(f"Volume: **{int(player.volume * 100)}%**\n"
+                   f"Loop: **{loop_mode}**\n"
+                   f"Idle disconnect: **{idle_status}**"),
+            inline=True,
         )
-        embed.add_field(name="Smart Autoplay", value="On" if player.autoplay else "Off")
-        embed.add_field(name="Loop", value=loop_mode.title())
-        embed.add_field(name="AutoMix", value="On" if player.automix_enabled else "Off")
-        embed.add_field(name="Karaoke", value="On" if player.karaoke_mode else "Off")
-        embed.set_footer(text="This preference is saved and survives bot restarts.")
-        await interaction.response.send_message(embed=embed, ephemeral=not changed)
+        embed.add_field(
+            name="✨ Discovery",
+            value=(f"Smart Autoplay: **{'On' if player.autoplay else 'Off'}**\n"
+                   f"Artist variety after 3: **{'On' if player.artist_diversity else 'Off'}**"),
+            inline=True,
+        )
+        embed.add_field(
+            name="🎛️ Sound",
+            value=(f"Filter: **{filter_labels.get(player.audio_filter, player.audio_filter)}**\n"
+                   f"Crossfade: **{player.crossfade_seconds}s**"),
+            inline=True,
+        )
+        embed.add_field(
+            name="🎧 DJ & vocals",
+            value=(f"AutoMix: **{'On' if player.automix_enabled else 'Off'}**\n"
+                   f"Blend: **{player.automix_blend_seconds}s**\n"
+                   f"Karaoke: **{'On' if player.karaoke_mode else 'Off'}**"),
+            inline=True,
+        )
+        embed.add_field(name="😴 Sleep timer", value=sleep_status, inline=True)
+        embed.add_field(
+            name="🔄 24/7 mode",
+            value=("Active" if player.is_247_mode else "Off") +
+                  "\nAdmin controls: `/247start` and `/247stop`",
+            inline=True,
+        )
+        if watch_settings:
+            embed.add_field(
+                name="🎬 WatchTogether • this channel",
+                value=(f"Quality: **{watch_settings['quality']}p**\n"
+                       f"Ad blocking: **{'On' if watch_settings['adblock'] else 'Off'}**\n"
+                       f"SponsorBlock: **{'On' if watch_settings['sponsorblock'] else 'Off'}**"),
+                inline=False,
+            )
+        embed.set_footer(text="Run /settings again with any options you want to change.")
+        return embed
+
+    @app_commands.command(name="settings", description="View or change every music setting for this server")
+    @app_commands.describe(
+        volume="Playback volume from 0 to 100",
+        loop_mode="Loop one song, the whole queue, or turn looping off",
+        autoplay="Keep playing related music when the queue ends",
+        artist_diversity="Prefer a related artist after 3 songs by the same artist",
+        filter_preset="Audio effect preset, or Off",
+        crossfade_seconds="Fade duration between songs; 0 disables it",
+        automix="Enable beat-aware DJ transitions",
+        automix_blend_seconds="Maximum AutoMix overlap length",
+        karaoke="Remove vocals and show live lyrics for every song",
+        sleep_timer_minutes="Stop and leave after this many minutes; 0 cancels",
+        idle_disconnect_minutes="Leave when idle after this many minutes; 0 means never",
+        watch_quality="WatchTogether download quality for this channel",
+        watch_adblock="Block ads in this channel's shared browser",
+        watch_sponsorblock="Remove sponsored segments from WatchTogether videos",
+    )
+    @app_commands.choices(
+        loop_mode=[
+            app_commands.Choice(name="Song", value="song"),
+            app_commands.Choice(name="Queue", value="queue"),
+            app_commands.Choice(name="Off", value="off"),
+        ],
+        filter_preset=[
+            app_commands.Choice(name="Bass Boost", value="bassboost"),
+            app_commands.Choice(name="Nightcore", value="nightcore"),
+            app_commands.Choice(name="Slowed", value="slowed"),
+            app_commands.Choice(name="8D", value="8d"),
+            app_commands.Choice(name="Karaoke (filter only)", value="karaoke"),
+            app_commands.Choice(name="Off", value="off"),
+        ],
+        watch_quality=[
+            app_commands.Choice(name="360p", value=360),
+            app_commands.Choice(name="480p", value=480),
+            app_commands.Choice(name="720p", value=720),
+            app_commands.Choice(name="1080p", value=1080),
+        ],
+    )
+    async def settings(
+        self,
+        interaction: discord.Interaction,
+        volume: Optional[app_commands.Range[int, 0, 100]] = None,
+        loop_mode: Optional[str] = None,
+        autoplay: Optional[bool] = None,
+        artist_diversity: Optional[bool] = None,
+        filter_preset: Optional[str] = None,
+        crossfade_seconds: Optional[app_commands.Range[int, 0, MAX_CROSSFADE_SECONDS]] = None,
+        automix: Optional[bool] = None,
+        automix_blend_seconds: Optional[
+            app_commands.Range[int, AUTOMIX_MIN_BLEND_SECONDS, AUTOMIX_MAX_BLEND_SECONDS]
+        ] = None,
+        karaoke: Optional[bool] = None,
+        sleep_timer_minutes: Optional[app_commands.Range[int, 0, 480]] = None,
+        idle_disconnect_minutes: Optional[app_commands.Range[int, 0, 60]] = None,
+        watch_quality: Optional[int] = None,
+        watch_adblock: Optional[bool] = None,
+        watch_sponsorblock: Optional[bool] = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        player = self.get_player(interaction.guild)
+        vc = interaction.guild.voice_client
+        notices = []
+        durable_changed = False
+        rebuild_audio = False
+        import watchtogether
+        watch_room_id = 'w' + str(interaction.channel.id)
+        watch_cfg = watchtogether.get_settings(watch_room_id)
+
+        if volume is not None:
+            player.volume = volume / 100
+            if vc and vc.source and hasattr(vc.source, 'volume'):
+                vc.source.volume = player.volume
+            notices.append(f"Volume set to {volume}%")
+            durable_changed = True
+
+        if loop_mode is not None:
+            player.loop = loop_mode == 'song'
+            player.loop_queue = loop_mode == 'queue'
+            notices.append(f"Loop set to {loop_mode}")
+            durable_changed = True
+
+        if autoplay is not None:
+            player.autoplay = autoplay
+            if autoplay:
+                player.schedule_autoplay_prefetch()
+            else:
+                player.cancel_autoplay_prefetch()
+            notices.append(f"Smart Autoplay {'enabled' if autoplay else 'disabled'}")
+            durable_changed = True
+
+        if artist_diversity is not None:
+            player.artist_diversity = artist_diversity
+            notices.append(
+                "Artist variety after 3 songs " +
+                ("enabled" if artist_diversity else "disabled")
+            )
+            durable_changed = True
+
+        if filter_preset is not None:
+            player.audio_filter = None if filter_preset == 'off' else filter_preset
+            # Selecting a standalone filter supersedes the full karaoke mode;
+            # an explicit karaoke option below can turn that mode back on.
+            if player.karaoke_mode and filter_preset != 'karaoke':
+                player.karaoke_mode = False
+                self._stop_lyricsnow_task(interaction.guild.id)
+            player.clear_preloads()
+            rebuild_audio = True
+            durable_changed = True
+            notices.append(f"Filter set to {filter_preset}")
+
+        if crossfade_seconds is not None:
+            player.crossfade_seconds = crossfade_seconds
+            player.clear_preloads()
+            rebuild_audio = True
+            durable_changed = True
+            notices.append(f"Crossfade set to {crossfade_seconds}s")
+
+        if automix_blend_seconds is not None:
+            player.automix_blend_seconds = automix_blend_seconds
+            notices.append(f"AutoMix blend set to {automix_blend_seconds}s")
+            durable_changed = True
+
+        if automix is not None:
+            if player.automix_enabled != automix:
+                player.clear_preloads()
+            player.automix_enabled = automix
+            if automix:
+                player.schedule_automix()
+            else:
+                player.cancel_automix()
+            notices.append(f"AutoMix {'enabled' if automix else 'disabled'}")
+            durable_changed = True
+
+        if karaoke is not None:
+            player.karaoke_mode = karaoke
+            if karaoke:
+                player.audio_filter = 'karaoke'
+                player.last_message_channel = interaction.channel
+            else:
+                if player.audio_filter == 'karaoke':
+                    player.audio_filter = None
+                self._stop_lyricsnow_task(interaction.guild.id)
+            player.clear_preloads()
+            rebuild_audio = True
+            durable_changed = True
+            notices.append(f"Karaoke {'enabled' if karaoke else 'disabled'}")
+
+        if idle_disconnect_minutes is not None:
+            player.idle_disconnect_seconds = idle_disconnect_minutes * 60
+            player.cancel_idle_disconnect()
+            if idle_disconnect_minutes:
+                player.schedule_idle_disconnect()
+            notices.append(
+                "Idle disconnect set to " +
+                (f"{idle_disconnect_minutes} min" if idle_disconnect_minutes else "never")
+            )
+            durable_changed = True
+
+        if sleep_timer_minutes is not None:
+            task = player.sleep_timer_task
+            if task and not task.done():
+                task.cancel()
+            player.sleep_timer_task = None
+            player.sleep_timer_ends_at = None
+            if sleep_timer_minutes == 0:
+                notices.append("Sleep timer cancelled")
+            elif not vc or not vc.is_connected():
+                notices.append("⚠️ Sleep timer needs the bot to be in voice")
+            else:
+                player.last_message_channel = interaction.channel
+                player.sleep_timer_ends_at = time.time() + sleep_timer_minutes * 60
+                player.sleep_timer_task = asyncio.create_task(
+                    self._run_sleep_timer(player, sleep_timer_minutes)
+                )
+                notices.append(f"Sleep timer set to {sleep_timer_minutes} min")
+
+        if any(value is not None for value in
+               (watch_quality, watch_adblock, watch_sponsorblock)):
+            watch_cfg = watchtogether.update_settings(
+                watch_room_id,
+                quality=watch_quality,
+                adblock=watch_adblock,
+                sponsorblock=watch_sponsorblock,
+            )
+            notices.append("WatchTogether settings updated for this channel")
+
+        if durable_changed:
+            self.save_player_settings(player)
+
+        applied_now = False
+        if rebuild_audio and vc and (vc.is_playing() or vc.is_paused()) and player.current:
+            applied_now = await player.seek_to(int(player.get_playback_position_seconds()))
+            if notices:
+                notices.append("Audio changes applied now" if applied_now else
+                               "Audio changes apply from the next song")
+
+        await interaction.followup.send(
+            embed=self._settings_embed(player, notices, watch_cfg), ephemeral=True
+        )
+
+        if karaoke is True and vc and (vc.is_playing() or vc.is_paused()) and player.current:
+            await self._start_lyricsnow_for_current(player)
 
     @app_commands.command(name="history", description="Show recently played songs")
     async def history(self, interaction: discord.Interaction):
@@ -5530,6 +5831,7 @@ class MusicCog(commands.Cog):
                     'karaoke_mode': player.karaoke_mode,
                     'automix': player.automix_enabled,
                     'automix_blend': player.automix_blend_seconds,
+                    'idle_disconnect_seconds': player.idle_disconnect_seconds,
                 }
             except Exception as e:
                 logger.debug(f"State snapshot failed for guild {guild_id}: {e}")
@@ -5583,6 +5885,9 @@ class MusicCog(commands.Cog):
                 player.karaoke_mode = entry.get('karaoke_mode', False)
                 player.automix_enabled = entry.get('automix', False)
                 player.automix_blend_seconds = entry.get('automix_blend', AUTOMIX_DEFAULT_BLEND_SECONDS)
+                player.idle_disconnect_seconds = entry.get(
+                    'idle_disconnect_seconds', player.idle_disconnect_seconds
+                )
 
                 text_channel = guild.get_channel(entry.get('text_channel_id') or 0)
                 if text_channel:
@@ -5653,7 +5958,11 @@ class MusicCog(commands.Cog):
     async def filter_cmd(self, interaction: discord.Interaction, preset: str):
         player = self.get_player(interaction.guild)
         player.audio_filter = None if preset == 'off' else preset
+        if player.karaoke_mode and preset != 'karaoke':
+            player.karaoke_mode = False
+            self._stop_lyricsnow_task(interaction.guild.id)
         player.clear_preloads()  # Preloads were built with the old filter
+        self.save_player_settings(player)
 
         label = {'bassboost': 'Bass Boost', 'nightcore': 'Nightcore', 'slowed': 'Slowed',
                  '8d': '8D', 'karaoke': 'Karaoke', 'off': 'Off'}.get(preset, preset)
@@ -5681,6 +5990,7 @@ class MusicCog(commands.Cog):
         player = self.get_player(interaction.guild)
         player.crossfade_seconds = seconds
         player.clear_preloads()  # Preloads were built with the old fade settings
+        self.save_player_settings(player)
 
         if seconds:
             note = " (AutoMix is on and takes over transitions until you turn it off.)" if player.automix_enabled else ""
@@ -5704,6 +6014,7 @@ class MusicCog(commands.Cog):
         if player.automix_enabled != enabled:
             player.clear_preloads()  # Preloads were built with the old fade settings
         player.automix_enabled = enabled
+        self.save_player_settings(player)
 
         if enabled:
             player.schedule_automix()  # Pick up the song that is already playing
@@ -5785,6 +6096,8 @@ class MusicCog(commands.Cog):
 
             when = "" if restored_now else " from the next song"
             await interaction.followup.send(f"🎤 Karaoke mode off - vocals are back{when}.")
+
+        self.save_player_settings(player)
 
     @app_commands.command(name="removedupes", description="Remove duplicate songs from the queue")
     async def removedupes(self, interaction: discord.Interaction):
@@ -5972,6 +6285,7 @@ class MusicCog(commands.Cog):
         
         player = self.get_player(interaction.guild)
         player.volume = level / 100
+        self.save_player_settings(player)
         
         if interaction.guild.voice_client and interaction.guild.voice_client.source:
             interaction.guild.voice_client.source.volume = player.volume
@@ -6053,6 +6367,7 @@ class MusicCog(commands.Cog):
             player.loop = False
             player.loop_queue = False
             await interaction.response.send_message("➡️ Loop disabled!")
+        self.save_player_settings(player)
 
     @app_commands.command(name="shuffle", description="Shuffle the queue")
     async def shuffle(self, interaction: discord.Interaction):
