@@ -11,8 +11,9 @@ A Discord music bot (`music.py`) with a browser-based control dashboard and a
   Add anything yt-dlp resolves (YouTube, Shorts, Reels, TikTok, Twitter…).
   Long videos stream while they download (progressive HLS). Per-room settings
   for quality, SponsorBlock, and adblock.
-- 📱 **ReelsTogether** — a synced, swipeable short-form feed with a per-room
-  taste algorithm.
+- 📱 **ReelsTogether** — a synced, swipeable short-form feed with backward
+  navigation through recent reels and a per-room taste algorithm. Watch and
+  Reels rooms share a hard 10-video download cache.
 - 🌐 **Shared co-browser** (`cobrowser.py`) — when yt-dlp can't grab something,
   the room opens a real Firefox on the server, streamed to everyone (MPEG-TS
   over websocket) with one person driving. AdGuard adblock built in.

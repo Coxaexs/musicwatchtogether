@@ -175,6 +175,7 @@ class WebUI:
             'volume': int(player.volume * 100),
             'loop': 'song' if player.loop else ('queue' if player.loop_queue else 'off'),
             'autoplay': player.autoplay,
+            'artist_diversity': player.artist_diversity,
             'is_247': player.is_247_mode,
             'current': current,
             'queue': [_song_json(s) for s in list(player.queue)[:100]],
@@ -280,6 +281,8 @@ class WebUI:
                     player.schedule_autoplay_prefetch()
                 else:
                     player.cancel_autoplay_prefetch()
+            elif action == 'artist_diversity':
+                cog.set_artist_diversity(player, not player.artist_diversity)
             elif action == 'remove':
                 index = int(body.get('index', -1))
                 queue_list = list(player.queue)
@@ -542,6 +545,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .addrow input[type=text]:focus { outline: 1px solid var(--accent); }
   .qhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .qhead h2 { font-size: 15px; margin: 0; }
+  .setting { display: flex; align-items: center; gap: 14px; padding: 10px 0;
+             border-bottom: 1px solid var(--border2); }
+  .setting:last-child { border-bottom: none; }
+  .setting .setting-text { flex: 1; min-width: 0; }
+  .setting .setting-title { font-size: 14px; font-weight: 600; }
+  .setting .setting-desc { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .setting button { min-width: 82px; }
   .qitem { display: flex; align-items: center; gap: 10px; padding: 8px 6px;
            border-bottom: 1px solid var(--border2); font-size: 14px; }
   .qitem:last-child { border-bottom: none; }
@@ -878,6 +888,19 @@ function render() {
       <button class="primary" onclick="addSong(false)">Add</button>
       <button onclick="addSong(true)">Play next</button>
     </div></div>`;
+
+  html += `<div class="card"><div class="qhead"><h2>⚙️ Settings</h2></div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Smart Autoplay</div>
+        <div class="setting-desc">Keep playing related music when the queue runs out.</div></div>
+      <button class="${s.autoplay ? 'toggled' : ''}" onclick="act('autoplay')">${s.autoplay ? 'Enabled' : 'Disabled'}</button>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Artist variety after 3 songs</div>
+        <div class="setting-desc">When AutoPlay plays the same artist three times in a row, prefer a related artist next.</div></div>
+      <button class="${s.artist_diversity ? 'toggled' : ''}" onclick="act('artist_diversity')">${s.artist_diversity ? 'Enabled' : 'Disabled'}</button>
+    </div>
+  </div>`;
 
   html += `<div class="card"><div class="qhead"><h2>📜 Queue (${s.queue_length})</h2>` +
     (s.queue_length ? `<button class="danger" onclick="if(confirm('Clear the queue?'))act('clear')">Clear</button>` : '') + `</div>`;

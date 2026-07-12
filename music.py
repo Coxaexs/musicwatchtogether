@@ -1764,6 +1764,10 @@ class MusicPlayer:
         self.nowplaying_message: Optional[discord.Message] = None  # Last auto-posted now-playing message
         self._suppress_after = False  # Set during /seek so after_playing doesn't advance the queue
         self.autoplay = False  # Keep playing related music when the queue runs out
+        # When enabled, Smart Autoplay changes to a related artist after three
+        # consecutive tracks by the same artist. This is a persistent,
+        # per-server preference managed by MusicCog.
+        self.artist_diversity = True
         self._autoplay_prefetch_task: Optional[asyncio.Task] = None
         self._autoplay_pick_lock = asyncio.Lock()
         self.sleep_timer_task: Optional[asyncio.Task] = None
@@ -2665,6 +2669,8 @@ class FakeInteraction:
 
 class MusicCog(commands.Cog):
     """Music commands cog"""
+
+    SETTINGS_FILE = os.path.join(BOT_DIR, 'guild_settings.json')
     
     def __init__(self, bot):
         self.bot = bot
@@ -2677,10 +2683,43 @@ class MusicCog(commands.Cog):
         self._last_saved_state = None
         self._autoplay_station_cache = {}
         self._lyrics_file_cache = {}  # cache_path -> (mtime, parsed json)
+        self.guild_settings = self._load_guild_settings()
+
+    def _load_guild_settings(self) -> dict:
+        try:
+            with open(self.SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        except Exception as e:
+            logger.warning(f"Could not load guild settings: {e}")
+            return {}
+
+    def _save_guild_settings(self):
+        try:
+            tmp_path = self.SETTINGS_FILE + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.guild_settings, f, indent=2, sort_keys=True)
+            os.replace(tmp_path, self.SETTINGS_FILE)
+        except Exception as e:
+            logger.warning(f"Could not save guild settings: {e}")
+
+    def set_artist_diversity(self, player: MusicPlayer, enabled: bool):
+        """Persist the Smart Autoplay artist-streak preference for a server."""
+        player.artist_diversity = bool(enabled)
+        guild_key = str(player.guild.id)
+        settings = dict(self.guild_settings.get(guild_key, {}))
+        settings['artist_diversity'] = player.artist_diversity
+        self.guild_settings[guild_key] = settings
+        self._save_guild_settings()
     
     def get_player(self, guild) -> MusicPlayer:
         if guild.id not in self.players:
-            self.players[guild.id] = MusicPlayer(self.bot, guild)
+            player = MusicPlayer(self.bot, guild)
+            settings = self.guild_settings.get(str(guild.id), {})
+            player.artist_diversity = bool(settings.get('artist_diversity', True))
+            self.players[guild.id] = player
         return self.players[guild.id]
 
     def _local_song_for_query(self, query: str, requester) -> Optional[Song]:
@@ -2816,7 +2855,7 @@ class MusicCog(commands.Cog):
                 streak += 1
             else:
                 break
-        avoid_seed_artist = streak >= 3
+        avoid_seed_artist = player.artist_diversity and streak >= 3
 
         album_key = self._artist_key(seed.album) if seed and seed.album else ''
 
@@ -4852,6 +4891,40 @@ class MusicCog(commands.Cog):
             player.last_message_channel = interaction.channel
             await player.play_next()
 
+    @app_commands.command(name="settings", description="View or change this server's music settings")
+    @app_commands.describe(
+        artist_diversity="Switch to a related artist after 3 songs by the same artist"
+    )
+    async def settings(self, interaction: discord.Interaction,
+                       artist_diversity: Optional[bool] = None):
+        player = self.get_player(interaction.guild)
+        changed = artist_diversity is not None
+        if changed:
+            self.set_artist_diversity(player, artist_diversity)
+
+        loop_mode = "song" if player.loop else ("queue" if player.loop_queue else "off")
+        embed = discord.Embed(
+            title="⚙️ Music settings",
+            description=(
+                "These settings apply to this server. Use the optional "
+                "`artist_diversity` choice to change the AutoPlay behavior."
+            ),
+            color=discord.Color.from_rgb(124, 92, 255),
+        )
+        embed.add_field(
+            name="Artist variety after 3 songs",
+            value=("✅ Enabled — switch to a related artist"
+                   if player.artist_diversity else
+                   "⏸️ Disabled — the same artist may continue"),
+            inline=False,
+        )
+        embed.add_field(name="Smart Autoplay", value="On" if player.autoplay else "Off")
+        embed.add_field(name="Loop", value=loop_mode.title())
+        embed.add_field(name="AutoMix", value="On" if player.automix_enabled else "Off")
+        embed.add_field(name="Karaoke", value="On" if player.karaoke_mode else "Off")
+        embed.set_footer(text="This preference is saved and survives bot restarts.")
+        await interaction.response.send_message(embed=embed, ephemeral=not changed)
+
     @app_commands.command(name="history", description="Show recently played songs")
     async def history(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
@@ -5949,6 +6022,7 @@ class MusicCog(commands.Cog):
             description=(
                 f"**[Click here to start swiping]({url})**\n\n"
                 "⬆️ Swipe up and everyone moves to the next reel\n"
+                "⬇️ Swipe down to return to a recent reel\n"
                 "❤️ Double-tap to like — the feed learns what you're into\n"
                 "➕ Paste your own Reels / Shorts / TikToks into the feed\n\n"
                 "*Works best on your phone. Everyone in this channel shares the feed.*"
