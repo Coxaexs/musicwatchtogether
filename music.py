@@ -1197,7 +1197,7 @@ class MusicControlView(View):
         if player.current:
             player.queue.appendleft(player.current)
         player.queue.appendleft(previous)
-        player.preloaded_sources.clear()
+        player.clear_preloads()
         player.loop = False
 
         await interaction.response.send_message(f"⏮️ Going back to **{previous.title}**")
@@ -1305,7 +1305,7 @@ class MusicControlView(View):
         queue_list = list(player.queue)
         random.shuffle(queue_list)
         player.queue = deque(queue_list)
-        player.preloaded_sources.clear()  # Clear preloaded cache since queue order changed
+        player.clear_preloads()  # Clear preloaded cache since queue order changed
         
         # Preload the new next song
         asyncio.create_task(player.preload_next_song())
@@ -1321,7 +1321,7 @@ class MusicControlView(View):
             player.loop = False
             player.loop_queue = False
             player.pending_playlist = None
-            player.preloaded_sources.clear()  # Clear preloaded cache
+            player.clear_preloads()  # Clear preloaded cache
             player.cancel_autoplay_prefetch()
         
         voice_client = interaction.guild.voice_client
@@ -1455,7 +1455,7 @@ class MusicControlView(View):
             await interaction.response.send_message("❌ No player found!", ephemeral=True)
             return
         player.automix_enabled = not player.automix_enabled
-        player.preloaded_sources.clear()
+        player.clear_preloads()
         if player.automix_enabled:
             player.schedule_automix()
         else:
@@ -1758,6 +1758,16 @@ class MusicPlayer:
         if task and not task.done() and task is not asyncio.current_task():
             task.cancel()
         self._autoplay_prefetch_task = None
+
+    def clear_preloads(self):
+        """Drop preloaded sources, killing the ffmpeg process each one holds."""
+        sources = list(self.preloaded_sources.values())
+        self.preloaded_sources.clear()
+        for source in sources:
+            try:
+                source.cleanup()
+            except Exception:
+                pass
 
     async def _ensure_autoplay_queued(self, expected_song: Optional[Song] = None,
                                       expected_key: Optional[str] = None) -> Optional[Song]:
@@ -2132,7 +2142,7 @@ class MusicPlayer:
 
             if not self.queue:
                 self.current = None
-                self.preloaded_sources.clear()  # Clear preload cache
+                self.clear_preloads()  # Clear preload cache
                 self.cancel_automix()
                 self.cancel_autoplay_prefetch()
                 self.reset_playback_clock()
@@ -2381,9 +2391,9 @@ class MusicPlayer:
             # files that carry no usable music context.
             if has_artist_context:
                 return None
-        return self._pick_random_library_song()
+        return await self._pick_random_library_song()
 
-    def _pick_random_library_song(self) -> Optional[Song]:
+    async def _pick_random_library_song(self) -> Optional[Song]:
         """Pick a random downloaded song from the musics folder for autoplay."""
         try:
             # Bias toward songs people favorited so autoplay feels curated
@@ -2394,16 +2404,23 @@ class MusicPlayer:
                     logger.info(f"🎲 Autoplay picked a favorite: {favorite.title}")
                     return favorite
 
-            files = glob.glob(os.path.join(MUSICS_FOLDER, '**', '*.mp3'), recursive=True)
-            if not files:
-                return None
             # Avoid repeating what was just played when the library is big enough
             recent_urls = {song.url for song in self.history}
-            fresh = [f for f in files if f not in recent_urls]
-            path = random.choice(fresh or files)
+
+            def scan_and_pick():
+                # Library scan + ffprobe are disk-bound; keep them off the event loop
+                files = glob.glob(os.path.join(MUSICS_FOLDER, '**', '*.mp3'), recursive=True)
+                if not files:
+                    return None, None
+                fresh = [f for f in files if f not in recent_urls]
+                chosen = random.choice(fresh or files)
+                return chosen, _probe_duration_seconds(chosen)
+
+            path, duration_seconds = await self.bot.loop.run_in_executor(None, scan_and_pick)
+            if not path:
+                return None
             title = os.path.splitext(os.path.basename(path))[0]
             title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', title).strip()
-            duration_seconds = _probe_duration_seconds(path)
             return Song(
                 title=title or 'Unknown',
                 url=path,
@@ -2609,6 +2626,7 @@ class MusicCog(commands.Cog):
         self._state_restored = False
         self._last_saved_state = None
         self._autoplay_station_cache = {}
+        self._lyrics_file_cache = {}  # cache_path -> (mtime, parsed json)
     
     def get_player(self, guild) -> MusicPlayer:
         if guild.id not in self.players:
@@ -3920,6 +3938,26 @@ class MusicCog(commands.Cog):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         return os.path.join(base_dir, "lyrics", f"{sanitized.lower()}.json")
 
+    def _read_cached_lyrics(self, cache_path: str) -> Optional[dict]:
+        """Cached-lyrics file read with an mtime-keyed memory cache.
+
+        The live now-playing loop asks for this every 1.5s, so it must not
+        hit the disk each tick.
+        """
+        try:
+            mtime = os.path.getmtime(cache_path)
+        except OSError:
+            return None
+        cached = self._lyrics_file_cache.get(cache_path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if len(self._lyrics_file_cache) > 64:
+            self._lyrics_file_cache.clear()
+        self._lyrics_file_cache[cache_path] = (mtime, data)
+        return data
+
     async def _fetch_synced_lyrics(self, query: str) -> Optional[dict]:
         # Check local cache first
         cache_path = self._get_lyrics_cache_path(query)
@@ -4123,34 +4161,31 @@ class MusicCog(commands.Cog):
             # Read cached live lyrics if available
             try:
                 cache_path = self._get_lyrics_cache_path(song.title)
-                if os.path.exists(cache_path):
-                    with open(cache_path, 'r', encoding='utf-8') as f:
-                        lyrics_data = json.load(f)
-                    
-                    if lyrics_data and lyrics_data.get('lines'):
-                        lines = lyrics_data['lines']
-                        current_second = player.get_playback_position_seconds()
-                        
-                        current_index = 0
-                        for idx, (timestamp, _) in enumerate(lines):
-                            if timestamp <= current_second:
-                                current_index = idx
-                            else:
-                                break
-                                
-                        start_index = max(0, current_index - 2)
-                        end_index = min(len(lines), current_index + 3)
-                        
-                        output_lines = []
-                        for idx in range(start_index, end_index):
-                            text = lines[idx][1]
-                            if idx == current_index:
-                                output_lines.append(f"▶ **{text}**")
-                            else:
-                                output_lines.append(text)
-                                
-                        lyrics_text = "\n".join(output_lines)
-                        embed.add_field(name="🎙️ Live Lyrics", value=lyrics_text, inline=False)
+                lyrics_data = self._read_cached_lyrics(cache_path)
+                if lyrics_data and lyrics_data.get('lines'):
+                    lines = lyrics_data['lines']
+                    current_second = player.get_playback_position_seconds()
+
+                    current_index = 0
+                    for idx, (timestamp, _) in enumerate(lines):
+                        if timestamp <= current_second:
+                            current_index = idx
+                        else:
+                            break
+
+                    start_index = max(0, current_index - 2)
+                    end_index = min(len(lines), current_index + 3)
+
+                    output_lines = []
+                    for idx in range(start_index, end_index):
+                        text = lines[idx][1]
+                        if idx == current_index:
+                            output_lines.append(f"▶ **{text}**")
+                        else:
+                            output_lines.append(text)
+
+                    lyrics_text = "\n".join(output_lines)
+                    embed.add_field(name="🎙️ Live Lyrics", value=lyrics_text, inline=False)
             except Exception as e:
                 logger.debug(f"Could not read synced lyrics for nowplaying: {e}")
 
@@ -4186,6 +4221,7 @@ class MusicCog(commands.Cog):
 
     async def _run_now_playing_live(self, guild_id: int, message: discord.Message, song_key: str):
         try:
+            last_rendered = None
             while True:
                 # 1.5s keeps the progress bar responsive without hammering
                 # Discord's message-edit rate limits.
@@ -4203,7 +4239,11 @@ class MusicCog(commands.Cog):
                     break
 
                 embed = self.create_now_playing_embed(player.current, player)
+                rendered = embed.to_dict()
+                if rendered == last_rendered:
+                    continue  # Paused/unchanged: don't burn edit rate limit
                 await message.edit(embed=embed)
+                last_rendered = rendered
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -4335,7 +4375,8 @@ class MusicCog(commands.Cog):
         player.current = None
         player.loop = False
         player.loop_queue = False
-        player.preloaded_sources.clear()  # Clear preloaded cache
+        player.pending_playlist = None  # Otherwise the playlist restarts playback after stop
+        player.clear_preloads()  # Clear preloaded cache
         player.cancel_autoplay_prefetch()
         player.reset_playback_clock()
         self._stop_lyricsnow_task(interaction.guild.id)
@@ -5217,7 +5258,7 @@ class MusicCog(commands.Cog):
     async def filter_cmd(self, interaction: discord.Interaction, preset: str):
         player = self.get_player(interaction.guild)
         player.audio_filter = None if preset == 'off' else preset
-        player.preloaded_sources.clear()  # Preloads were built with the old filter
+        player.clear_preloads()  # Preloads were built with the old filter
 
         label = {'bassboost': 'Bass Boost', 'nightcore': 'Nightcore', 'slowed': 'Slowed',
                  '8d': '8D', 'karaoke': 'Karaoke', 'off': 'Off'}.get(preset, preset)
@@ -5244,7 +5285,7 @@ class MusicCog(commands.Cog):
     async def crossfade(self, interaction: discord.Interaction, seconds: app_commands.Range[int, 0, MAX_CROSSFADE_SECONDS]):
         player = self.get_player(interaction.guild)
         player.crossfade_seconds = seconds
-        player.preloaded_sources.clear()  # Preloads were built with the old fade settings
+        player.clear_preloads()  # Preloads were built with the old fade settings
 
         if seconds:
             note = " (AutoMix is on and takes over transitions until you turn it off.)" if player.automix_enabled else ""
@@ -5266,7 +5307,7 @@ class MusicCog(commands.Cog):
             player.automix_blend_seconds = blend
         enabled = mode == 'on'
         if player.automix_enabled != enabled:
-            player.preloaded_sources.clear()  # Preloads were built with the old fade settings
+            player.clear_preloads()  # Preloads were built with the old fade settings
         player.automix_enabled = enabled
 
         if enabled:
@@ -5320,7 +5361,7 @@ class MusicCog(commands.Cog):
     async def karaoke(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         player.karaoke_mode = not player.karaoke_mode
-        player.preloaded_sources.clear()  # Preloads were built with the old filter
+        player.clear_preloads()  # Preloads were built with the old filter
 
         await interaction.response.defer()
         vc = interaction.guild.voice_client
@@ -5372,7 +5413,7 @@ class MusicCog(commands.Cog):
             return
 
         player.queue = deque(deduped)
-        player.preloaded_sources.clear()
+        player.clear_preloads()
         await interaction.response.send_message(f"🧹 Removed **{removed}** duplicate{'s' if removed != 1 else ''} from the queue!")
 
     @app_commands.command(name="skipto", description="Skip ahead to a specific song in the queue")
@@ -5629,7 +5670,7 @@ class MusicCog(commands.Cog):
         queue_list = list(player.queue)
         random.shuffle(queue_list)
         player.queue = deque(queue_list)
-        player.preloaded_sources.clear()  # Clear preloaded cache since queue order changed
+        player.clear_preloads()  # Clear preloaded cache since queue order changed
         
         # Preload the new next song
         asyncio.create_task(player.preload_next_song())
@@ -5640,7 +5681,7 @@ class MusicCog(commands.Cog):
     async def clear(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         player.queue.clear()
-        player.preloaded_sources.clear()  # Clear preloaded cache
+        player.clear_preloads()  # Clear preloaded cache
         player.schedule_idle_disconnect()
         await interaction.response.send_message("🗑️ Queue cleared!")
 
@@ -5666,7 +5707,9 @@ class MusicCog(commands.Cog):
             player.cancel_idle_disconnect()
             player.queue.clear()
             player.current = None
-            player.preloaded_sources.clear()  # Clear preloaded cache
+            player.pending_playlist = None
+            player.cancel_autoplay_prefetch()
+            player.clear_preloads()  # Clear preloaded cache
             player.reset_playback_clock()
             self._stop_lyricsnow_task(interaction.guild.id)
             await interaction.guild.voice_client.disconnect()
@@ -5854,7 +5897,7 @@ class MusicCog(commands.Cog):
                         queue_list = list(player.queue)
                         random.shuffle(queue_list)
                         player.queue = deque(queue_list)
-                        player.preloaded_sources.clear()
+                        player.clear_preloads()
                         logger.info("🔀 24/7 mode: shuffled the full queue after 1000 discovered songs")
 
                         batch_to_add.clear()
@@ -6165,7 +6208,9 @@ async def on_voice_state_update(member, before, after):
                         if player:
                             player.cancel_idle_disconnect()
                             player.queue.clear()
-                            player.preloaded_sources.clear()
+                            player.pending_playlist = None
+                            player.cancel_autoplay_prefetch()
+                            player.clear_preloads()
                             player.current = None
                     try:
                         await voice_client.disconnect(force=False)

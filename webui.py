@@ -247,7 +247,8 @@ class WebUI:
                 player.current = None
                 player.loop = False
                 player.loop_queue = False
-                player.preloaded_sources.clear()
+                player.pending_playlist = None
+                player.clear_preloads()
                 player.cancel_autoplay_prefetch()
                 player.reset_playback_clock()
                 if vc:
@@ -258,11 +259,11 @@ class WebUI:
                 random.shuffle(queue_list)
                 from collections import deque
                 player.queue = deque(queue_list)
-                player.preloaded_sources.clear()
+                player.clear_preloads()
                 asyncio.create_task(player.preload_next_song())
             elif action == 'clear':
                 player.queue.clear()
-                player.preloaded_sources.clear()
+                player.clear_preloads()
                 player.schedule_idle_disconnect()
             elif action == 'volume':
                 level = max(0, min(100, int(body.get('level', 50))))
@@ -294,13 +295,14 @@ class WebUI:
                     queue_list.insert(0, song)
                     from collections import deque
                     player.queue = deque(queue_list)
-                    player.preloaded_sources.clear()
+                    player.clear_preloads()
             elif action == 'skipto':
                 index = int(body.get('index', -1))
                 if 0 <= index < len(player.queue) and vc:
                     for _ in range(index):
                         player.queue.popleft()
                     player.loop = False
+                    vc.stop()  # after_playing advances to the new queue head
             elif action == 'seek':
                 seconds = body.get('seconds')
                 if seconds is not None:
