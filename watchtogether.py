@@ -85,9 +85,11 @@ YT_ID_RE = re.compile(
     r'([A-Za-z0-9_-]{11})')
 
 _search_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': True,
-                'nocheckcertificate': True, 'skip_download': True}
+                'nocheckcertificate': True, 'skip_download': True,
+                'socket_timeout': 15}
 _info_opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True,
-              'nocheckcertificate': True, 'skip_download': True}
+              'nocheckcertificate': True, 'skip_download': True,
+              'socket_timeout': 15}
 
 
 def _dl_opts(cache_dir, vertical=False, quality=720, sponsorblock=False):
@@ -104,6 +106,8 @@ def _dl_opts(cache_dir, vertical=False, quality=720, sponsorblock=False):
         'restrictfilenames': True,
         'nocheckcertificate': True,
         'concurrent_fragment_downloads': 4,
+        'socket_timeout': 20,
+        'retries': 2,
     }
     if sponsorblock and not vertical:
         opts['postprocessors'] = [
@@ -195,6 +199,8 @@ class Room:
         self.reels_task = None
         self.sync_task = None
         self._advanced_past = -1   # 'ended' debounce
+        self.last_query = None     # avoid back-to-back identical feed searches
+        self._topup_busy = False   # topup is not reentrant-safe
         # reels profile
         prof = profiles.get(self.id, {})
         self.interests = prof.get('interests', {})
@@ -498,19 +504,22 @@ async def _download_item(room, item):
 
         cfg = get_settings(room.id)
         hdrs = item.get('_http_headers')
+        # Watchdog: a wedged yt-dlp must never hold a download slot forever -
+        # that starved the feed and left rooms stuck on one reel.
+        dl_timeout = 180 if room.mode == 'reels' else 1800
         try:
             try:
-                fname, info = await loop.run_in_executor(
+                fname, info = await asyncio.wait_for(loop.run_in_executor(
                     None, _blocking_download, item['url'], cache_dir,
                     room.mode == 'reels', progress_cb,
-                    cfg['quality'], cfg['sponsorblock'], hdrs)
+                    cfg['quality'], cfg['sponsorblock'], hdrs), dl_timeout)
             except Exception:
                 if not cfg['sponsorblock'] or room.mode == 'reels':
                     raise
                 # SponsorBlock post-processing can fail on its own; retry clean
-                fname, info = await loop.run_in_executor(
+                fname, info = await asyncio.wait_for(loop.run_in_executor(
                     None, _blocking_download, item['url'], cache_dir,
-                    False, progress_cb, cfg['quality'], False, hdrs)
+                    False, progress_cb, cfg['quality'], False, hdrs), dl_timeout)
             item['file'] = fname
             item['vid'] = info.get('id') or item.get('vid')
             item['title'] = info.get('title') or item.get('title')
@@ -773,12 +782,23 @@ def _tokenize(item):
         tag = tag.lower().strip()
         if tag and tag not in STOPWORDS and len(tag) >= 3:
             terms.append(tag)
+    # channels people like are one of the strongest signals shorts feeds have
+    uploader = re.sub(r'[^a-z0-9ğüşöçı]+', '', (item.get('uploader') or '').lower())
+    if len(uploader) >= 3 and uploader not in STOPWORDS:
+        terms.append(uploader)
     return terms
 
 
 def _learn(room, item, delta):
     if not item:
         return
+    # Slow decay so yesterday's binge doesn't dominate the feed forever
+    for term in list(room.interests):
+        w = room.interests[term] * 0.97
+        if abs(w) < 0.4:
+            room.interests.pop(term, None)
+        else:
+            room.interests[term] = round(w, 2)
     for term in _tokenize(item):
         w = room.interests.get(term, 0) + delta
         room.interests[term] = max(-5, min(50, w))
@@ -790,17 +810,80 @@ def _learn(room, item, delta):
 
 
 def _pick_query(room):
-    positive = {k: v for k, v in room.interests.items() if v > 0}
-    if not positive or random.random() < 0.2:   # explore 20% of the time
-        return random.choice(DEFAULT_TOPICS)
-    terms = random.choices(list(positive), weights=list(positive.values()),
-                           k=min(2, len(positive)))
-    return ' '.join(dict.fromkeys(terms))
+    positive = {k: v for k, v in room.interests.items() if v > 0.5}
+    roll = random.random()
+    if not positive or roll < 0.15:
+        # pure explore: something completely fresh
+        query = random.choice(DEFAULT_TOPICS)
+    elif roll < 0.30:
+        # guided explore: a loved topic crossed with a fresh angle
+        weights = [v ** 0.6 for v in positive.values()]
+        term = random.choices(list(positive), weights=weights)[0]
+        query = f'{term} {random.choice(DEFAULT_TOPICS)}'
+    else:
+        # exploit - but soften weights so one runaway term can't own the feed
+        weights = [v ** 0.6 for v in positive.values()]
+        terms = random.choices(list(positive), weights=weights,
+                               k=min(2, len(positive)))
+        query = ' '.join(dict.fromkeys(terms))
+    if query == room.last_query:
+        query = random.choice([t for t in DEFAULT_TOPICS if t != query])
+    room.last_query = query
+    return query
+
+
+def _viable_ahead(room):
+    """Items past the cursor that can still play (dead ones don't count)."""
+    return sum(1 for it in room.queue[room.index + 1:]
+               if it.get('status') != 'error')
+
+
+def _prune_dead_feed_items(room):
+    """Drop errored feed items so they can't dam the swipe path."""
+    removed = False
+    i = 0
+    while i < len(room.queue):
+        it = room.queue[i]
+        if (it.get('added_by') == '✨ feed' and it.get('status') == 'error'
+                and i != room.index):
+            room.queue.pop(i)
+            if i < room.index:
+                room.index -= 1
+            removed = True
+            continue
+        i += 1
+    # cursor parked on a dead feed item: hand it the next viable one
+    cur = room.current()
+    if (cur and cur.get('added_by') == '✨ feed' and cur.get('status') == 'error'
+            and room.index + 1 < len(room.queue)):
+        room.queue.pop(room.index)
+        room._advanced_past = room.index - 1
+        room.set_position(0, playing=True)
+        removed = True
+    return removed
+
+
+def _entry_score(room, entry):
+    """Rank flat search results against what the room liked/disliked."""
+    title = (entry.get('title') or '').lower()
+    words = set(re.findall(r'[a-zA-ZğüşöçıİĞÜŞÖÇ0-9]{3,}', title))
+    return sum(room.interests.get(w, 0) for w in words if w not in STOPWORDS)
 
 
 async def _reels_topup(room):
-    ahead = len(room.queue) - (room.index + 1)
-    if ahead >= REELS_READY_AHEAD:
+    if room._topup_busy:
+        return
+    room._topup_busy = True
+    try:
+        await _reels_topup_inner(room)
+    finally:
+        room._topup_busy = False
+
+
+async def _reels_topup_inner(room):
+    if _prune_dead_feed_items(room):
+        await _broadcast_state(room)
+    if _viable_ahead(room) >= REELS_READY_AHEAD:
         return
     loop = asyncio.get_running_loop()
     query = _pick_query(room)
@@ -810,11 +893,15 @@ async def _reels_topup(room):
     except Exception as e:
         logger.warning(f"reels search failed ({query!r}): {e}")
         return
+    # Best matches first (learned dislikes filter out), with a little jitter
+    # so the same channels don't front-run every search.
+    entries = [e for e in entries if _entry_score(room, e) > -3]
+    entries.sort(key=lambda e: _entry_score(room, e) + random.uniform(0, 2),
+                 reverse=True)
     added = 0
     checked = 0
     for e in entries:
-        if added >= 2 or checked >= 6 or \
-                len(room.queue) - (room.index + 1) >= REELS_READY_AHEAD:
+        if added >= 2 or checked >= 6 or _viable_ahead(room) >= REELS_READY_AHEAD:
             break
         vid = e.get('id')
         dur = e.get('duration')
@@ -911,7 +998,8 @@ async def ws_handler(request):
                 joined = True
                 if room.sync_task is None:
                     room.sync_task = asyncio.create_task(_sync_loop(room))
-                if room.mode == 'reels' and room.reels_task is None and room.interests:
+                if room.mode == 'reels' and room.reels_task is None \
+                        and (room.interests or room.queue):
                     room.reels_task = asyncio.create_task(_reels_loop(room))
                 await ws.send_str(json.dumps(_room_state(room)))
                 await _notice(room, f'👋 {name} joined')
@@ -1034,10 +1122,19 @@ async def ws_handler(request):
                         _learn(room, cur, -1)
                     elif ratio >= 0.9:
                         _learn(room, cur, 1)
-                if room.index + 1 < len(room.queue):
-                    room.index += 1
+                # land on the next item that can actually play
+                nxt = room.index + 1
+                while nxt < len(room.queue) and \
+                        room.queue[nxt].get('status') == 'error':
+                    nxt += 1
+                if nxt < len(room.queue):
+                    room.index = nxt
                     room._advanced_past = room.index - 1
                     room.set_position(0, playing=True)
+                else:
+                    # out of reels: fetch more right now instead of waiting
+                    # for the next loop tick
+                    asyncio.create_task(_reels_topup(room))
                 await _broadcast_state(room)
 
             elif t == 'like' and room.mode == 'reels':

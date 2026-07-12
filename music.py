@@ -2808,6 +2808,18 @@ class MusicCog(commands.Cog):
             re.sub(r'\W+', '', (song.title or '').lower()) for song in player.history
         }
 
+        # After a few songs in a row from the same artist, steer to a related
+        # one so the radio doesn't just march through a discography.
+        streak = 0
+        for prev in player.history:
+            if self._artist_key(self._song_artist(prev) or '') == seed_key:
+                streak += 1
+            else:
+                break
+        avoid_seed_artist = streak >= 3
+
+        album_key = self._artist_key(seed.album) if seed and seed.album else ''
+
         # Reuse relevant downloads first: same artist/album wins, followed by
         # artists from the related-artist station. Unrelated library tracks are
         # intentionally not candidates here.
@@ -2817,13 +2829,19 @@ class MusicCog(commands.Cog):
                 if path in recent_urls:
                     continue
                 title, local_artist = parse_local_song_name(path)
+                if re.sub(r'\W+', '', title.lower()) in recent_titles:
+                    continue  # same song cached under another path
                 candidate_key = self._artist_key(local_artist or '')
                 score = 0
                 if candidate_key and candidate_key == seed_key:
+                    if avoid_seed_artist:
+                        continue
                     score = 100
                 elif candidate_key and candidate_key in related_keys:
                     score = 65
-                if seed and seed.album and self._artist_key(seed.album) in self._artist_key(path):
+                # Short album names ("Live", "One") match half the library;
+                # only trust reasonably distinctive ones.
+                if album_key and len(album_key) >= 5 and album_key in self._artist_key(path):
                     score += 35
                 if score:
                     candidates.append((score, path, title, local_artist))
@@ -2831,7 +2849,9 @@ class MusicCog(commands.Cog):
 
         local_candidates = await self.bot.loop.run_in_executor(None, scan_local_candidates)
 
-        if local_candidates:
+        # Local matches usually win (instant, no network), but sometimes let
+        # the online station through so the radio still discovers new songs.
+        if local_candidates and random.random() < 0.70:
             local_candidates.sort(key=lambda item: item[0], reverse=True)
             score, path, title, local_artist = random.choice(local_candidates[:10])
             duration_seconds = await self.bot.loop.run_in_executor(None, _probe_duration_seconds, path)
@@ -2855,10 +2875,11 @@ class MusicCog(commands.Cog):
         # getting stuck playing an entire discography.
         same_artist = [item for item in fresh if self._artist_key(item.get('artist')) == seed_key]
         related = [item for item in fresh if self._artist_key(item.get('artist')) != seed_key]
-        album_key = self._artist_key(seed.album) if seed and seed.album else ''
         same_album = [item for item in fresh
                       if album_key and self._artist_key(item.get('album')) == album_key]
-        if same_album and random.random() < 0.35:
+        if avoid_seed_artist and related:
+            pool = related
+        elif same_album and random.random() < 0.35:
             pool = same_album
         else:
             pool = same_artist if same_artist and (not related or random.random() < 0.60) else related
