@@ -422,7 +422,7 @@ class WebUI:
 
     async def api_autocomplete(self, request):
         query = request.query.get('q', '').strip()
-        suggestions = get_autocomplete_suggestions(query)
+        suggestions = await asyncio.get_event_loop().run_in_executor(None, get_autocomplete_suggestions, query)
         return web.json_response(suggestions)
 
 

@@ -20,6 +20,7 @@ import logging
 import logging.handlers
 import glob
 import math
+import threading
 import time
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -612,69 +613,124 @@ except PermissionError:
 except Exception as e:
     logger.warning(f"Error creating cache directory: {e}")
 # Check if song file is already downloaded
+AUDIO_EXTENSIONS = tuple(getattr(config, 'SUPPORTED_FORMATS', None)
+                         or ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.opus', '.webm'))
+
+# One shared, briefly-cached walk of the library folders. Cache lookups,
+# autocomplete and autoplay all used to re-glob thousands of files from a
+# spinning disk per call - on the event loop, which is what froze the bot.
+LIBRARY_INDEX_TTL = 45.0
+_library_index_lock = threading.Lock()
+_library_index = {'ts': 0.0, 'files': ()}
+
+
+def _library_roots() -> list[str]:
+    roots = [MUSICS_FOLDER]
+    try:
+        libcfg = os.path.abspath(config.MUSIC_LIBRARY_PATH) if getattr(config, 'MUSIC_LIBRARY_PATH', None) else None
+        if libcfg and libcfg not in roots:
+            roots.append(libcfg)
+    except Exception:
+        pass
+    for extra in (DOWNLOADS_FOLDER, TEMP_DOWNLOAD_FOLDER):
+        if extra not in roots:
+            roots.append(extra)
+    return [root for root in roots if os.path.isdir(root)]
+
+
+def refresh_library_index() -> tuple:
+    """Walk the library folders and cache every audio file path.
+
+    Blocking (disk-bound): call from an executor on hot paths.
+    """
+    files = []
+    seen_roots = set()
+    for directory in _library_roots():
+        real = os.path.realpath(directory)
+        if real in seen_roots:
+            continue
+        seen_roots.add(real)
+        try:
+            for root, _, names in os.walk(directory):
+                for name in names:
+                    if name.lower().endswith(AUDIO_EXTENSIONS):
+                        files.append(os.path.join(root, name))
+        except Exception as e:
+            logger.debug(f"Library scan failed for {directory}: {e}")
+    snapshot = tuple(files)
+    with _library_index_lock:
+        _library_index['ts'] = time.monotonic()
+        _library_index['files'] = snapshot
+    return snapshot
+
+
+def list_library_files(max_age: float = LIBRARY_INDEX_TTL) -> tuple:
+    """All known audio files; served from cache unless older than max_age."""
+    with _library_index_lock:
+        ts = _library_index['ts']
+        files = _library_index['files']
+    if ts and time.monotonic() - ts <= max_age:
+        return files
+    return refresh_library_index()
+
+
+def parse_local_song_name(path: str) -> tuple[str, Optional[str]]:
+    """Best-effort (title, artist) from a library file path.
+
+    Downloads are saved as "Artist/Title - [videoID].mp3" or, when the artist
+    folder isn't writable, flat as "Artist - Title - [videoID].mp3". Never
+    reports a library root folder (e.g. "musics") as the artist.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', stem).strip()
+    root_names = {os.path.basename(root) for root in (MUSICS_FOLDER, DOWNLOADS_FOLDER, TEMP_DOWNLOAD_FOLDER)}
+    try:
+        if getattr(config, 'MUSIC_LIBRARY_PATH', None):
+            root_names.add(os.path.basename(os.path.abspath(config.MUSIC_LIBRARY_PATH)))
+    except Exception:
+        pass
+    parent = os.path.basename(os.path.dirname(path))
+    artist = parent if parent and parent not in root_names else None
+    parts = re.split(r'\s+-\s+', stem)
+    if artist is None and len(parts) >= 2:
+        artist = parts[0].strip()
+    # Flat files repeat the artist ("Duman - Duman - Song"): drop the prefix
+    if artist and len(parts) >= 2 and parts[0].strip().lower() == artist.lower():
+        stem = ' - '.join(parts[1:]).strip() or stem
+    return stem or 'Unknown', artist
+
+
 def find_cached_song(video_id: str = None):
     """Find a cached song by EXACT video ID match only.
-    
-    This is the most reliable method - searches for [videoID] in filenames.
-    Returns matching file path or None if not found.
-    
+
+    Searches for [videoID] in filenames via the library index; on a miss the
+    index is rebuilt once so a download that just finished is still found.
+
     IMPORTANT: We deliberately do NOT support title/artist matching
     because it causes false positives and plays wrong songs!
     """
     if not video_id or video_id == 'unknown':
         return None
-    
-    # Build library paths (bot musics + configured MUSIC_LIBRARY_PATH)
-    library_paths = [MUSICS_FOLDER]
-    try:
-        libcfg = os.path.abspath(config.MUSIC_LIBRARY_PATH) if getattr(config, 'MUSIC_LIBRARY_PATH', None) else None
-        if libcfg and libcfg not in library_paths:
-            library_paths.append(libcfg)
-    except Exception:
-        pass
 
-    debug = str(getattr(config, 'CACHE_LOOKUP_DEBUG', '0')) == '1'
-    if debug:
-        logger.debug(f"Cache lookup for video_id: {video_id}")
+    needle = f"[{video_id}]"
+    old_prefix = f"ytdl_{video_id}."
 
-    # Try NEW format first: [videoID].mp3 in subdirectories (artist folders)
-    # CRITICAL: Escape literal brackets in glob pattern!
-    # In glob: [x] means "character class" - we need literal [ and ]
-    # Escape as: [[] for literal [, and []] for literal ]
-    for directory in (*library_paths, DOWNLOADS_FOLDER, TEMP_DOWNLOAD_FOLDER):
-        try:
-            if debug:
-                logger.debug(f"  Searching in {directory}")
-            recursive_pattern = os.path.join(directory, f"**/*[[]" + video_id + "[]]" + ".mp3")
-            matching_files = glob.glob(recursive_pattern, recursive=True)
-            if not matching_files:
-                flat_pattern = os.path.join(directory, f"*[[]" + video_id + "[]]" + ".mp3")
-                matching_files = glob.glob(flat_pattern)
-            if matching_files:
-                if debug:
-                    logger.debug(f"  Found by id (new format): {matching_files[0]}")
-                return matching_files[0]
-        except Exception as e:
-            if debug:
-                logger.debug(f"  Error: {e}")
-            continue
+    def search(files):
+        for path in files:
+            name = os.path.basename(path)
+            if needle in name and name.lower().endswith('.mp3'):
+                return path
+        for path in files:
+            if os.path.basename(path).startswith(old_prefix):
+                return path
+        return None
 
-    # Try FALLBACK: old format ytdl_<videoID>.* in root (for backward compat)
-    for directory in (*library_paths, DOWNLOADS_FOLDER, TEMP_DOWNLOAD_FOLDER):
-        try:
-            matching_files = glob.glob(os.path.join(directory, f"ytdl_{video_id}.*"))
-            if matching_files:
-                if debug:
-                    logger.debug(f"  Found by id (old format): {matching_files[0]}")
-                return matching_files[0]
-        except Exception as e:
-            if debug:
-                logger.debug(f"  Error: {e}")
-            continue
-
-    if debug:
-        logger.debug(f"  No cache found for video_id: {video_id}")
-    return None
+    found = search(list_library_files())
+    if found:
+        return found
+    # Miss: allow one near-fresh rescan so a download that just finished is
+    # picked up, without letting repeat misses hammer the disk.
+    return search(list_library_files(max_age=5.0))
 
 def get_autocomplete_suggestions(query: str) -> list[str]:
     if not query or len(query) < 2:
@@ -702,24 +758,17 @@ def get_autocomplete_suggestions(query: str) -> list[str]:
         except Exception:
             pass
                         
-    # 2. Search in local music folders
-    library_paths = [os.path.join(base_dir, "musics")]
-    if getattr(config, 'MUSIC_LIBRARY_PATH', None):
-        library_paths.append(config.MUSIC_LIBRARY_PATH)
-        
-    for directory in library_paths:
-        if os.path.exists(directory):
-            try:
-                for root, _, files in os.walk(directory):
-                    for file in files:
-                        if file.endswith(('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.opus', '.webm')):
-                            name = os.path.splitext(file)[0]
-                            name = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', name).strip()
-                            if query_lower in name.lower():
-                                suggestions.add(name)
-            except Exception:
-                pass
-                
+    # 2. Search the local music library via the cached index
+    try:
+        for path in list_library_files():
+            name = os.path.splitext(os.path.basename(path))[0]
+            name = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', name).strip()
+            if query_lower in name.lower():
+                suggestions.add(name)
+    except Exception:
+        pass
+
+
     def sort_key(s):
         try:
             return s.lower().index(query_lower), s.lower()
@@ -954,8 +1003,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
         video_id = video_id_match if video_id_match else 'unknown'
         
         # Check if song is already cached by VIDEO ID ONLY (most reliable method)
-        cached_file = find_cached_song(video_id=video_id)
-        
+        cached_file = await loop.run_in_executor(None, find_cached_song, video_id)
+
         if cached_file:
             logger.info(f"🎵 Found cached: {os.path.basename(cached_file)}")
             print(f"🎵 Found cached: {os.path.basename(cached_file)}")
@@ -971,9 +1020,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 data = None
 
             if not data:
-                title = os.path.splitext(os.path.basename(cached_file))[0]
-                title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', title).strip()
-                data = {'title': title or 'Unknown', 'webpage_url': url}
+                title, _ = parse_local_song_name(cached_file)
+                data = {'title': title, 'webpage_url': url}
 
             source = discord.FFmpegPCMAudio(cached_file, options=audio_options)
             return cls(source, data=data)
@@ -2409,7 +2457,7 @@ class MusicPlayer:
 
             def scan_and_pick():
                 # Library scan + ffprobe are disk-bound; keep them off the event loop
-                files = glob.glob(os.path.join(MUSICS_FOLDER, '**', '*.mp3'), recursive=True)
+                files = list_library_files()
                 if not files:
                     return None, None
                 fresh = [f for f in files if f not in recent_urls]
@@ -2419,15 +2467,15 @@ class MusicPlayer:
             path, duration_seconds = await self.bot.loop.run_in_executor(None, scan_and_pick)
             if not path:
                 return None
-            title = os.path.splitext(os.path.basename(path))[0]
-            title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', title).strip()
+            title, artist = parse_local_song_name(path)
             return Song(
-                title=title or 'Unknown',
+                title=title,
                 url=path,
                 duration=cog.format_duration(duration_seconds)
                 if cog and duration_seconds else "Unknown",
                 requester=self.guild.me,
-                source_type='local'
+                source_type='local',
+                artist=artist
             )
         except Exception as e:
             logger.warning(f"Autoplay pick failed: {e}")
@@ -2633,6 +2681,32 @@ class MusicCog(commands.Cog):
             self.players[guild.id] = MusicPlayer(self.bot, guild)
         return self.players[guild.id]
 
+    def _local_song_for_query(self, query: str, requester) -> Optional[Song]:
+        """Match a text query to a downloaded library song (autocomplete picks).
+
+        Exact name matches play straight from disk - no YouTube round-trip.
+        Blocking (library index + ffprobe): call from an executor.
+        """
+        text = (query or '').strip().lower()
+        if len(text) < 3 or text.startswith('http'):
+            return None
+        for path in list_library_files():
+            stem = os.path.splitext(os.path.basename(path))[0]
+            stem = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', stem).strip()
+            title, artist = parse_local_song_name(path)
+            if text == stem.lower() or text == title.lower():
+                duration_seconds = _probe_duration_seconds(path)
+                logger.info(f"📁 Playing from library: {title}")
+                return Song(
+                    title=title,
+                    url=path,
+                    duration=self.format_duration(duration_seconds) if duration_seconds else 'Unknown',
+                    requester=requester,
+                    source_type='local',
+                    artist=artist
+                )
+        return None
+
     @staticmethod
     def _artist_key(value: Optional[str]) -> str:
         """Normalize artist/channel names for recommendation matching."""
@@ -2735,34 +2809,34 @@ class MusicCog(commands.Cog):
         # Reuse relevant downloads first: same artist/album wins, followed by
         # artists from the related-artist station. Unrelated library tracks are
         # intentionally not candidates here.
-        local_candidates = []
-        roots = {MUSICS_FOLDER, DOWNLOADS_FOLDER}
-        for root in roots:
-            for path in glob.glob(os.path.join(root, '**', '*.mp3'), recursive=True):
+        def scan_local_candidates():
+            candidates = []
+            for path in list_library_files():
                 if path in recent_urls:
                     continue
-                folder_artist = os.path.basename(os.path.dirname(path))
-                candidate_key = self._artist_key(folder_artist)
+                title, local_artist = parse_local_song_name(path)
+                candidate_key = self._artist_key(local_artist or '')
                 score = 0
-                if candidate_key == seed_key:
+                if candidate_key and candidate_key == seed_key:
                     score = 100
-                elif candidate_key in related_keys:
+                elif candidate_key and candidate_key in related_keys:
                     score = 65
                 if seed and seed.album and self._artist_key(seed.album) in self._artist_key(path):
                     score += 35
                 if score:
-                    local_candidates.append((score, path, folder_artist))
+                    candidates.append((score, path, title, local_artist))
+            return candidates
+
+        local_candidates = await self.bot.loop.run_in_executor(None, scan_local_candidates)
 
         if local_candidates:
             local_candidates.sort(key=lambda item: item[0], reverse=True)
-            score, path, folder_artist = random.choice(local_candidates[:10])
-            title = os.path.splitext(os.path.basename(path))[0]
-            title = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', title).strip()
+            score, path, title, local_artist = random.choice(local_candidates[:10])
             duration_seconds = await self.bot.loop.run_in_executor(None, _probe_duration_seconds, path)
-            logger.info(f"🎶 Autoplay local affinity {score}: {folder_artist} - {title}")
-            return Song(title=title or 'Unknown', url=path,
+            logger.info(f"🎶 Autoplay local affinity {score}: {local_artist} - {title}")
+            return Song(title=title, url=path,
                         duration=self.format_duration(duration_seconds) if duration_seconds else 'Unknown',
-                        requester=player.guild.me, source_type='local', artist=folder_artist)
+                        requester=player.guild.me, source_type='local', artist=local_artist)
 
         fresh = [item for item in station
                  if re.sub(r'\W+', '', item['title'].lower()) not in recent_titles]
@@ -3034,7 +3108,12 @@ class MusicCog(commands.Cog):
                     all_songs, total_count = await self.process_youtube_playlist_fast(query, interaction.user)
                     songs_added = all_songs
                 else:
-                    song = await self.process_youtube(query, interaction.user)
+                    # Library names (e.g. autocomplete picks) play from disk instantly
+                    song = await self.bot.loop.run_in_executor(
+                        None, self._local_song_for_query, query, interaction.user
+                    )
+                    if not song:
+                        song = await self.process_youtube(query, interaction.user)
                     print(f"Got song: {song}")
                     if song:
                         songs_added.append(song)
@@ -3097,7 +3176,8 @@ class MusicCog(commands.Cog):
 
     @play.autocomplete('query')
     async def play_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        suggestions = get_autocomplete_suggestions(current)
+        # Disk-bound suggestion lookup: never block the event loop per keystroke
+        suggestions = await self.bot.loop.run_in_executor(None, get_autocomplete_suggestions, current)
         return [
             app_commands.Choice(name=name[:100], value=name[:100])
             for name in suggestions
@@ -3159,7 +3239,11 @@ class MusicCog(commands.Cog):
                     all_songs, total_count = await self.process_youtube_playlist_fast(query, interaction.user)
                     songs_added = all_songs
                 else:
-                    song = await self.process_youtube(query, interaction.user)
+                    song = await self.bot.loop.run_in_executor(
+                        None, self._local_song_for_query, query, interaction.user
+                    )
+                    if not song:
+                        song = await self.process_youtube(query, interaction.user)
                     print(f"Got playnext song: {song}")
                     if song:
                         songs_added.append(song)
@@ -3218,7 +3302,7 @@ class MusicCog(commands.Cog):
 
     @playnext.autocomplete('query')
     async def playnext_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        suggestions = get_autocomplete_suggestions(current)
+        suggestions = await self.bot.loop.run_in_executor(None, get_autocomplete_suggestions, current)
         return [
             app_commands.Choice(name=name[:100], value=name[:100])
             for name in suggestions
@@ -5861,10 +5945,11 @@ class MusicCog(commands.Cog):
                     except:
                         pass
                     
-                    # Fall back to filename if no title metadata
+                    # Fall back to a cleaned-up filename if no title metadata
+                    parsed_title, parsed_artist = parse_local_song_name(file_path)
                     if not title:
-                        title = os.path.splitext(filename)[0]
-                    
+                        title = parsed_title
+
                     song_data = {
                         'title': title,
                         'url': file_path,
@@ -5874,7 +5959,7 @@ class MusicCog(commands.Cog):
                     }
                     all_discovered.append(song_data)
                     discovered_songs_set.add(file_path)
-                    
+
                     # Create song and accumulate in batch
                     if player.is_247_mode:
                         song = Song(
@@ -5883,7 +5968,8 @@ class MusicCog(commands.Cog):
                             duration=duration,
                             requester=interaction.user,
                             source_type='local',
-                            thumbnail=None
+                            thumbnail=None,
+                            artist=parsed_artist
                         )
                         batch_to_add.append(song)
                         logger.info(f"📀 Indexed: {title} ({duration})")
