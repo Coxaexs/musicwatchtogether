@@ -1766,6 +1766,8 @@ class MusicPlayer:
         self.autoplay = False  # Keep playing related music when the queue runs out
         self._autoplay_prefetch_task: Optional[asyncio.Task] = None
         self._autoplay_pick_lock = asyncio.Lock()
+        self.sleep_timer_task: Optional[asyncio.Task] = None
+        self.sleep_timer_ends_at: Optional[float] = None  # unix time, for display
         self.history = deque(maxlen=25)  # Recently played songs, newest first
         self.audio_filter: Optional[str] = None  # Active /filter preset name
         self.crossfade_seconds = 0  # Fade in/out duration between songs (0 = off)
@@ -4231,6 +4233,9 @@ class MusicCog(commands.Cog):
             status = [f"🔊 {int(player.volume * 100)}%", f"🔁 {loop_status}"]
             if player.autoplay:
                 status.append("✨ Smart Autoplay")
+            if player.sleep_timer_ends_at:
+                remaining = max(0, int((player.sleep_timer_ends_at - time.time()) / 60))
+                status.append(f"😴 {remaining}m left")
 
             if player.audio_filter or player.crossfade_seconds or player.automix_enabled:
                 effects = []
@@ -4590,6 +4595,218 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(f"🔄 Restarted **{player.current.title}**")
         else:
             await interaction.followup.send("❌ Can't replay this song (only downloaded/local tracks support it).")
+
+    @app_commands.command(name="forward", description="Jump forward in the current song")
+    @app_commands.describe(seconds="How far to jump ahead (default 15)")
+    async def forward(self, interaction: discord.Interaction, seconds: app_commands.Range[int, 1, 600] = 15):
+        player = self.get_player(interaction.guild)
+        if not player.current:
+            await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
+            return
+
+        position = int(player.get_playback_position_seconds()) + seconds
+        total = self._parse_duration_seconds(player.current.duration)
+        if total and position >= total:
+            await interaction.response.send_message("❌ That would jump past the end - use /skip instead.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        if await player.seek_to(position):
+            await interaction.followup.send(f"⏩ Jumped ahead to `{self.format_duration(position)}`")
+        else:
+            await interaction.followup.send("❌ Can't seek in this song (only downloaded/local tracks support seeking).")
+
+    @app_commands.command(name="rewind", description="Jump back in the current song")
+    @app_commands.describe(seconds="How far to jump back (default 15)")
+    async def rewind(self, interaction: discord.Interaction, seconds: app_commands.Range[int, 1, 600] = 15):
+        player = self.get_player(interaction.guild)
+        if not player.current:
+            await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
+            return
+
+        position = max(0, int(player.get_playback_position_seconds()) - seconds)
+        await interaction.response.defer()
+        if await player.seek_to(position):
+            await interaction.followup.send(f"⏪ Jumped back to `{self.format_duration(position)}`")
+        else:
+            await interaction.followup.send("❌ Can't seek in this song (only downloaded/local tracks support seeking).")
+
+    # ---------- library commands ----------
+
+    def _collect_library_artists(self) -> list[str]:
+        """Unique artist names across the downloaded library (blocking)."""
+        artists = {}
+        for path in list_library_files():
+            _, artist = parse_local_song_name(path)
+            if artist:
+                artists.setdefault(artist.lower(), artist)
+        return sorted(artists.values(), key=str.lower)
+
+    @app_commands.command(name="artist", description="Queue every downloaded song by an artist from the library")
+    @app_commands.describe(
+        name="Artist name from the library",
+        shuffle="Shuffle the songs (default: on)",
+        limit="Cap how many songs to queue"
+    )
+    async def artist_cmd(self, interaction: discord.Interaction, name: str,
+                         shuffle: bool = True,
+                         limit: Optional[app_commands.Range[int, 1, 200]] = None):
+        await interaction.response.defer()
+        if not await self.ensure_voice(interaction):
+            return
+
+        player = self.get_player(interaction.guild)
+        player.last_message_channel = interaction.channel
+
+        wanted = self._artist_key(name)
+        if not wanted:
+            await interaction.followup.send("❌ Give me an artist name to look for!")
+            return
+
+        def collect():
+            matches = []
+            for path in list_library_files():
+                title, artist = parse_local_song_name(path)
+                if artist and self._artist_key(artist) == wanted:
+                    matches.append((path, title, artist))
+            matches.sort(key=lambda item: item[1].lower())
+            return matches
+
+        matches = await self.bot.loop.run_in_executor(None, collect)
+        if not matches:
+            await interaction.followup.send(
+                f"❌ No downloaded songs by **{name}** - play some with /play first and they'll be cached!"
+            )
+            return
+
+        if shuffle:
+            random.shuffle(matches)
+        if limit:
+            matches = matches[:limit]
+
+        for path, title, artist in matches:
+            player.queue.append(Song(title=title, url=path, duration="Unknown",
+                                     requester=interaction.user, source_type='local', artist=artist))
+
+        await interaction.followup.send(
+            f"📀 Queued **{len(matches)}** song{'s' if len(matches) != 1 else ''} by "
+            f"**{matches[0][2]}**{' (shuffled)' if shuffle else ''}!"
+        )
+
+        vc = interaction.guild.voice_client
+        if vc and not vc.is_playing() and not vc.is_paused() and not player._play_next_running:
+            await player.play_next()
+
+    @artist_cmd.autocomplete('name')
+    async def artist_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        artists = await self.bot.loop.run_in_executor(None, self._collect_library_artists)
+        text = current.lower().strip()
+        picks = [a for a in artists if text in a.lower()] if text else artists
+        return [app_commands.Choice(name=a[:100], value=a[:100]) for a in picks[:25]]
+
+    @app_commands.command(name="randomplay", description="Queue random songs from the downloaded library")
+    @app_commands.describe(count="How many songs to queue (default 10)")
+    async def randomplay(self, interaction: discord.Interaction, count: app_commands.Range[int, 1, 50] = 10):
+        await interaction.response.defer()
+        if not await self.ensure_voice(interaction):
+            return
+
+        player = self.get_player(interaction.guild)
+        player.last_message_channel = interaction.channel
+        recent_urls = {song.url for song in player.history}
+
+        def pick():
+            files = list(list_library_files())
+            pool = [f for f in files if f not in recent_urls] or files
+            return random.sample(pool, min(count, len(pool)))
+
+        picks = await self.bot.loop.run_in_executor(None, pick)
+        if not picks:
+            await interaction.followup.send("❌ The library is empty - play something with /play to start caching songs!")
+            return
+
+        for path in picks:
+            title, artist = parse_local_song_name(path)
+            player.queue.append(Song(title=title, url=path, duration="Unknown",
+                                     requester=interaction.user, source_type='local', artist=artist))
+
+        await interaction.followup.send(f"🎲 Queued **{len(picks)}** random song{'s' if len(picks) != 1 else ''} from the library!")
+
+        vc = interaction.guild.voice_client
+        if vc and not vc.is_playing() and not vc.is_paused() and not player._play_next_running:
+            await player.play_next()
+
+    # ---------- sleep timer ----------
+
+    async def _run_sleep_timer(self, player: MusicPlayer, minutes: int):
+        try:
+            await asyncio.sleep(minutes * 60)
+            player.sleep_timer_ends_at = None
+
+            vc = player.guild.voice_client
+            if not vc or not vc.is_connected():
+                return
+
+            # Gentle fade-out so the music doesn't cut off mid-beat
+            source = vc.source
+            if vc.is_playing() and source is not None and hasattr(source, 'volume'):
+                original = source.volume
+                for step in range(20):
+                    source.volume = original * (1 - (step + 1) / 20)
+                    await asyncio.sleep(0.4)
+
+            self._stop_now_playing_task(player.guild.id)
+            self._stop_lyricsnow_task(player.guild.id)
+            player.cancel_idle_disconnect()
+            player.queue.clear()
+            player.current = None
+            player.pending_playlist = None
+            player.cancel_autoplay_prefetch()
+            player.clear_preloads()
+            player.reset_playback_clock()
+            await vc.disconnect(force=False)
+
+            if player.last_message_channel:
+                try:
+                    await player.last_message_channel.send("😴 Sleep timer: that's all for tonight - good night!")
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning(f"Sleep timer failed for {player.guild.name}: {e}")
+        finally:
+            if player.sleep_timer_task is asyncio.current_task():
+                player.sleep_timer_task = None
+                player.sleep_timer_ends_at = None
+
+    @app_commands.command(name="sleeptimer", description="Fade the music out and leave after a while - great for falling asleep")
+    @app_commands.describe(minutes="Minutes until the music stops (0 cancels the timer)")
+    async def sleeptimer(self, interaction: discord.Interaction, minutes: app_commands.Range[int, 0, 480]):
+        player = self.get_player(interaction.guild)
+
+        task = player.sleep_timer_task
+        if task and not task.done():
+            task.cancel()
+        player.sleep_timer_task = None
+        player.sleep_timer_ends_at = None
+
+        if minutes == 0:
+            await interaction.response.send_message("⏰ Sleep timer cancelled.")
+            return
+
+        vc = interaction.guild.voice_client
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message("❌ I'm not in a voice channel - start some music first!", ephemeral=True)
+            return
+
+        player.last_message_channel = interaction.channel
+        player.sleep_timer_ends_at = time.time() + minutes * 60
+        player.sleep_timer_task = asyncio.create_task(self._run_sleep_timer(player, minutes))
+        await interaction.response.send_message(
+            f"😴 Sleep timer set: the music fades out in **{minutes} min** "
+            f"(around <t:{int(player.sleep_timer_ends_at)}:t>). Cancel with `/sleeptimer 0`."
+        )
 
     @app_commands.command(name="autoplay", description="Toggle smart artist/album radio when the queue is empty")
     async def autoplay(self, interaction: discord.Interaction):
