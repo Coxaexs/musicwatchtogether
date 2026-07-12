@@ -585,6 +585,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   h1 select { margin-left: auto; background: var(--panel); color: var(--text);
               border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px;
               font-size: 13px; cursor: pointer; }
+  h1 .settings-toggle { white-space: nowrap; padding: 7px 11px; font-size: 13px; }
   .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
   .tab { background: var(--panel); border: 1px solid transparent; color: var(--text);
          padding: 8px 14px; border-radius: 999px; cursor: pointer; font-size: 14px;
@@ -767,6 +768,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <option value="modern">✨ Modern</option>
       <option value="light">☀️ Light</option>
     </select>
+    <button id="settingsBtn" class="settings-toggle" onclick="toggleSettings()"
+            aria-expanded="false" aria-controls="settingsPanel">⚙️ Settings</button>
   </h1>
   <div class="tabs" id="tabs"></div>
   <div id="content"><div class="empty">Loading…</div></div>
@@ -806,6 +809,7 @@ let token = sessionStorage.getItem('mb_token') || localStorage.getItem('mb_token
 let guilds = [], selected = sessionStorage.getItem('mb_guild') || localStorage.getItem('mb_guild') || null;
 let state = null, lastStateAt = 0;
 let lyricsData = null, lastLyricsTitle = null, lyricsVisible = true;
+let settingsOpen = false; // intentionally closed on every fresh page load
 
 // ---------- themes ----------
 const THEMES = ['default', 'vinyl-modern', 'vinyl-classic', 'modern', 'light'];
@@ -853,6 +857,11 @@ function fmt(sec) {
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
   return (h ? h + ':' + String(m).padStart(2,'0') : m) + ':' + String(s).padStart(2,'0');
+}
+
+function toggleSettings() {
+  settingsOpen = !settingsOpen;
+  if (state) render();
 }
 
 async function refreshGuilds() {
@@ -970,7 +979,8 @@ function render() {
       <button onclick="addSong(true)">Play next</button>
     </div></div>`;
 
-  html += `<div class="card"><div class="qhead"><h2>⚙️ All settings</h2></div>
+  const settingsHtml = `<div class="card" id="settingsPanel"><div class="qhead"><h2>⚙️ All settings</h2>
+      <button onclick="toggleSettings()" aria-label="Close settings">✕ Close</button></div>
     <div class="setting">
       <div class="setting-text"><div class="setting-title">Volume</div>
         <div class="setting-desc">Current playback level: ${s.volume}%.</div></div>
@@ -1079,7 +1089,13 @@ function render() {
       '</details></div>';
   }
 
+  if (settingsOpen) html = settingsHtml + html;
   document.getElementById('content').innerHTML = html;
+  const settingsBtn = document.getElementById('settingsBtn');
+  if (settingsBtn) {
+    settingsBtn.classList.toggle('toggled', settingsOpen);
+    settingsBtn.setAttribute('aria-expanded', settingsOpen ? 'true' : 'false');
+  }
   
   // Restore input value and focus state
   const newInput = document.getElementById('q');
