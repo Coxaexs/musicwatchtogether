@@ -17,7 +17,7 @@ every participant streams the exact same file.
 ReelsTogether keeps a tiny per-room taste profile: likes and full watches
 boost keywords from a clip's title/tags, fast skips decay them, and the next
 clips are found by searching YouTube Shorts with the highest-weighted terms.
-Only the newest MAX_REELS_CACHE files are kept on disk.
+WatchTogether and ReelsTogether share a hard 10-file downloaded-video cache.
 """
 
 import asyncio
@@ -52,9 +52,8 @@ WATCH_CACHE_DIR = os.path.join(BASE_DIR, 'watch_cache')
 REELS_CACHE_DIR = os.path.join(BASE_DIR, 'reels_cache')
 
 TOKEN_TTL = 7 * 86400          # links stay valid for a week
-MAX_WATCH_CACHE = 10           # downloaded files kept per cache dir
-MAX_REELS_CACHE = 10
-MAX_HLS_DIRS = 4               # progressive-stream folders kept
+MAX_MEDIA_CACHE = 10           # WatchTogether + ReelsTogether files combined
+REELS_HISTORY = 5              # recent backward history within the shared cache cap
 CHAT_HISTORY = 100
 REELS_READY_AHEAD = 3          # keep this many reels downloaded ahead of the cursor
 REELS_MAX_DURATION = 150       # seconds - skip anything longer in the shorts feed
@@ -147,6 +146,26 @@ def get_settings(room_id):
     s = dict(DEFAULT_SETTINGS)
     s.update(room_settings.get(room_id, {}))
     return s
+
+
+def update_settings(room_id, *, adblock=None, sponsorblock=None, quality=None):
+    """Persist validated room settings for Discord and web control surfaces."""
+    cfg = get_settings(room_id)
+    if adblock is not None:
+        cfg['adblock'] = bool(adblock)
+    if sponsorblock is not None:
+        cfg['sponsorblock'] = bool(sponsorblock)
+    if quality is not None:
+        try:
+            quality = int(quality)
+        except (TypeError, ValueError):
+            quality = 0
+        if quality not in (360, 480, 720, 1080):
+            raise ValueError('quality must be 360, 480, 720, or 1080')
+        cfg['quality'] = quality
+    room_settings[room_id] = cfg
+    _save_json(SETTINGS_FILE, room_settings)
+    return cfg
 
 
 def get_room_link(channel_id, channel_name, mode):
@@ -444,18 +463,32 @@ def _blocking_ffmpeg_dl(url, headers, cache_dir, uid, kind=None):
     raise RuntimeError(last)
 
 
-def _trim_cache(cache_dir, keep, protected):
+def _trim_cache(keep, protected):
     try:
-        files = [f for f in glob.glob(os.path.join(cache_dir, '*.*'))
-                 if not f.endswith(('.part', '.ytdl'))]
+        files = []
+        for cache_dir in (WATCH_CACHE_DIR, REELS_CACHE_DIR):
+            files.extend(
+                f for f in glob.glob(os.path.join(cache_dir, '*.*'))
+                if not f.endswith(('.part', '.ytdl'))
+            )
+        hls_root = os.path.join(WATCH_CACHE_DIR, 'hls')
+        if os.path.isdir(hls_root):
+            files.extend(
+                os.path.join(hls_root, name) for name in os.listdir(hls_root)
+                if os.path.isdir(os.path.join(hls_root, name))
+            )
         files.sort(key=os.path.getmtime)
-        removable = [f for f in files if os.path.basename(f) not in protected]
+        removable = [f for f in files if f not in protected]
         excess = len(files) - keep
         for f in removable:
             if excess <= 0:
                 break
             try:
-                os.remove(f)
+                if os.path.isdir(f):
+                    import shutil
+                    shutil.rmtree(f)
+                else:
+                    os.remove(f)
                 excess -= 1
             except OSError:
                 pass
@@ -463,14 +496,45 @@ def _trim_cache(cache_dir, keep, protected):
         logger.warning(f"cache trim failed: {e}")
 
 
-def _protected_files():
-    keep = set()
+def _protected_files(extra=()):
+    """Pick at most the global cache cap's most useful files to retain."""
+    ordered = []
+
+    def add(room, item):
+        fname = item.get('file') if item else None
+        if fname:
+            cache_dir = REELS_CACHE_DIR if room.mode == 'reels' else WATCH_CACHE_DIR
+            path = os.path.join(cache_dir, fname)
+            if fname.startswith('hls/'):
+                path = os.path.dirname(path)
+            if path not in ordered:
+                ordered.append(path)
+
+    # A just-finished/in-progress download is protected until it has had a
+    # chance to become current, followed by every room's current item.
+    for path in extra:
+        if path and path not in ordered:
+            ordered.append(path)
     for room in rooms.values():
-        lo = max(0, room.index - 1)
-        for item in room.queue[lo:room.index + REELS_READY_AHEAD + 3]:
-            if item.get('file'):
-                keep.add(item['file'])
-    return keep
+        add(room, room.current())
+
+    # Ready-ahead items keep forward swipes instant.
+    for distance in range(1, REELS_READY_AHEAD + 1):
+        for room in rooms.values():
+            idx = room.index + distance
+            if 0 <= idx < len(room.queue):
+                add(room, room.queue[idx])
+
+    # Fill the remaining slots with backward reel history.
+    for distance in range(1, REELS_HISTORY + 1):
+        for room in rooms.values():
+            if room.mode != 'reels':
+                continue
+            idx = room.index - distance
+            if idx >= 0:
+                add(room, room.queue[idx])
+
+    return set(ordered[:MAX_MEDIA_CACHE])
 
 
 # ---------------------------------------------------------------- downloads
@@ -549,9 +613,9 @@ async def _download_item(room, item):
             else:
                 logger.error(f"watch download failed for {item.get('url')}: {e}")
                 _set_embed_fallback(item, e)
-        _trim_cache(cache_dir,
-                    MAX_REELS_CACHE if room.mode == 'reels' else MAX_WATCH_CACHE,
-                    _protected_files())
+        _trim_cache(MAX_MEDIA_CACHE, _protected_files([
+            os.path.join(cache_dir, item['file']) if item.get('file') else None
+        ]))
         await _after_ready(room, item)
 
 
@@ -576,6 +640,7 @@ async def _hls_item(room, item):
 
     out_dir = os.path.join(WATCH_CACHE_DIR, 'hls', item['uid'])
     os.makedirs(out_dir, exist_ok=True)
+    _trim_cache(MAX_MEDIA_CACHE, _protected_files([out_dir]))
     playlist = os.path.join(out_dir, 'index.m3u8')
     cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
     for inp in fmt['inputs']:
@@ -641,33 +706,8 @@ async def _hls_item(room, item):
                 f.write('\n#EXT-X-ENDLIST\n')
     except OSError:
         pass
-    _trim_hls()
+    _trim_cache(MAX_MEDIA_CACHE, _protected_files([out_dir]))
     await _broadcast_state(room)
-
-
-def _trim_hls():
-    root = os.path.join(WATCH_CACHE_DIR, 'hls')
-    if not os.path.isdir(root):
-        return
-    protected = set()
-    for room in rooms.values():
-        lo = max(0, room.index - 1)
-        for it in room.queue[lo:room.index + REELS_READY_AHEAD + 3]:
-            protected.add(it['uid'])
-    try:
-        dirs = sorted((os.path.join(root, d) for d in os.listdir(root)),
-                      key=os.path.getmtime)
-        excess = len(dirs) - MAX_HLS_DIRS
-        for d in dirs:
-            if excess <= 0:
-                break
-            if os.path.basename(d) in protected:
-                continue
-            import shutil
-            shutil.rmtree(d, ignore_errors=True)
-            excess -= 1
-    except Exception as e:
-        logger.warning(f"hls trim failed: {e}")
 
 
 async def _after_ready(room, item):
@@ -1136,6 +1176,28 @@ async def ws_handler(request):
                     # for the next loop tick
                     asyncio.create_task(_reels_topup(room))
                 await _broadcast_state(room)
+
+            elif t == 'swipe_back' and room.mode == 'reels':
+                # Move backward through reels that are still playable. Recent
+                # history is protected from cache trimming, so this normally
+                # permits several consecutive backward swipes.
+                prev = room.index - 1
+                while prev >= 0:
+                    item = room.queue[prev]
+                    playable = item.get('status') == 'embed'
+                    if item.get('file'):
+                        playable = os.path.isfile(os.path.join(REELS_CACHE_DIR,
+                                                               item['file']))
+                    if playable:
+                        break
+                    prev -= 1
+                if prev >= 0:
+                    room.index = prev
+                    room._advanced_past = room.index - 1
+                    room.set_position(0, playing=True)
+                    await _broadcast_state(room)
+                else:
+                    await _notice(room, '⏮ This is the oldest available reel')
 
             elif t == 'like' and room.mode == 'reels':
                 cur = room.current()
@@ -2110,7 +2172,8 @@ REELS_HTML = r"""<!DOCTYPE html>
   <button class="rbtn" onclick="toggleAddPanel()">➕</button>
   <button class="rbtn" onclick="copyLink()">🔗</button>
   <button class="rbtn" onclick="toggleFullscreen()">⛶</button>
-  <button class="rbtn" onclick="doSwipe()">⬆️</button>
+  <button class="rbtn" title="Previous reel" aria-label="Previous reel" onclick="doSwipeBack()">⬇️</button>
+  <button class="rbtn" title="Next reel" aria-label="Next reel" onclick="doSwipe()">⬆️</button>
 </div>
 <div class="meta"><div class="t" id="mtitle"></div><div class="u" id="muser"></div></div>
 <div class="chatfeed" id="chatfeed"></div>
@@ -2289,6 +2352,13 @@ function doSwipe(){
   document.getElementById('hint').style.display='none';
   send({t:'swipe', watched:(Date.now()-watchedStart)/1000, dur:v.duration||0});
 }
+function doSwipeBack(){
+  if(Date.now()-swipeLock<600)return;
+  if(!st||st.index<=0){toast('⏮ This is the oldest available reel');return}
+  swipeLock=Date.now();
+  document.getElementById('hint').style.display='none';
+  send({t:'swipe_back'});
+}
 function doLike(){
   send({t:'like'});
 }
@@ -2330,13 +2400,15 @@ function sendChat(){
   if(!t)return;send({t:'chat',text:t});i.value='';i.blur();
 }
 
-// gestures: swipe up = next, double tap = like, single tap = pause/play
+// gestures: swipe up = next, swipe down = previous, double tap = like,
+// single tap = pause/play
 let tY=null, lastTap=0;
 document.getElementById('stage').addEventListener('touchstart',e=>{tY=e.touches[0].clientY},{passive:true});
 document.getElementById('stage').addEventListener('touchend',e=>{
   if(tY===null)return;
   const dy=tY-e.changedTouches[0].clientY; tY=null;
   if(dy>70){doSwipe();return}
+  if(dy < -70){doSwipeBack();return}
   const now=Date.now();
   if(now-lastTap<300){doLike();lastTap=0;return}
   lastTap=now;
@@ -2349,11 +2421,16 @@ document.getElementById('stage').addEventListener('click',e=>{
   lastTap=now;
   setTimeout(()=>{if(lastTap===now)togglePlay()},310);
 });
-window.addEventListener('wheel',e=>{if(e.deltaY>30)doSwipe()},{passive:true});
+window.addEventListener('wheel',e=>{
+  if(e.deltaY>30)doSwipe();
+  else if(e.deltaY < -30)doSwipeBack();
+},{passive:true});
 window.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT')return;
   if(e.key==='ArrowUp'||e.key==='ArrowDown'||e.key===' '){e.preventDefault();
-    if(e.key===' ')togglePlay();else doSwipe();}
+    if(e.key===' ')togglePlay();
+    else if(e.key==='ArrowUp')doSwipeBack();
+    else doSwipe();}
   if(e.key==='l')doLike();
 });
 function togglePlay(){

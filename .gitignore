@@ -38,6 +38,7 @@ backups/
 
 # ---- runtime state (per-deployment, not source) ----
 player_state.json
+guild_settings.json
 watch_tokens.json
 web_tokens.json
 reels_profiles.json

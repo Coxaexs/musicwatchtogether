@@ -175,6 +175,15 @@ class WebUI:
             'volume': int(player.volume * 100),
             'loop': 'song' if player.loop else ('queue' if player.loop_queue else 'off'),
             'autoplay': player.autoplay,
+            'artist_diversity': player.artist_diversity,
+            'vibe_match': player.vibe_match,
+            'audio_filter': player.audio_filter or 'off',
+            'crossfade_seconds': player.crossfade_seconds,
+            'automix': player.automix_enabled,
+            'automix_blend_seconds': player.automix_blend_seconds,
+            'karaoke': player.karaoke_mode,
+            'idle_disconnect_minutes': player.idle_disconnect_seconds // 60,
+            'sleep_timer_ends_at': player.sleep_timer_ends_at,
             'is_247': player.is_247_mode,
             'current': current,
             'queue': [_song_json(s) for s in list(player.queue)[:100]],
@@ -270,16 +279,90 @@ class WebUI:
                 player.volume = level / 100
                 if vc and vc.source:
                     vc.source.volume = player.volume
+                cog.save_player_settings(player)
             elif action == 'loop':
                 mode = body.get('mode', 'off')
                 player.loop = mode == 'song'
                 player.loop_queue = mode == 'queue'
+                cog.save_player_settings(player)
             elif action == 'autoplay':
                 player.autoplay = not player.autoplay
                 if player.autoplay:
                     player.schedule_autoplay_prefetch()
                 else:
                     player.cancel_autoplay_prefetch()
+                cog.save_player_settings(player)
+            elif action == 'artist_diversity':
+                cog.set_artist_diversity(player, not player.artist_diversity)
+            elif action == 'vibe_match':
+                player.vibe_match = not player.vibe_match
+                cog.save_player_settings(player)
+            elif action == 'filter':
+                preset = body.get('preset', 'off')
+                if preset not in ('off', 'bassboost', 'nightcore', 'slowed', '8d', 'karaoke'):
+                    return web.json_response({'error': 'invalid filter preset'}, status=400)
+                player.audio_filter = None if preset == 'off' else preset
+                if player.karaoke_mode and preset != 'karaoke':
+                    player.karaoke_mode = False
+                    cog._stop_lyricsnow_task(guild.id)
+                player.clear_preloads()
+                cog.save_player_settings(player)
+                if vc and (vc.is_playing() or vc.is_paused()) and player.current:
+                    await player.seek_to(int(player.get_playback_position_seconds()))
+            elif action == 'crossfade':
+                seconds = max(0, min(10, int(body.get('seconds', 0))))
+                player.crossfade_seconds = seconds
+                player.clear_preloads()
+                cog.save_player_settings(player)
+            elif action == 'automix':
+                player.automix_enabled = not player.automix_enabled
+                player.clear_preloads()
+                if player.automix_enabled:
+                    player.schedule_automix()
+                else:
+                    player.cancel_automix()
+                cog.save_player_settings(player)
+            elif action == 'automix_blend':
+                seconds = max(4, min(15, int(body.get('seconds', 8))))
+                player.automix_blend_seconds = seconds
+                cog.save_player_settings(player)
+            elif action == 'karaoke':
+                player.karaoke_mode = not player.karaoke_mode
+                if player.karaoke_mode:
+                    player.audio_filter = 'karaoke'
+                else:
+                    if player.audio_filter == 'karaoke':
+                        player.audio_filter = None
+                    cog._stop_lyricsnow_task(guild.id)
+                player.clear_preloads()
+                cog.save_player_settings(player)
+                if vc and (vc.is_playing() or vc.is_paused()) and player.current:
+                    await player.seek_to(int(player.get_playback_position_seconds()))
+                    if player.karaoke_mode and player.last_message_channel:
+                        await cog._start_lyricsnow_for_current(player)
+            elif action == 'idle_disconnect':
+                minutes = max(0, min(60, int(body.get('minutes', 5))))
+                player.idle_disconnect_seconds = minutes * 60
+                player.cancel_idle_disconnect()
+                if minutes:
+                    player.schedule_idle_disconnect()
+                cog.save_player_settings(player)
+            elif action == 'sleep_timer':
+                minutes = max(0, min(480, int(body.get('minutes', 0))))
+                task = player.sleep_timer_task
+                if task and not task.done():
+                    task.cancel()
+                player.sleep_timer_task = None
+                player.sleep_timer_ends_at = None
+                if minutes:
+                    if not vc or not vc.is_connected():
+                        return web.json_response(
+                            {'error': 'Bot must be in voice to start a sleep timer'}, status=409
+                        )
+                    player.sleep_timer_ends_at = time.time() + minutes * 60
+                    player.sleep_timer_task = asyncio.create_task(
+                        cog._run_sleep_timer(player, minutes)
+                    )
             elif action == 'remove':
                 index = int(body.get('index', -1))
                 queue_list = list(player.queue)
@@ -506,6 +589,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   h1 select { margin-left: auto; background: var(--panel); color: var(--text);
               border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px;
               font-size: 13px; cursor: pointer; }
+  h1 .settings-toggle { white-space: nowrap; padding: 7px 11px; font-size: 13px; }
   .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
   .tab { background: var(--panel); border: 1px solid transparent; color: var(--text);
          padding: 8px 14px; border-radius: 999px; cursor: pointer; font-size: 14px;
@@ -542,6 +626,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .addrow input[type=text]:focus { outline: 1px solid var(--accent); }
   .qhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .qhead h2 { font-size: 15px; margin: 0; }
+  .setting { display: flex; align-items: center; gap: 14px; padding: 10px 0;
+             border-bottom: 1px solid var(--border2); }
+  .setting:last-child { border-bottom: none; }
+  .setting .setting-text { flex: 1; min-width: 0; }
+  .setting .setting-title { font-size: 14px; font-weight: 600; }
+  .setting .setting-desc { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .setting button { min-width: 82px; }
+  .setting select { min-width: 110px; max-width: 170px; background: var(--panel2);
+                    color: var(--text); border: 1px solid var(--border);
+                    border-radius: 8px; padding: 8px; }
   .qitem { display: flex; align-items: center; gap: 10px; padding: 8px 6px;
            border-bottom: 1px solid var(--border2); font-size: 14px; }
   .qitem:last-child { border-bottom: none; }
@@ -678,6 +772,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <option value="modern">✨ Modern</option>
       <option value="light">☀️ Light</option>
     </select>
+    <button id="settingsBtn" class="settings-toggle" onclick="toggleSettings()"
+            aria-expanded="false" aria-controls="settingsPanel">⚙️ Settings</button>
   </h1>
   <div class="tabs" id="tabs"></div>
   <div id="content"><div class="empty">Loading…</div></div>
@@ -717,6 +813,7 @@ let token = sessionStorage.getItem('mb_token') || localStorage.getItem('mb_token
 let guilds = [], selected = sessionStorage.getItem('mb_guild') || localStorage.getItem('mb_guild') || null;
 let state = null, lastStateAt = 0;
 let lyricsData = null, lastLyricsTitle = null, lyricsVisible = true;
+let settingsOpen = false; // intentionally closed on every fresh page load
 
 // ---------- themes ----------
 const THEMES = ['default', 'vinyl-modern', 'vinyl-classic', 'modern', 'light'];
@@ -764,6 +861,11 @@ function fmt(sec) {
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
   return (h ? h + ':' + String(m).padStart(2,'0') : m) + ':' + String(s).padStart(2,'0');
+}
+
+function toggleSettings() {
+  settingsOpen = !settingsOpen;
+  if (state) render();
 }
 
 async function refreshGuilds() {
@@ -824,6 +926,8 @@ function render() {
   const inputVal = oldInput ? oldInput.value : '';
   const isFocused = (document.activeElement === oldInput);
   const s = state;
+  const sleepMinutes = s.sleep_timer_ends_at
+    ? Math.max(0, Math.ceil((s.sleep_timer_ends_at * 1000 - Date.now()) / 60000)) : 0;
   let html = '';
 
   // Detect track change for the vinyl record-swap animation
@@ -879,6 +983,100 @@ function render() {
       <button onclick="addSong(true)">Play next</button>
     </div></div>`;
 
+  const settingsHtml = `<div class="card" id="settingsPanel"><div class="qhead"><h2>⚙️ All settings</h2>
+      <button onclick="toggleSettings()" aria-label="Close settings">✕ Close</button></div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Volume</div>
+        <div class="setting-desc">Current playback level: ${s.volume}%.</div></div>
+      <input type="range" min="0" max="100" value="${s.volume}"
+        onchange="act('volume',{level:+this.value})">
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Loop mode</div>
+        <div class="setting-desc">Repeat one song, the full queue, or neither.</div></div>
+      <select onchange="act('loop',{mode:this.value})">
+        <option value="off" ${s.loop==='off'?'selected':''}>Off</option>
+        <option value="song" ${s.loop==='song'?'selected':''}>Song</option>
+        <option value="queue" ${s.loop==='queue'?'selected':''}>Queue</option>
+      </select>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Smart Autoplay</div>
+        <div class="setting-desc">Keep playing related music when the queue runs out.</div></div>
+      <button class="${s.autoplay ? 'toggled' : ''}" onclick="act('autoplay')">${s.autoplay ? 'Enabled' : 'Disabled'}</button>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Artist variety after 3 songs</div>
+        <div class="setting-desc">When AutoPlay plays the same artist three times in a row, prefer a related artist next.</div></div>
+      <button class="${s.artist_diversity ? 'toggled' : ''}" onclick="act('artist_diversity')">${s.artist_diversity ? 'Enabled' : 'Disabled'}</button>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Vibe matching</div>
+        <div class="setting-desc">AutoPlay follows the current song's energy and genre and weighs ❤️ likes. Off = classic artist/album radio.</div></div>
+      <button class="${s.vibe_match ? 'toggled' : ''}" onclick="act('vibe_match')">${s.vibe_match ? 'Enabled' : 'Disabled'}</button>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Audio filter</div>
+        <div class="setting-desc">Apply an effect to playback.</div></div>
+      <select onchange="act('filter',{preset:this.value})">
+        <option value="off" ${s.audio_filter==='off'?'selected':''}>Off</option>
+        <option value="bassboost" ${s.audio_filter==='bassboost'?'selected':''}>Bass Boost</option>
+        <option value="nightcore" ${s.audio_filter==='nightcore'?'selected':''}>Nightcore</option>
+        <option value="slowed" ${s.audio_filter==='slowed'?'selected':''}>Slowed</option>
+        <option value="8d" ${s.audio_filter==='8d'?'selected':''}>8D</option>
+        <option value="karaoke" ${s.audio_filter==='karaoke'?'selected':''}>Karaoke filter</option>
+      </select>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Crossfade</div>
+        <div class="setting-desc">Fade songs in and out; AutoMix takes priority when enabled.</div></div>
+      <select onchange="act('crossfade',{seconds:+this.value})">
+        ${[0,1,2,3,4,5,6,8,10].map(n=>`<option value="${n}" ${s.crossfade_seconds===n?'selected':''}>${n?n+' seconds':'Off'}</option>`).join('')}
+      </select>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">AutoMix</div>
+        <div class="setting-desc">Beat-aware DJ transitions between songs.</div></div>
+      <button class="${s.automix ? 'toggled' : ''}" onclick="act('automix')">${s.automix ? 'Enabled' : 'Disabled'}</button>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">AutoMix blend</div>
+        <div class="setting-desc">Maximum overlap between outgoing and incoming tracks.</div></div>
+      <select onchange="act('automix_blend',{seconds:+this.value})">
+        ${Array.from({length:12},(_,i)=>i+4).map(n=>`<option value="${n}" ${s.automix_blend_seconds===n?'selected':''}>${n} seconds</option>`).join('')}
+      </select>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Karaoke mode</div>
+        <div class="setting-desc">Remove vocals and post live synced lyrics for every song.</div></div>
+      <button class="${s.karaoke ? 'toggled' : ''}" onclick="act('karaoke')">${s.karaoke ? 'Enabled' : 'Disabled'}</button>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Idle disconnect</div>
+        <div class="setting-desc">Leave voice after the player has been idle.</div></div>
+      <select onchange="act('idle_disconnect',{minutes:+this.value})">
+        ${[0,1,5,10,15,30,60].map(n=>`<option value="${n}" ${s.idle_disconnect_minutes===n?'selected':''}>${n?n+' min':'Never'}</option>`).join('')}
+      </select>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">Sleep timer</div>
+        <div class="setting-desc">${sleepMinutes ? sleepMinutes+' min remaining' : 'No timer active'}; fades out, stops, and leaves.</div></div>
+      <select onchange="if(this.value!=='')act('sleep_timer',{minutes:+this.value})">
+        <option value="">Choose…</option>
+        <option value="0">Cancel</option>
+        <option value="15">15 min</option><option value="30">30 min</option>
+        <option value="45">45 min</option><option value="60">1 hour</option>
+        <option value="120">2 hours</option><option value="240">4 hours</option>
+        <option value="480">8 hours</option>
+      </select>
+    </div>
+    <div class="setting">
+      <div class="setting-text"><div class="setting-title">24/7 mode</div>
+        <div class="setting-desc">Admin-managed continuous library playback; use /247start or /247stop in Discord.</div></div>
+      <button disabled class="${s.is_247 ? 'toggled' : ''}">${s.is_247 ? 'Active' : 'Off'}</button>
+    </div>
+  </div>`;
+
   html += `<div class="card"><div class="qhead"><h2>📜 Queue (${s.queue_length})</h2>` +
     (s.queue_length ? `<button class="danger" onclick="if(confirm('Clear the queue?'))act('clear')">Clear</button>` : '') + `</div>`;
   if (s.queue.length) {
@@ -900,7 +1098,13 @@ function render() {
       '</details></div>';
   }
 
+  if (settingsOpen) html = settingsHtml + html;
   document.getElementById('content').innerHTML = html;
+  const settingsBtn = document.getElementById('settingsBtn');
+  if (settingsBtn) {
+    settingsBtn.classList.toggle('toggled', settingsOpen);
+    settingsBtn.setAttribute('aria-expanded', settingsOpen ? 'true' : 'false');
+  }
   
   // Restore input value and focus state
   const newInput = document.getElementById('q');
