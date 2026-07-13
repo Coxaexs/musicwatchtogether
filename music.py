@@ -295,6 +295,82 @@ def _tempo_match_ratio(bpm_out: float, bpm_in: float) -> Optional[float]:
     return best
 
 
+def analyze_song_features(path: str) -> Optional[dict]:
+    """Content profile of a local song: tempo, energy, dynamics, genre tag.
+
+    This is the bot's stand-in for Spotify-style audio features - smart
+    autoplay uses it to keep consecutive picks in the same lane (an
+    energetic pop song after an energetic pop song). Blocking: run in an
+    executor.
+    """
+    try:
+        duration = _probe_duration_seconds(path)
+        if not duration or duration < 20:
+            return None
+        # Sample the meat of the song, not the intro
+        start = max(0.0, duration * 0.30)
+        window = max(10.0, min(25.0, duration - start - 1))
+        pcm = _decode_pcm_mono(path, start, window)
+        if not pcm:
+            return None
+
+        # Energy: percussive drive, not loudness. Raw RMS is useless here -
+        # loudness-war masters make ballads as "loud" as club tracks. Onset
+        # flux (how hard and often the level jumps) separates them cleanly:
+        # measured ~0.07 for energetic pop vs ~0.04 for a ballad.
+        hop, win = 128, 256
+        total = len(pcm) // 2
+        energies = [audioop.rms(pcm[2 * s: 2 * (s + win)], 2)
+                    for s in range(0, total - win, hop)]
+        flux = 0.0
+        if len(energies) > 1:
+            prev = math.log(energies[0] + 1)
+            rises = []
+            for e in energies[1:]:
+                cur = math.log(e + 1)
+                rises.append(max(0.0, cur - prev))
+                prev = cur
+            flux = sum(rises) / len(rises)
+        energy = max(0.0, min(1.0, (flux - 0.02) / 0.06))
+
+        # Dynamics: how much the level moves around (flat wall-of-sound
+        # dance masters score low, quiet-loud rock/acoustic scores high)
+        env = _rms_envelope(pcm, AUTOMIX_ANALYSIS_RATE // 2)  # 0.5s windows
+        dynamics = 0.0
+        if env:
+            mean_env = sum(env) / len(env)
+            if mean_env > 0:
+                var = sum((e - mean_env) ** 2 for e in env) / len(env)
+                dynamics = round(min(1.0, (var ** 0.5) / mean_env), 3)
+
+        bpm, confidence = _estimate_bpm(pcm)
+        if bpm and confidence >= 0.1:
+            # fast songs feel more energetic even at equal percussive drive
+            tempo_component = max(0.0, min(1.0, (bpm - 70) / 100))
+            energy = 0.75 * energy + 0.25 * tempo_component
+        energy = round(energy, 3)
+
+        genre = None
+        try:
+            from mutagen import File as MutagenFile
+            meta = MutagenFile(path, easy=True)
+            if meta and meta.get('genre'):
+                raw = meta['genre']
+                genre = (raw[0] if isinstance(raw, list) else str(raw)).strip().lower() or None
+        except Exception:
+            pass
+
+        return {
+            'bpm': round(bpm, 1) if bpm and confidence >= 0.1 else None,
+            'energy': energy,
+            'dynamics': dynamics,
+            'genre': genre,
+        }
+    except Exception as e:
+        logger.debug(f"Feature analysis failed for {path}: {e}")
+        return None
+
+
 def analyze_track_edges(path: str) -> Optional[dict]:
     """Analyze a local audio file for AutoMix transitions.
 
@@ -615,6 +691,17 @@ except Exception as e:
 # Check if song file is already downloaded
 AUDIO_EXTENSIONS = tuple(getattr(config, 'SUPPORTED_FORMATS', None)
                          or ('.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.opus', '.webm'))
+
+
+def _load_json_file(path: str, default):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+    except Exception as e:
+        logger.warning(f"Could not load {path}: {e}")
+        return default
 
 # One shared, briefly-cached walk of the library folders. Cache lookups,
 # autocomplete and autoplay all used to re-glob thousands of files from a
@@ -1378,6 +1465,33 @@ class MusicControlView(View):
         
         await interaction.response.send_message("⏹️ Stopped!", ephemeral=True)
     
+    @discord.ui.button(label="👎", style=discord.ButtonStyle.secondary, custom_id="dislike", row=0)
+    async def dislike_button(self, interaction: discord.Interaction, button: Button):
+        player = self.get_player()
+        if not player or not player.current:
+            await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
+            return
+
+        cog = self.bot.get_cog('MusicCog')
+        if not cog:
+            await interaction.response.send_message("❌ No player found!", ephemeral=True)
+            return
+
+        added, title = cog.toggle_dislike(interaction.user.id, player.current)
+        if not added:
+            await interaction.response.send_message(f"👍 Removed **{title}** from your dislikes.", ephemeral=True)
+            return
+
+        msg = f"👎 Noted - autoplay won't serve **{title}** again."
+        # If autoplay picked it, don't make them sit through it
+        requester = player.current.requester
+        vc = interaction.guild.voice_client
+        if getattr(requester, 'bot', False) and vc and (vc.is_playing() or vc.is_paused()):
+            player.loop = False
+            vc.stop()
+            msg += " Skipping!"
+        await interaction.response.send_message(msg, ephemeral=True)
+
     @discord.ui.button(label="❤️", style=discord.ButtonStyle.secondary, custom_id="favorite", row=1)
     async def favorite_button(self, interaction: discord.Interaction, button: Button):
         player = self.get_player()
@@ -2462,7 +2576,15 @@ class MusicPlayer:
                 files = list_library_files()
                 if not files:
                     return None, None
-                fresh = [f for f in files if f not in recent_urls]
+                dis_urls, dis_titles, _counts = cog._dislike_index() if cog else (set(), set(), {})
+                fresh = []
+                for f in files:
+                    if f in recent_urls or f in dis_urls:
+                        continue
+                    t, _a = parse_local_song_name(f)
+                    if re.sub(r'\W+', '', t.lower()) in dis_titles:
+                        continue
+                    fresh.append(f)
                 chosen = random.choice(fresh or files)
                 return chosen, _probe_duration_seconds(chosen)
 
@@ -2677,6 +2799,10 @@ class MusicCog(commands.Cog):
         self._last_saved_state = None
         self._autoplay_station_cache = {}
         self._lyrics_file_cache = {}  # cache_path -> (mtime, parsed json)
+        # Spotify-style audio features per local file, learned lazily
+        self._audio_features = _load_json_file(self.FEATURES_FILE, {})
+        self._features_lock = threading.Lock()
+        self._guild_settings = _load_json_file(self.GUILD_SETTINGS_FILE, {})
     
     def get_player(self, guild) -> MusicPlayer:
         if guild.id not in self.players:
@@ -2816,22 +2942,49 @@ class MusicCog(commands.Cog):
                 streak += 1
             else:
                 break
-        avoid_seed_artist = streak >= 3
+        # /settings autoplay: "legacy" turns off the vibe-aware extras and
+        # behaves like the classic artist/album radio. Dislikes are an
+        # explicit "never again" and are honored in both modes.
+        legacy_mode = self.get_guild_setting(
+            player.guild.id, 'autoplay_algorithm', 'smart') == 'legacy'
+
+        avoid_seed_artist = streak >= 3 and not legacy_mode
 
         album_key = self._artist_key(seed.album) if seed and seed.album else ''
+
+        # Feedback signals: everyone's likes lift a song, dislikes bury it
+        dis_urls, dis_titles, dis_artist_counts = self._dislike_index()
+        fav_urls, fav_titles, fav_artist_keys = self._favorite_index()
+
+        seed_path = player._resolve_local_file(seed) if not legacy_mode else None
+        seed_genres = [g.lower() for g in (seed.genres or ())] if seed else []
 
         # Reuse relevant downloads first: same artist/album wins, followed by
         # artists from the related-artist station. Unrelated library tracks are
         # intentionally not candidates here.
         def scan_local_candidates():
+            # The seed's vibe: audio features of its local file, plus any
+            # genre YouTube reported for it
+            seed_profile = dict(self.get_local_features(seed_path) or {}) if seed_path else {}
+            if not seed_profile.get('genre'):
+                for genre in seed_genres:
+                    if genre and genre != 'music':
+                        seed_profile['genre'] = genre
+                        break
+            if legacy_mode:
+                seed_profile = {}
+
             candidates = []
             for path in list_library_files():
-                if path in recent_urls:
+                if path in recent_urls or path in dis_urls:
                     continue
                 title, local_artist = parse_local_song_name(path)
-                if re.sub(r'\W+', '', title.lower()) in recent_titles:
-                    continue  # same song cached under another path
+                title_key = re.sub(r'\W+', '', title.lower())
+                if title_key in recent_titles or title_key in dis_titles:
+                    continue
                 candidate_key = self._artist_key(local_artist or '')
+                if dis_artist_counts.get(candidate_key, 0) >= 3:
+                    continue  # the room clearly doesn't want this artist
                 score = 0
                 if candidate_key and candidate_key == seed_key:
                     if avoid_seed_artist:
@@ -2843,25 +2996,56 @@ class MusicCog(commands.Cog):
                 # only trust reasonably distinctive ones.
                 if album_key and len(album_key) >= 5 and album_key in self._artist_key(path):
                     score += 35
-                if score:
-                    candidates.append((score, path, title, local_artist))
-            return candidates
+                if not score:
+                    continue
+                if not legacy_mode:
+                    if path in fav_urls or title_key in fav_titles:
+                        score += 30
+                    elif candidate_key in fav_artist_keys:
+                        score += 10
+                    score -= 30 * dis_artist_counts.get(candidate_key, 0)
+                candidates.append((score, path, title, local_artist))
+
+            # Vibe continuity on the shortlist: energetic pop follows
+            # energetic pop. Features are cached per file; allow a few
+            # fresh ffmpeg analyses per pick so the cache fills over time.
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            shortlist = candidates[:12]
+            if seed_profile and shortlist:
+                analyzed = 0
+                rescored = []
+                for score, path, title, local_artist in shortlist:
+                    known = path in self._audio_features
+                    if known or analyzed < 4:
+                        feats = self.get_local_features(path)
+                        if not known:
+                            analyzed += 1
+                        score += self._feature_affinity(seed_profile, feats)
+                    rescored.append((score, path, title, local_artist))
+                shortlist = sorted(rescored, key=lambda item: item[0], reverse=True)
+            return shortlist
 
         local_candidates = await self.bot.loop.run_in_executor(None, scan_local_candidates)
 
         # Local matches usually win (instant, no network), but sometimes let
         # the online station through so the radio still discovers new songs.
-        if local_candidates and random.random() < 0.70:
-            local_candidates.sort(key=lambda item: item[0], reverse=True)
-            score, path, title, local_artist = random.choice(local_candidates[:10])
+        # Legacy mode keeps the original local-always-wins behavior.
+        if local_candidates and (legacy_mode or random.random() < 0.70):
+            pick_from = local_candidates[:10] if legacy_mode else local_candidates[:5]
+            score, path, title, local_artist = random.choice(pick_from)
             duration_seconds = await self.bot.loop.run_in_executor(None, _probe_duration_seconds, path)
             logger.info(f"🎶 Autoplay local affinity {score}: {local_artist} - {title}")
             return Song(title=title, url=path,
                         duration=self.format_duration(duration_seconds) if duration_seconds else 'Unknown',
                         requester=player.guild.me, source_type='local', artist=local_artist)
 
-        fresh = [item for item in station
-                 if re.sub(r'\W+', '', item['title'].lower()) not in recent_titles]
+        def _station_ok(item):
+            title_key = re.sub(r'\W+', '', item['title'].lower())
+            if title_key in recent_titles or title_key in dis_titles:
+                return False
+            return dis_artist_counts.get(self._artist_key(item.get('artist')), 0) < 3
+
+        fresh = [item for item in station if _station_ok(item)]
         if not fresh:
             # Catalogue outages still get a same-artist fallback; never jump
             # to a random artist just because related-artist lookup failed.
@@ -2883,7 +3067,14 @@ class MusicCog(commands.Cog):
             pool = same_album
         else:
             pool = same_artist if same_artist and (not related or random.random() < 0.60) else related
-        pick = random.choice(pool or fresh)
+        pool = pool or fresh
+        # Half the time, favor artists someone in the room has ❤️'d
+        if not legacy_mode:
+            loved = [item for item in pool
+                     if self._artist_key(item.get('artist')) in fav_artist_keys]
+            if loved and random.random() < 0.5:
+                pool = loved
+        pick = random.choice(pool)
         song = await self.process_youtube(
             f"{pick['artist']} - {pick['title']} official audio", player.guild.me
         )
@@ -5045,6 +5236,150 @@ class MusicCog(commands.Cog):
     # ---------- favorites ----------
 
     FAVORITES_FILE = os.path.join(BOT_DIR, 'favorites.json')
+    DISLIKES_FILE = os.path.join(BOT_DIR, 'dislikes.json')
+    FEATURES_FILE = os.path.join(BOT_DIR, 'audio_features.json')
+    GUILD_SETTINGS_FILE = os.path.join(BOT_DIR, 'guild_settings.json')
+
+    # ---------- per-server settings ----------
+
+    def get_guild_setting(self, guild_id: int, key: str, default=None):
+        return self._guild_settings.get(str(guild_id), {}).get(key, default)
+
+    def set_guild_setting(self, guild_id: int, key: str, value):
+        self._guild_settings.setdefault(str(guild_id), {})[key] = value
+        try:
+            with open(self.GUILD_SETTINGS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._guild_settings, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save guild settings: {e}")
+
+    # ---------- audio features (Spotify-style content profile) ----------
+
+    def get_local_features(self, path: str) -> Optional[dict]:
+        """Cached content profile for a local file. Blocking on first
+        analysis (~1-2s of ffmpeg) - call from an executor."""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        entry = self._audio_features.get(path)
+        if entry is not None and entry.get('mtime') == mtime:
+            return entry
+        feats = analyze_song_features(path) or {}  # {} = don't re-analyze broken files
+        feats['mtime'] = mtime
+        self._audio_features[path] = feats
+        with self._features_lock:
+            try:
+                with open(self.FEATURES_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(self._audio_features, f, ensure_ascii=False)
+            except Exception as e:
+                logger.debug(f"Could not save audio features: {e}")
+        return feats
+
+    @staticmethod
+    def _feature_affinity(seed: Optional[dict], candidate: Optional[dict]) -> int:
+        """How well a candidate matches the seed's vibe: energy first,
+        then groove (tempo) and genre. Same lane scores high, an acoustic
+        ballad after a club banger scores negative."""
+        if not seed or not candidate:
+            return 0
+        bonus = 0
+        ea, eb = seed.get('energy'), candidate.get('energy')
+        if ea is not None and eb is not None:
+            diff = abs(ea - eb)
+            if diff <= 0.10:
+                bonus += 25
+            elif diff <= 0.20:
+                bonus += 10
+            elif diff >= 0.40:
+                bonus -= 20
+        da, db = seed.get('dynamics'), candidate.get('dynamics')
+        if da is not None and db is not None and abs(da - db) <= 0.15:
+            bonus += 10
+        ta, tb = seed.get('bpm'), candidate.get('bpm')
+        if ta and tb:
+            ratio = max(ta, tb) / max(1e-6, min(ta, tb))
+            while ratio >= 1.5:  # half/double-time is the same groove
+                ratio /= 2
+            if ratio <= 1.08:
+                bonus += 15
+            elif ratio <= 1.20:
+                bonus += 5
+        ga, gb = seed.get('genre'), candidate.get('genre')
+        # bare "music" tags match everything and mean nothing
+        if ga and gb and ga != 'music' and gb != 'music' \
+                and (ga == gb or ga in gb or gb in ga):
+            bonus += 20
+        return bonus
+
+    # ---------- dislikes ----------
+
+    def _read_dislikes(self) -> dict:
+        return _load_json_file(self.DISLIKES_FILE, {})
+
+    def _write_dislikes(self, data: dict):
+        with open(self.DISLIKES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def toggle_dislike(self, user_id: int, song: Song) -> tuple[bool, str]:
+        """Add or remove a song from a user's dislikes. Returns (added, title)."""
+        data = self._read_dislikes()
+        dislikes = data.setdefault(str(user_id), [])
+
+        for i, entry in enumerate(dislikes):
+            if entry.get('url') == song.url:
+                dislikes.pop(i)
+                self._write_dislikes(data)
+                return False, song.title
+
+        artist = song.artist
+        if not artist and song.source_type == 'local':
+            _, artist = parse_local_song_name(song.url)
+        dislikes.append({
+            'title': song.title,
+            'url': song.url,
+            'artist': artist,
+        })
+        self._write_dislikes(data)
+        return True, song.title
+
+    def _dislike_index(self) -> tuple[set, set, dict]:
+        """(urls, squashed titles, artist-key -> distinct dislike count)
+        aggregated over every user - autoplay serves the whole room."""
+        urls, titles, artist_counts = set(), set(), {}
+        for entries in self._read_dislikes().values():
+            for entry in entries:
+                if entry.get('url'):
+                    urls.add(entry['url'])
+                title_key = re.sub(r'\W+', '', (entry.get('title') or '').lower())
+                if title_key:
+                    titles.add(title_key)
+                artist_key = self._artist_key(entry.get('artist') or '')
+                if artist_key:
+                    artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
+        return urls, titles, artist_counts
+
+    def _favorite_index(self) -> tuple[set, set, set]:
+        """(urls, squashed titles, artist keys) across everyone's likes."""
+        urls, titles, artist_keys = set(), set(), set()
+        for entries in self._read_favorites().values():
+            for entry in entries:
+                url = entry.get('url')
+                if url:
+                    urls.add(url)
+                title = entry.get('title') or ''
+                title_key = re.sub(r'\W+', '', title.lower())
+                if title_key:
+                    titles.add(title_key)
+                if entry.get('source_type') == 'local' and url:
+                    _, artist = parse_local_song_name(url)
+                else:
+                    parts = re.split(r'\s+[-–—|]\s+', title, maxsplit=1)
+                    artist = parts[0] if len(parts) == 2 else None
+                artist_key = self._artist_key(artist or '')
+                if artist_key:
+                    artist_keys.add(artist_key)
+        return urls, titles, artist_keys
 
     def _read_favorites(self) -> dict:
         try:
@@ -5103,6 +5438,62 @@ class MusicCog(commands.Cog):
             source_type=entry.get('source_type', 'youtube'),
             thumbnail=entry.get('thumbnail'),
         )
+
+    @app_commands.command(name="dislike", description="Never hear this song from autoplay again (also the 👎 button)")
+    async def dislike(self, interaction: discord.Interaction):
+        player = self.get_player(interaction.guild)
+        if not player.current:
+            await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
+            return
+
+        added, title = self.toggle_dislike(interaction.user.id, player.current)
+        if not added:
+            await interaction.response.send_message(f"👍 Removed **{title}** from your dislikes.", ephemeral=True)
+            return
+
+        msg = f"👎 Noted - autoplay won't serve **{title}** again."
+        requester = player.current.requester
+        vc = interaction.guild.voice_client
+        if getattr(requester, 'bot', False) and vc and (vc.is_playing() or vc.is_paused()):
+            player.loop = False
+            vc.stop()
+            msg += " Skipping!"
+        await interaction.response.send_message(msg)
+
+    settings_group = app_commands.Group(name="settings", description="Server settings for the music bot")
+
+    @settings_group.command(name="show", description="Show this server's music settings")
+    async def settings_show(self, interaction: discord.Interaction):
+        algo = self.get_guild_setting(interaction.guild.id, 'autoplay_algorithm', 'smart')
+        embed = discord.Embed(title="⚙️ Music settings", color=discord.Color.from_rgb(124, 92, 255))
+        embed.add_field(
+            name="Autoplay algorithm",
+            value=("**Smart** - matches energy/genre, weighs ❤️ likes, "
+                   "steers away after 3 songs by the same artist"
+                   if algo == 'smart' else
+                   "**Legacy** - classic artist/album radio, no vibe matching"),
+            inline=False
+        )
+        embed.set_footer(text="Change with /settings autoplay • 👎 dislikes are always respected")
+        await interaction.response.send_message(embed=embed)
+
+    @settings_group.command(name="autoplay", description="Choose how autoplay picks the next song")
+    @app_commands.describe(algorithm="Smart matches the vibe and your likes; Legacy is the classic artist/album radio")
+    @app_commands.choices(algorithm=[
+        app_commands.Choice(name="Smart - energy/genre matching, likes, artist variety (default)", value="smart"),
+        app_commands.Choice(name="Legacy - classic artist/album radio", value="legacy"),
+    ])
+    async def settings_autoplay(self, interaction: discord.Interaction,
+                                algorithm: app_commands.Choice[str]):
+        self.set_guild_setting(interaction.guild.id, 'autoplay_algorithm', algorithm.value)
+        if algorithm.value == 'legacy':
+            await interaction.response.send_message(
+                "⚙️ Autoplay set to **Legacy** - classic artist/album radio. "
+                "(👎 dislikes are still honored.)")
+        else:
+            await interaction.response.send_message(
+                "⚙️ Autoplay set to **Smart** - it'll match the current song's energy and genre, "
+                "weigh everyone's ❤️ likes, and mix in related artists for variety.")
 
     favorites = app_commands.Group(name="favorites", description="Your liked songs (also the ❤️ button on the player)")
 
