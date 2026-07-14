@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import time
 
@@ -80,6 +81,17 @@ def _duration_to_seconds(duration):
     return seconds
 
 
+def _thumbnail_from_url(url, thumbnail=None):
+    """Return stored art, or derive a stable YouTube thumbnail for older playlists."""
+    if thumbnail:
+        return thumbnail
+    value = str(url or '')
+    match = re.search(r'(?:youtu\.be/|[?&]v=|/shorts/|/embed/)([A-Za-z0-9_-]{11})', value)
+    if match:
+        return f'https://i.ytimg.com/vi/{match.group(1)}/hqdefault.jpg'
+    return None
+
+
 def _song_json(song):
     return {
         'title': song.title,
@@ -87,7 +99,7 @@ def _song_json(song):
         'duration_seconds': _duration_to_seconds(song.duration),
         'requester': getattr(song.requester, 'display_name', str(song.requester)),
         'source_type': song.source_type,
-        'thumbnail': song.thumbnail,
+        'thumbnail': _thumbnail_from_url(song.url, song.thumbnail),
     }
 
 
@@ -259,6 +271,22 @@ class WebUI:
                 player.loop = False
                 if vc:
                     vc.stop()
+            elif action == 'previous':
+                history = list(player.history)
+                previous = None
+                if history:
+                    if player.current and history[0].url == player.current.url:
+                        previous = history[1] if len(history) > 1 else history[0]
+                    else:
+                        previous = history[0]
+                if previous:
+                    player.loop = False
+                    player.queue.appendleft(previous)
+                    player.clear_preloads()
+                    if vc and (vc.is_playing() or vc.is_paused()):
+                        vc.stop()
+                    elif vc:
+                        await player.play_next()
             elif action == 'stop':
                 for stopper in ('_stop_now_playing_task', '_stop_lyricsnow_task'):
                     fn = getattr(cog, stopper, None)
@@ -541,21 +569,22 @@ class WebUI:
     def _playlist_json(self, guild_id):
         playlists = self.cog._read_playlists().get(str(guild_id), {})
         meta = self._read_playlist_meta().get(str(guild_id), {})
+        def track_json(entry):
+            return {
+                'title': entry.get('title', 'Unknown'),
+                'duration': entry.get('duration', 'Unknown'),
+                'thumbnail': _thumbnail_from_url(entry.get('url'), entry.get('thumbnail')),
+                'source_type': entry.get('source_type', 'youtube'),
+            }
         return [
             {
                 'name': name,
                 'count': len(entries),
-                'cover': meta.get(name) or next((entry.get('thumbnail') for entry in entries if entry.get('thumbnail')), None),
+                'cover': meta.get(name) or next(
+                    (_thumbnail_from_url(entry.get('url'), entry.get('thumbnail')) for entry in entries
+                     if _thumbnail_from_url(entry.get('url'), entry.get('thumbnail'))), None),
                 'custom_cover': bool(meta.get(name)),
-                'tracks': [
-                    {
-                        'title': entry.get('title', 'Unknown'),
-                        'duration': entry.get('duration', 'Unknown'),
-                        'thumbnail': entry.get('thumbnail'),
-                        'source_type': entry.get('source_type', 'youtube'),
-                    }
-                    for entry in entries[:200]
-                ],
+                'tracks': [track_json(entry) for entry in entries[:200]],
             }
             for name, entries in sorted(playlists.items(), key=lambda item: item[0].lower())
         ]
@@ -596,7 +625,7 @@ class WebUI:
                     'url': song.url,
                     'duration': song.duration,
                     'source_type': song.source_type,
-                    'thumbnail': song.thumbnail,
+                    'thumbnail': _thumbnail_from_url(song.url, song.thumbnail),
                 }
                 for song in songs
             ]
@@ -649,7 +678,7 @@ class WebUI:
                 'url': song.url,
                 'duration': song.duration,
                 'source_type': song.source_type,
-                'thumbnail': song.thumbnail,
+                'thumbnail': _thumbnail_from_url(song.url, song.thumbnail),
             } for song in songs)
             self.cog._write_playlists(data)
             message = f'Added {len(songs)} song' + ('' if len(songs) == 1 else 's') + f' to {name}.'
@@ -993,7 +1022,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .playlist-track { border-radius:9px; }
   .playlist-track:hover { background:var(--panel2); }
   .track-main { display:flex; align-items:center; gap:11px; min-width:0; }
-  .track-main img { width:44px; height:44px; object-fit:cover; border-radius:5px; background:var(--panel2); }
+  .track-art { position:relative; flex:0 0 44px; width:44px; height:44px; display:grid; place-items:center;
+               overflow:hidden; border-radius:5px; background:linear-gradient(145deg,var(--panel2),var(--panel)); }
+  .track-art img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .track-art.missing::after { content:'♫'; color:var(--muted); font-size:17px; }
   .track-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .track-source, .track-duration, .track-number { color:var(--muted); font-size:13px; }
   .controls { position: fixed; z-index: 20; left: 14px; right: 14px; bottom: 12px; margin: 0;
@@ -1250,6 +1282,11 @@ function fmt(sec) {
 function cssUrl(url) {
   return encodeURI(String(url || '')).replace(/['()]/g, ch => '%' + ch.charCodeAt(0).toString(16));
 }
+function mediaUrl(url) {
+  const value = String(url || '');
+  if (!value || /^(?:data:|blob:|https?:)/i.test(value)) return value;
+  return basePath + value.replace(/^\/+/, '');
+}
 
 function showView(view) {
   activeView = view === 'playlists' ? 'playlists' : 'player';
@@ -1270,18 +1307,19 @@ function renderViewNav() {
 function playerControlsHTML(s) {
   const current = s.current;
   return `<div class="controls">
-    <div class="bottom-track">${current && current.thumbnail ? `<img src="${esc(current.thumbnail)}" alt="">` : '<img alt="">'}
+    <div class="bottom-track">${current && current.thumbnail ? `<img src="${esc(mediaUrl(current.thumbnail))}" alt="">` : '<img alt="">'}
       <div class="bt-copy"><div class="bt-title">${current ? esc(current.title) : 'Nothing playing'}</div>
       <div class="bt-sub">${current ? esc(current.requester) : (s.connected ? 'Choose something to play' : 'Join voice in Discord')}</div></div></div>
     <div class="transport">
-      <button class="${s.autoplay ? 'toggled' : ''}" onclick="act('autoplay')" title="Autoplay">✣</button>
-      <button onclick="act('shuffle')" title="Shuffle">↝</button>
+      <button class="${s.autoplay ? 'toggled' : ''}" onclick="act('autoplay')" title="Autoplay" aria-label="Autoplay">🎲</button>
+      <button onclick="act('shuffle')" title="Shuffle" aria-label="Shuffle">🔀</button>
+      <button onclick="act('previous')" title="Previous track" aria-label="Previous track">⏮</button>
       <button class="play-main" onclick="act('${s.paused ? 'resume' : 'pause'}')" title="${s.paused ? 'Resume' : 'Pause'}">${s.paused ? '▶' : 'Ⅱ'}</button>
-      <button onclick="doSkip()" title="Skip">▶|</button>
-      <button class="${s.loop !== 'off' ? 'toggled' : ''}" onclick="cycleLoop()" title="${s.loop === 'song' ? 'Repeat song' : s.loop === 'queue' ? 'Repeat queue' : 'Loop off'}">${s.loop === 'song' ? '↻¹' : '↻'}</button>
+      <button onclick="doSkip()" title="Next track" aria-label="Next track">⏭</button>
+      <button class="${s.loop !== 'off' ? 'toggled' : ''}" onclick="cycleLoop()" title="${s.loop === 'song' ? 'Repeat song' : s.loop === 'queue' ? 'Repeat queue' : 'Loop off'}" aria-label="Loop">${s.loop === 'song' ? '🔂' : '🔁'}</button>
     </div>
-    <button class="danger" onclick="if(confirm('Stop and clear the queue?'))act('stop')" title="Stop">■</button>
-    <div class="vol">♫ <input type="range" min="0" max="100" value="${s.volume}" onchange="act('volume',{level:+this.value})"><span>${s.volume}%</span></div>
+    <button class="danger" onclick="if(confirm('Stop and clear the queue?'))act('stop')" title="Stop" aria-label="Stop">⏹</button>
+    <div class="vol">🔊 <input type="range" min="0" max="100" value="${s.volume}" onchange="act('volume',{level:+this.value})"><span>${s.volume}%</span></div>
     <div class="bottom-progress" onclick="seekProgress(event)"><div id="bottomPbar"></div></div>
   </div>`;
 }
@@ -1289,7 +1327,7 @@ function playerControlsHTML(s) {
 function playlistCardsHTML() {
   if (!playlists.length) return '<div class="empty">No playlists yet. Create one, then search for songs to add.</div>';
   return playlists.map((playlist, index) => {
-    const cover = playlist.cover ? ` style="background-image:url('${cssUrl(playlist.cover)}')"` : '';
+    const cover = playlist.cover ? ` style="background-image:url('${cssUrl(mediaUrl(playlist.cover))}')"` : '';
     return `<article class="playlist-card ${playlist.cover ? '' : 'no-cover'}" tabindex="0" onclick="openPlaylist(${index})" onkeydown="if(event.key==='Enter')openPlaylist(${index})">
       <div class="playlist-disc"><div class="cover"${cover}></div></div>
       <div class="playlist-name">${esc(playlist.name)}</div>
@@ -1316,10 +1354,10 @@ function renderPlaylistPage() {
       <button class="primary" onclick="createPlaylist()">＋ Create</button></div></div>
       <div class="playlist-grid">${playlistCardsHTML()}</div></section>`;
   } else {
-    const cover = playlist.cover ? `style="background-image:url('${cssUrl(playlist.cover)}')"` : '';
+    const cover = playlist.cover ? `style="background-image:url('${cssUrl(mediaUrl(playlist.cover))}')"` : '';
     const rows = playlist.tracks.length ? playlist.tracks.map((track, index) => `<div class="playlist-track">
       <div class="track-number">${index + 1}</div>
-      <div class="track-main">${track.thumbnail ? `<img src="${esc(track.thumbnail)}" alt="">` : '<img alt="">'}<div class="track-title">${esc(track.title)}</div></div>
+      <div class="track-main"><span class="track-art ${track.thumbnail ? '' : 'missing'}">${track.thumbnail ? `<img src="${esc(mediaUrl(track.thumbnail))}" alt="" onerror="this.parentElement.classList.add('missing');this.remove()">` : ''}</span><div class="track-title">${esc(track.title)}</div></div>
       <div class="track-source">${esc(track.source_type === 'spotify' ? 'Spotify' : 'YouTube')}</div>
       <div class="track-duration">${esc(track.duration)}</div>
       <button class="danger" onclick="removePlaylistSong(${index})" title="Remove song">✕</button>
@@ -1540,7 +1578,7 @@ function render() {
   } else if (s.current) {
     const c = s.current;
     html += `<div class="np">` +
-      (c.thumbnail ? `<img src="${c.thumbnail}">` : '<img>') +
+      (c.thumbnail ? `<img src="${esc(mediaUrl(c.thumbnail))}" alt="">` : '<img alt="">') +
       `<div style="flex:1;min-width:0">
         <div class="title">${esc(c.title)}</div>
         <div class="sub">requested by ${esc(c.requester)}${s.channel ? ' • 🔊 ' + esc(s.channel) : ''}` +
@@ -1860,7 +1898,7 @@ let lastVinylTitle = null, lastManualSkipAt = 0, lastFrame = null;
 
 function turntableHTML(s) {
   const c = s.current;
-  const vinylCover = s.active_playlist_cover || (c && c.thumbnail);
+  const vinylCover = mediaUrl(s.active_playlist_cover || (c && c.thumbnail));
   const art = vinylCover ? ` style="background-image:url('${cssUrl(vinylCover)}')"` : '';
   return `<div class="deck">
       <div class="plinth"></div>
