@@ -1068,6 +1068,7 @@ class Song:
     album: Optional[str] = None
     genres: tuple[str, ...] = ()
     played_at: Optional[int] = None
+    playlist: Optional[str] = None  # Saved-playlist name this song was queued from
 
 
 class YTDLSource(discord.PCMVolumeTransformer):
@@ -1464,13 +1465,15 @@ class MusicControlView(View):
             player.loop = False
             player.loop_queue = False
             player.pending_playlist = None
+            player.web_playlist_name = None
+            player.web_playlist_cover = None
             player.clear_preloads()  # Clear preloaded cache
             player.cancel_autoplay_prefetch()
-        
+
         voice_client = interaction.guild.voice_client
         if voice_client:
             voice_client.stop()
-        
+
         await interaction.response.send_message("⏹️ Stopped!", ephemeral=True)
     
     @discord.ui.button(label="👎", style=discord.ButtonStyle.secondary, custom_id="dislike", row=0)
@@ -1888,6 +1891,9 @@ class MusicPlayer:
         self.idle_disconnect_task: Optional[asyncio.Task] = None
         self.idle_disconnect_seconds = IDLE_DISCONNECT_SECONDS
         self.nowplaying_message: Optional[discord.Message] = None  # Last auto-posted now-playing message
+        self.web_playlist_name: Optional[str] = None  # Saved playlist currently driving playback
+        self.web_playlist_cover: Optional[str] = None
+        self.web_playlist_started_at: float = 0.0
         self._suppress_after = False  # Set during /seek so after_playing doesn't advance the queue
         self.autoplay = False  # Keep playing related music when the queue runs out
         # When enabled, Smart Autoplay changes to a related artist after three
@@ -4672,19 +4678,29 @@ class MusicCog(commands.Cog):
 
             self._stop_now_playing_task(player.guild.id)
 
-            # Remove the previous auto-posted now-playing message so the
-            # channel doesn't fill up with stale players
-            old_message = getattr(player, 'nowplaying_message', None)
-            if old_message:
-                try:
-                    await old_message.delete()
-                except Exception:
-                    pass
-                player.nowplaying_message = None
-
             embed = await self.create_now_playing_with_lyrics_embed(player.current, player)
             view = MusicControlView(self.bot, player.guild.id)
-            message = await player.last_message_channel.send(embed=embed, view=view)
+
+            # Edit the existing now-playing message in place when the song
+            # changes; only send a fresh one if there's none yet, it was
+            # deleted, or the active channel moved.
+            message = None
+            old_message = getattr(player, 'nowplaying_message', None)
+            if old_message:
+                if old_message.channel.id == player.last_message_channel.id:
+                    try:
+                        message = await old_message.edit(embed=embed, view=view)
+                    except Exception:
+                        message = None
+                else:
+                    try:
+                        await old_message.delete()
+                    except Exception:
+                        pass
+                if message is None:
+                    player.nowplaying_message = None
+            if message is None:
+                message = await player.last_message_channel.send(embed=embed, view=view)
             player.nowplaying_message = message
             task = asyncio.create_task(self._run_now_playing_live(player.guild.id, message, player.current_song_key))
             self.nowplaying_tasks[player.guild.id] = task
@@ -4770,6 +4786,8 @@ class MusicCog(commands.Cog):
         player.loop = False
         player.loop_queue = False
         player.pending_playlist = None  # Otherwise the playlist restarts playback after stop
+        player.web_playlist_name = None
+        player.web_playlist_cover = None
         player.clear_preloads()  # Clear preloaded cache
         player.cancel_autoplay_prefetch()
         player.reset_playback_clock()
@@ -4852,6 +4870,15 @@ class MusicCog(commands.Cog):
         await interaction.edit_original_response(embed=embed, view=view)
 
         message = await interaction.original_response()
+        # Adopt this as THE now-playing message so song changes edit it in place
+        old_message = player.nowplaying_message
+        player.nowplaying_message = message
+        player.last_message_channel = interaction.channel
+        if old_message and old_message.id != message.id:
+            try:
+                await old_message.delete()
+            except Exception:
+                pass
         task = asyncio.create_task(self._run_now_playing_live(interaction.guild.id, message, player.current_song_key))
         self.nowplaying_tasks[interaction.guild.id] = task
 
@@ -5486,14 +5513,89 @@ class MusicCog(commands.Cog):
         await interaction.followup.send(embed=embed, view=SearchResultView(self, entries, interaction.user))
 
     # ---------- saved playlists ----------
+    # playlists.json format: {guild_id: {"shared": {name: [entries]},
+    #                                    "users": {user_id: {name: [entries]}}}}
+    # "shared" holds pre-per-user playlists (and master-password web edits);
+    # everyone in the guild sees them alongside their own.
 
     PLAYLISTS_FILE = os.path.join(BOT_DIR, 'playlists.json')
+    PLAYLIST_META_FILE = os.path.join(BOT_DIR, 'playlist_meta.json')
+
+    @staticmethod
+    def _migrate_guild_buckets(data: dict) -> dict:
+        """Upgrade legacy {guild: {name: value}} maps to shared/users buckets in place."""
+        for guild_id, guild_data in data.items():
+            if not isinstance(guild_data, dict):
+                data[guild_id] = {'shared': {}, 'users': {}}
+            # Legacy format maps names straight to entry lists / cover strings
+            elif any(not isinstance(v, dict) for v in guild_data.values()) or (
+                    guild_data and set(guild_data) - {'shared', 'users'}):
+                data[guild_id] = {'shared': guild_data, 'users': {}}
+            else:
+                guild_data.setdefault('shared', {})
+                guild_data.setdefault('users', {})
+        return data
 
     def _read_playlists(self) -> dict:
-        return load_json(self.PLAYLISTS_FILE, {}, logger)
+        return self._migrate_guild_buckets(
+            load_json(self.PLAYLISTS_FILE, {}, logger)
+        )
 
     def _write_playlists(self, data: dict):
         save_json(self.PLAYLISTS_FILE, data, logger)
+
+    def _read_playlist_meta(self) -> dict:
+        """Per-playlist metadata (currently custom cover URLs), same bucket layout."""
+        return self._migrate_guild_buckets(
+            load_json(self.PLAYLIST_META_FILE, {}, logger)
+        )
+
+    def _write_playlist_meta(self, data: dict):
+        save_json(self.PLAYLIST_META_FILE, data, logger)
+
+    @staticmethod
+    def _owner_key(user_id) -> str:
+        return str(user_id) if user_id else 'shared'
+
+    @staticmethod
+    def _bucket_for(guild_data: dict, owner_key: str, create: bool = False) -> dict:
+        if owner_key == 'shared':
+            return guild_data.setdefault('shared', {})
+        users = guild_data.setdefault('users', {})
+        if create:
+            return users.setdefault(owner_key, {})
+        return users.get(owner_key, {})
+
+    def get_user_playlists(self, guild_id, user_id) -> dict:
+        """Merged view for one user: guild-shared playlists + their own (own wins)."""
+        guild_data = self._read_playlists().get(str(guild_id), {})
+        merged = dict(guild_data.get('shared', {}))
+        if user_id:
+            merged.update(guild_data.get('users', {}).get(str(user_id), {}))
+        return merged
+
+    def resolve_playlist_owner(self, data: dict, guild_id, user_id, name: str) -> Optional[str]:
+        """Which bucket ('<user_id>' or 'shared') holds this name for this user, if any."""
+        guild_data = data.get(str(guild_id), {})
+        if user_id and name in guild_data.get('users', {}).get(str(user_id), {}):
+            return str(user_id)
+        if name in guild_data.get('shared', {}):
+            return 'shared'
+        return None
+
+    def playlist_cover_url(self, guild_id, owner_key: str, name: str, entries: list) -> Optional[str]:
+        """Custom cover if uploaded, else the first track thumbnail we can find."""
+        meta = self._read_playlist_meta().get(str(guild_id), {})
+        cover = self._bucket_for(meta, owner_key).get(name) if owner_key else None
+        if cover:
+            return cover
+        for entry in entries:
+            if entry.get('thumbnail'):
+                return entry['thumbnail']
+            video_id = extract_youtube_video_id(str(entry.get('url') or ''))
+            if video_id:
+                return f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg'
+        return None
 
     playlist = app_commands.Group(name="playlist", description="Save and load the queue as a named playlist")
 
@@ -5511,8 +5613,9 @@ class MusicCog(commands.Cog):
 
         name = name.strip()[:50]
         data = self._read_playlists()
-        guild_lists = data.setdefault(str(interaction.guild.id), {})
-        guild_lists[name] = [
+        guild_data = data.setdefault(str(interaction.guild.id), {'shared': {}, 'users': {}})
+        user_lists = self._bucket_for(guild_data, str(interaction.user.id), create=True)
+        user_lists[name] = [
             {
                 'title': s.title,
                 'url': s.url,
@@ -5527,16 +5630,16 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(f"💾 Saved **{name}** with **{len(songs)}** songs! Load it anytime with `/playlist load {name}`")
 
     async def _playlist_name_autocomplete(self, interaction: discord.Interaction, current: str):
-        guild_lists = self._read_playlists().get(str(interaction.guild.id), {})
-        names = [n for n in guild_lists if current.lower() in n.lower()]
+        user_lists = self.get_user_playlists(interaction.guild.id, interaction.user.id)
+        names = [n for n in user_lists if current.lower() in n.lower()]
         return [app_commands.Choice(name=n, value=n) for n in sorted(names)[:25]]
 
-    @playlist.command(name="load", description="Load a saved playlist into the queue")
+    @playlist.command(name="load", description="Load one of your saved playlists into the queue")
     @app_commands.describe(name="Playlist to load", shuffle="Shuffle the songs while loading")
     @app_commands.autocomplete(name=_playlist_name_autocomplete)
     async def playlist_load(self, interaction: discord.Interaction, name: str, shuffle: bool = False):
-        guild_lists = self._read_playlists().get(str(interaction.guild.id), {})
-        entries = guild_lists.get(name)
+        user_lists = self.get_user_playlists(interaction.guild.id, interaction.user.id)
+        entries = user_lists.get(name)
         if entries is None:
             await interaction.response.send_message(f"❌ No playlist named **{name}**. See `/playlist list`.", ephemeral=True)
             return
@@ -5560,11 +5663,17 @@ class MusicCog(commands.Cog):
                 requester=interaction.user,
                 source_type=entry.get('source_type', 'youtube'),
                 thumbnail=entry.get('thumbnail'),
+                playlist=name,
             ))
 
         vc = interaction.guild.voice_client
         started = False
         if vc and not vc.is_playing() and not vc.is_paused():
+            owner = self.resolve_playlist_owner(self._read_playlists(), interaction.guild.id,
+                                                interaction.user.id, name)
+            player.web_playlist_name = name
+            player.web_playlist_cover = self.playlist_cover_url(interaction.guild.id, owner, name, entries)
+            player.web_playlist_started_at = time.time()
             await player.play_next()
             started = True
 
@@ -5577,32 +5686,35 @@ class MusicCog(commands.Cog):
             embed.set_footer(text=f"▶️ Now playing: {player.current.title}")
         await interaction.followup.send(embed=embed)
 
-    @playlist.command(name="list", description="Show saved playlists for this server")
+    @playlist.command(name="list", description="Show your saved playlists in this server")
     async def playlist_list(self, interaction: discord.Interaction):
-        guild_lists = self._read_playlists().get(str(interaction.guild.id), {})
-        if not guild_lists:
+        guild_data = self._read_playlists().get(str(interaction.guild.id), {})
+        own = guild_data.get('users', {}).get(str(interaction.user.id), {})
+        shared = {n: s for n, s in guild_data.get('shared', {}).items() if n not in own}
+        if not own and not shared:
             await interaction.response.send_message("📭 No saved playlists yet - build a queue and use `/playlist save`!", ephemeral=True)
             return
 
-        lines = [f"• **{name}** ({len(songs)} songs)" for name, songs in sorted(guild_lists.items())]
+        lines = [f"• **{name}** ({len(songs)} songs)" for name, songs in sorted(own.items())]
+        lines += [f"• **{name}** ({len(songs)} songs) · shared" for name, songs in sorted(shared.items())]
         embed = discord.Embed(
             title="💾 Saved Playlists",
             description="\n".join(lines[:25]),
             color=discord.Color.blurple()
         )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @playlist.command(name="delete", description="Delete a saved playlist")
+    @playlist.command(name="delete", description="Delete one of your saved playlists")
     @app_commands.describe(name="Playlist to delete")
     @app_commands.autocomplete(name=_playlist_name_autocomplete)
     async def playlist_delete(self, interaction: discord.Interaction, name: str):
         data = self._read_playlists()
-        guild_lists = data.get(str(interaction.guild.id), {})
-        if name not in guild_lists:
+        owner = self.resolve_playlist_owner(data, interaction.guild.id, interaction.user.id, name)
+        if owner is None:
             await interaction.response.send_message(f"❌ No playlist named **{name}**.", ephemeral=True)
             return
 
-        del guild_lists[name]
+        del self._bucket_for(data[str(interaction.guild.id)], owner)[name]
         self._write_playlists(data)
         await interaction.response.send_message(f"🗑️ Deleted playlist **{name}**.")
 
@@ -6652,7 +6764,7 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="web", description="Get a temporary link to control this server's music player via web dashboard")
     async def web_cmd(self, interaction: discord.Interaction):
         import webui
-        token = webui.generate_token(interaction.guild.id)
+        token = webui.generate_token(interaction.guild.id, interaction.user.id)
         
         # Build the url
         base_url = getattr(config, "WEB_SERVER_URL", "https://deeppixel.online")
@@ -6801,6 +6913,9 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(f"🔊 Joined **{channel.name}**!")
 
         player = self.get_player(interaction.guild)
+        # Remember where /join was typed so web-started playback can post
+        # its now-playing updates somewhere visible
+        player.last_message_channel = interaction.channel
         player.schedule_idle_disconnect()
 
     @app_commands.command(name="serverinvite", description="DM a server picker so you can create an invite link")

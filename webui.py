@@ -30,7 +30,6 @@ logger = logging.getLogger('MusicBot.WebUI')
 
 # Tokens persist to disk so /web links survive bot restarts
 TOKENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web_tokens.json')
-PLAYLIST_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'playlist_meta.json')
 PLAYLIST_COVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'playlist_covers')
 
 
@@ -55,14 +54,14 @@ def _valid_token_info(token):
         return None
     return info
 
-def generate_token(guild_id):
+def generate_token(guild_id, user_id=None):
     token = secrets.token_urlsafe(16)
     # Clean up expired tokens (older than 24 hours)
     now = time.time()
     for k, v in list(temp_tokens.items()):
         if now - v.get('created_at', 0) >= WEB_TOKEN_TTL:
             temp_tokens.pop(k, None)
-    temp_tokens[token] = {'guild_id': guild_id, 'created_at': now}
+    temp_tokens[token] = {'guild_id': guild_id, 'user_id': user_id, 'created_at': now}
     _save_tokens()
     return token
 
@@ -156,6 +155,15 @@ class WebUI:
             return token_info['guild_id']
         return None
 
+    def _get_acting_user_id(self, request):
+        """Discord user carried by the validated invitation session."""
+        token_info = _valid_token_info(self._supplied_token(request))
+        return token_info.get('user_id') if token_info else None
+    def _acting_member(self, request, guild):
+        user_id = self._get_acting_user_id(request)
+        member = guild.get_member(user_id) if user_id else None
+        return member or guild.me
+
     @web.middleware
     async def auth_middleware(self, request, handler):
         if request.path == '/api/session':
@@ -185,13 +193,16 @@ class WebUI:
     def _guild_state(self, guild, player):
         vc = guild.voice_client
         connected = bool(vc and vc.is_connected())
-        playlist_urls = getattr(player, 'web_playlist_urls', None)
+        # Songs queued from a saved playlist carry its name; once something
+        # else is playing (autoplay, ad-hoc search) drop the active-playlist
+        # state. The 5s grace covers the gap while the first song spins up.
+        active_name = getattr(player, 'web_playlist_name', None)
         playlist_started_at = getattr(player, 'web_playlist_started_at', 0)
-        if (player.current and playlist_urls and player.current.url not in playlist_urls
+        if (player.current and active_name
+                and getattr(player.current, 'playlist', None) != active_name
                 and time.time() - playlist_started_at > 5):
             player.web_playlist_name = None
             player.web_playlist_cover = None
-            player.web_playlist_urls = None
         current = None
         if player.current:
             current = _song_json(player.current)
@@ -360,7 +371,6 @@ class WebUI:
                 player.pending_playlist = None
                 player.web_playlist_name = None
                 player.web_playlist_cover = None
-                player.web_playlist_urls = None
                 player.clear_preloads()
                 player.cancel_autoplay_prefetch()
                 player.reset_playback_clock()
@@ -527,7 +537,7 @@ class WebUI:
                 status=409,
             )
 
-        requester = guild.me
+        requester = self._acting_member(request, guild)
         songs = []
         try:
             if 'spotify.com' in query or query.startswith('spotify:'):
@@ -550,7 +560,10 @@ class WebUI:
 
         player.web_playlist_name = None
         player.web_playlist_cover = None
-        player.web_playlist_urls = None
+        if not player.last_message_channel:
+            # Voice-channel text chat: guarantees now-playing updates land
+            # somewhere even when playback was started purely from the web
+            player.last_message_channel = vc.channel
 
         if body.get('next'):
             for song in reversed(songs):
@@ -616,15 +629,14 @@ class WebUI:
         suggestions = await asyncio.get_event_loop().run_in_executor(None, get_autocomplete_suggestions, query)
         return web.json_response(suggestions)
 
-    def _read_playlist_meta(self):
-        return load_json(PLAYLIST_META_FILE, {}, logger)
+    def _playlist_json(self, guild_id, user_id):
+        """The acting user's playlists (own + guild-shared, own shadows shared)."""
+        cog = self.cog
+        guild_data = cog._read_playlists().get(str(guild_id), {})
+        meta = cog._read_playlist_meta().get(str(guild_id), {})
+        own = guild_data.get('users', {}).get(str(user_id), {}) if user_id else {}
+        shared = guild_data.get('shared', {})
 
-    def _write_playlist_meta(self, data):
-        save_json(PLAYLIST_META_FILE, data, logger)
-
-    def _playlist_json(self, guild_id):
-        playlists = self.cog._read_playlists().get(str(guild_id), {})
-        meta = self._read_playlist_meta().get(str(guild_id), {})
         def track_json(entry):
             return {
                 'title': entry.get('title', 'Unknown'),
@@ -632,22 +644,28 @@ class WebUI:
                 'thumbnail': _thumbnail_from_url(entry.get('url'), entry.get('thumbnail')),
                 'source_type': entry.get('source_type', 'youtube'),
             }
-        return [
-            {
+
+        def playlist_json(name, entries, owner_key, is_shared):
+            custom = cog._bucket_for(meta, owner_key).get(name) if meta else None
+            return {
                 'name': name,
                 'count': len(entries),
-                'cover': meta.get(name) or next(
+                'cover': custom or next(
                     (_thumbnail_from_url(entry.get('url'), entry.get('thumbnail')) for entry in entries
                      if _thumbnail_from_url(entry.get('url'), entry.get('thumbnail'))), None),
-                'custom_cover': bool(meta.get(name)),
+                'custom_cover': bool(custom),
+                'shared': is_shared,
                 'tracks': [track_json(entry) for entry in entries[:200]],
             }
-            for name, entries in sorted(playlists.items(), key=lambda item: item[0].lower())
-        ]
+
+        items = {name: playlist_json(name, entries, 'shared', True) for name, entries in shared.items()}
+        items.update({name: playlist_json(name, entries, str(user_id), False) for name, entries in own.items()})
+        return [items[name] for name in sorted(items, key=str.lower)]
 
     async def api_playlists(self, request):
         guild, _player = self._get_guild_and_player(request)
-        return web.json_response({'playlists': self._playlist_json(guild.id)})
+        user_id = self._get_acting_user_id(request)
+        return web.json_response({'playlists': self._playlist_json(guild.id, user_id)})
 
     async def api_playlist_action(self, request):
         guild, player = self._get_guild_and_player(request)
@@ -661,21 +679,29 @@ class WebUI:
         if not name:
             return web.json_response({'error': 'Give the playlist a name.'}, status=400)
 
-        data = self.cog._read_playlists()
-        guild_lists = data.setdefault(str(guild.id), {})
+        cog = self.cog
+        user_id = self._get_acting_user_id(request)
+        owner_key = cog._owner_key(user_id)
+        data = cog._read_playlists()
+        guild_data = data.setdefault(str(guild.id), {'shared': {}, 'users': {}})
+        # Writes go to the acting user's own bucket; reads/edits find the
+        # playlist wherever this user can see it (own first, then shared)
+        own_lists = cog._bucket_for(guild_data, owner_key, create=True)
+        found_owner = cog.resolve_playlist_owner(data, guild.id, user_id, name)
+        found_lists = cog._bucket_for(guild_data, found_owner) if found_owner else None
 
         if action == 'create':
-            if name in guild_lists:
+            if found_owner:
                 return web.json_response({'error': f'A playlist named {name} already exists.'}, status=409)
-            guild_lists[name] = []
-            self.cog._write_playlists(data)
+            own_lists[name] = []
+            cog._write_playlists(data)
             message = f'Created {name}.'
         elif action == 'save':
             songs = ([player.current] if player.current else []) + list(player.queue)
             songs = [song for song in songs if song.source_type != 'local'][:200]
             if not songs:
                 return web.json_response({'error': 'There is nothing in the player to save yet.'}, status=409)
-            guild_lists[name] = [
+            own_lists[name] = [
                 {
                     'title': song.title,
                     'url': song.url,
@@ -685,25 +711,25 @@ class WebUI:
                 }
                 for song in songs
             ]
-            self.cog._write_playlists(data)
+            cog._write_playlists(data)
             message = f'Saved {name} with {len(songs)} songs.'
         elif action == 'delete':
-            if name not in guild_lists:
+            if found_lists is None:
                 return web.json_response({'error': f'No playlist named {name}.'}, status=404)
-            del guild_lists[name]
-            self.cog._write_playlists(data)
-            meta_data = self._read_playlist_meta()
-            guild_meta = meta_data.get(str(guild.id), {})
+            del found_lists[name]
+            cog._write_playlists(data)
+            meta_data = cog._read_playlist_meta()
+            guild_meta = cog._bucket_for(meta_data.setdefault(str(guild.id), {}), found_owner)
             cover_url = guild_meta.pop(name, None)
             if cover_url:
                 try:
                     os.remove(os.path.join(PLAYLIST_COVERS_DIR, os.path.basename(cover_url)))
                 except FileNotFoundError:
                     pass
-                self._write_playlist_meta(meta_data)
+                cog._write_playlist_meta(meta_data)
             message = f'Deleted {name}.'
         elif action == 'add_song':
-            entries = guild_lists.get(name)
+            entries = found_lists.get(name) if found_lists is not None else None
             if entries is None:
                 return web.json_response({'error': f'No playlist named {name}.'}, status=404)
             query = (body.get('query') or '').strip()
@@ -736,20 +762,20 @@ class WebUI:
                 'source_type': song.source_type,
                 'thumbnail': _thumbnail_from_url(song.url, song.thumbnail),
             } for song in songs)
-            self.cog._write_playlists(data)
+            cog._write_playlists(data)
             message = f'Added {len(songs)} song' + ('' if len(songs) == 1 else 's') + f' to {name}.'
         elif action == 'remove_song':
-            entries = guild_lists.get(name)
+            entries = found_lists.get(name) if found_lists is not None else None
             if entries is None:
                 return web.json_response({'error': f'No playlist named {name}.'}, status=404)
             index = int(body.get('index', -1))
             if not 0 <= index < len(entries):
                 return web.json_response({'error': 'That song is no longer in the playlist.'}, status=404)
             removed = entries.pop(index)
-            self.cog._write_playlists(data)
+            cog._write_playlists(data)
             message = f"Removed {removed.get('title', 'song')} from {name}."
         elif action in ('load', 'play'):
-            entries = guild_lists.get(name)
+            entries = found_lists.get(name) if found_lists is not None else None
             if entries is None:
                 return web.json_response({'error': f'No playlist named {name}.'}, status=404)
             vc = guild.voice_client
@@ -758,25 +784,27 @@ class WebUI:
                     {'error': 'Bot is not in a voice channel. Use /join in Discord first.'},
                     status=409,
                 )
+            requester = self._acting_member(request, guild)
+            if not player.last_message_channel:
+                player.last_message_channel = vc.channel
             if action == 'play':
                 player.queue.clear()
                 player.loop = False
                 player.loop_queue = False
                 player.pending_playlist = None
                 player.clear_preloads()
-                playlist_info = next((item for item in self._playlist_json(guild.id) if item['name'] == name), None)
                 player.web_playlist_name = name
-                player.web_playlist_cover = playlist_info.get('cover') if playlist_info else None
-                player.web_playlist_urls = {entry.get('url') for entry in entries}
+                player.web_playlist_cover = cog.playlist_cover_url(guild.id, found_owner, name, entries)
                 player.web_playlist_started_at = time.time()
             for entry in entries:
                 player.queue.append(Song(
                     title=entry.get('title', 'Unknown'),
                     url=entry['url'],
                     duration=entry.get('duration', 'Unknown'),
-                    requester=guild.me,
+                    requester=requester,
                     source_type=entry.get('source_type', 'youtube'),
                     thumbnail=entry.get('thumbnail'),
+                    playlist=name,
                 ))
             if action == 'play' and (vc.is_playing() or vc.is_paused()):
                 vc.stop()
@@ -788,7 +816,7 @@ class WebUI:
 
         return web.json_response({
             'message': message,
-            'playlists': self._playlist_json(guild.id),
+            'playlists': self._playlist_json(guild.id, user_id),
             'state': self._guild_state(guild, player),
         })
 
@@ -804,7 +832,10 @@ class WebUI:
             elif part.name == 'cover':
                 content_type = part.headers.get('Content-Type', '')
                 image = await part.read(decode=False)
-        if not name or name not in self.cog._read_playlists().get(str(guild.id), {}):
+        cog = self.cog
+        user_id = self._get_acting_user_id(request)
+        found_owner = cog.resolve_playlist_owner(cog._read_playlists(), guild.id, user_id, name) if name else None
+        if not found_owner:
             return web.json_response({'error': 'Playlist not found.'}, status=404)
         if not image or len(image) > 4 * 1024 * 1024:
             return web.json_response({'error': 'Choose an image smaller than 4 MB.'}, status=400)
@@ -817,20 +848,20 @@ class WebUI:
         if not extension or not content_type.startswith('image/'):
             return web.json_response({'error': 'Use a PNG, JPEG, or WebP image.'}, status=400)
         os.makedirs(PLAYLIST_COVERS_DIR, exist_ok=True)
-        filename = hashlib.sha256(f'{guild.id}:{name}'.encode()).hexdigest()[:28] + '.' + extension
+        filename = hashlib.sha256(f'{guild.id}:{found_owner}:{name}'.encode()).hexdigest()[:28] + '.' + extension
         with open(os.path.join(PLAYLIST_COVERS_DIR, filename), 'wb') as file:
             file.write(image)
-        meta_data = self._read_playlist_meta()
-        guild_meta = meta_data.setdefault(str(guild.id), {})
+        meta_data = cog._read_playlist_meta()
+        guild_meta = cog._bucket_for(meta_data.setdefault(str(guild.id), {}), found_owner, create=True)
         old_cover = guild_meta.get(name)
         guild_meta[name] = '/playlist-covers/' + filename
-        self._write_playlist_meta(meta_data)
+        cog._write_playlist_meta(meta_data)
         if old_cover and old_cover != guild_meta[name]:
             try:
                 os.remove(os.path.join(PLAYLIST_COVERS_DIR, os.path.basename(old_cover)))
             except FileNotFoundError:
                 pass
-        return web.json_response({'playlists': self._playlist_json(guild.id)})
+        return web.json_response({'playlists': self._playlist_json(guild.id, user_id)})
 
 
 
@@ -1402,7 +1433,7 @@ function playlistCardsHTML() {
     return `<article class="playlist-card ${playlist.cover ? '' : 'no-cover'}" tabindex="0" onclick="openPlaylist(${index})" onkeydown="if(event.key==='Enter')openPlaylist(${index})">
       <div class="playlist-disc"><div class="cover"${cover}></div></div>
       <div class="playlist-name">${esc(playlist.name)}</div>
-      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'}</div>
+      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'}${playlist.shared ? ' · shared' : ''}</div>
       <div class="playlist-actions">
         <button class="primary" onclick="event.stopPropagation();playlistByIndex('play',${index})">▶ Play</button>
         <button onclick="event.stopPropagation();playlistByIndex('load',${index})">＋ Queue</button>
@@ -1437,7 +1468,7 @@ function renderPlaylistPage() {
       <div class="playlist-cover-large ${playlist.cover ? '' : 'empty'}" ${cover}>
         <label class="cover-upload">▣ Change photo<input type="file" accept="image/png,image/jpeg,image/webp" onchange="uploadPlaylistCover(this.files[0])"></label>
       </div><div><div class="playlist-eyebrow">Playlist</div><h2>${esc(playlist.name)}</h2>
-      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'} · Kivi Yeşili library</div></div></div>
+      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'} · ${playlist.shared ? 'shared with the server' : 'your library'}</div></div></div>
       <div class="playlist-body"><div class="playlist-toolbar">
         <button class="playlist-play" onclick="playlistAction('play',openPlaylistName)" title="Play playlist">▶</button>
         <button onclick="playlistAction('load',openPlaylistName)">＋ Add to queue</button>
