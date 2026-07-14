@@ -45,6 +45,8 @@ reels_profiles.json
 room_settings.json
 favorites.json
 playlists.json
+playlist_meta.json
+playlist_covers/
 stats.jsonl
 .cache
 

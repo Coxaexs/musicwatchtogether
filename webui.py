@@ -11,6 +11,7 @@ Config (via .env / config.py):
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -20,12 +21,14 @@ import time
 from aiohttp import web
 
 import config
-from music import get_autocomplete_suggestions
+from music import Song, get_autocomplete_suggestions
 
 logger = logging.getLogger('MusicBot.WebUI')
 
 # Tokens persist to disk so /web links survive bot restarts
 TOKENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web_tokens.json')
+PLAYLIST_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'playlist_meta.json')
+PLAYLIST_COVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'playlist_covers')
 
 
 def _load_tokens():
@@ -160,6 +163,13 @@ class WebUI:
     def _guild_state(self, guild, player):
         vc = guild.voice_client
         connected = bool(vc and vc.is_connected())
+        playlist_urls = getattr(player, 'web_playlist_urls', None)
+        playlist_started_at = getattr(player, 'web_playlist_started_at', 0)
+        if (player.current and playlist_urls and player.current.url not in playlist_urls
+                and time.time() - playlist_started_at > 5):
+            player.web_playlist_name = None
+            player.web_playlist_cover = None
+            player.web_playlist_urls = None
         current = None
         if player.current:
             current = _song_json(player.current)
@@ -189,6 +199,8 @@ class WebUI:
             'queue': [_song_json(s) for s in list(player.queue)[:100]],
             'queue_length': len(player.queue),
             'history': [_song_json(s) for s in list(player.history)[:10]],
+            'active_playlist': getattr(player, 'web_playlist_name', None),
+            'active_playlist_cover': getattr(player, 'web_playlist_cover', None),
         }
 
     # ---------- routes ----------
@@ -257,6 +269,9 @@ class WebUI:
                 player.loop = False
                 player.loop_queue = False
                 player.pending_playlist = None
+                player.web_playlist_name = None
+                player.web_playlist_cover = None
+                player.web_playlist_urls = None
                 player.clear_preloads()
                 player.cancel_autoplay_prefetch()
                 player.reset_playback_clock()
@@ -444,6 +459,10 @@ class WebUI:
         if not songs:
             return web.json_response({'error': 'No results found for that query.'}, status=404)
 
+        player.web_playlist_name = None
+        player.web_playlist_cover = None
+        player.web_playlist_urls = None
+
         if body.get('next'):
             for song in reversed(songs):
                 player.queue.appendleft(song)
@@ -508,6 +527,226 @@ class WebUI:
         suggestions = await asyncio.get_event_loop().run_in_executor(None, get_autocomplete_suggestions, query)
         return web.json_response(suggestions)
 
+    def _read_playlist_meta(self):
+        try:
+            with open(PLAYLIST_META_FILE, 'r', encoding='utf-8') as file:
+                return json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _write_playlist_meta(self, data):
+        with open(PLAYLIST_META_FILE, 'w', encoding='utf-8') as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+
+    def _playlist_json(self, guild_id):
+        playlists = self.cog._read_playlists().get(str(guild_id), {})
+        meta = self._read_playlist_meta().get(str(guild_id), {})
+        return [
+            {
+                'name': name,
+                'count': len(entries),
+                'cover': meta.get(name) or next((entry.get('thumbnail') for entry in entries if entry.get('thumbnail')), None),
+                'custom_cover': bool(meta.get(name)),
+                'tracks': [
+                    {
+                        'title': entry.get('title', 'Unknown'),
+                        'duration': entry.get('duration', 'Unknown'),
+                        'thumbnail': entry.get('thumbnail'),
+                        'source_type': entry.get('source_type', 'youtube'),
+                    }
+                    for entry in entries[:200]
+                ],
+            }
+            for name, entries in sorted(playlists.items(), key=lambda item: item[0].lower())
+        ]
+
+    async def api_playlists(self, request):
+        guild, _player = self._get_guild_and_player(request)
+        return web.json_response({'playlists': self._playlist_json(guild.id)})
+
+    async def api_playlist_action(self, request):
+        guild, player = self._get_guild_and_player(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+
+        action = body.get('action')
+        name = (body.get('name') or '').strip()[:50]
+        if not name:
+            return web.json_response({'error': 'Give the playlist a name.'}, status=400)
+
+        data = self.cog._read_playlists()
+        guild_lists = data.setdefault(str(guild.id), {})
+
+        if action == 'create':
+            if name in guild_lists:
+                return web.json_response({'error': f'A playlist named {name} already exists.'}, status=409)
+            guild_lists[name] = []
+            self.cog._write_playlists(data)
+            message = f'Created {name}.'
+        elif action == 'save':
+            songs = ([player.current] if player.current else []) + list(player.queue)
+            songs = [song for song in songs if song.source_type != 'local'][:200]
+            if not songs:
+                return web.json_response({'error': 'There is nothing in the player to save yet.'}, status=409)
+            guild_lists[name] = [
+                {
+                    'title': song.title,
+                    'url': song.url,
+                    'duration': song.duration,
+                    'source_type': song.source_type,
+                    'thumbnail': song.thumbnail,
+                }
+                for song in songs
+            ]
+            self.cog._write_playlists(data)
+            message = f'Saved {name} with {len(songs)} songs.'
+        elif action == 'delete':
+            if name not in guild_lists:
+                return web.json_response({'error': f'No playlist named {name}.'}, status=404)
+            del guild_lists[name]
+            self.cog._write_playlists(data)
+            meta_data = self._read_playlist_meta()
+            guild_meta = meta_data.get(str(guild.id), {})
+            cover_url = guild_meta.pop(name, None)
+            if cover_url:
+                try:
+                    os.remove(os.path.join(PLAYLIST_COVERS_DIR, os.path.basename(cover_url)))
+                except FileNotFoundError:
+                    pass
+                self._write_playlist_meta(meta_data)
+            message = f'Deleted {name}.'
+        elif action == 'add_song':
+            entries = guild_lists.get(name)
+            if entries is None:
+                return web.json_response({'error': f'No playlist named {name}.'}, status=404)
+            query = (body.get('query') or '').strip()
+            if not query:
+                return web.json_response({'error': 'Search for a song first.'}, status=400)
+            try:
+                if 'spotify.com' in query or query.startswith('spotify:'):
+                    if 'playlist' in query or 'album' in query:
+                        songs, _total = await self.cog.process_spotify_playlist_fast(query, guild.me)
+                    else:
+                        songs = await self.cog.process_spotify(query, guild.me)
+                elif 'list=' in query:
+                    songs, _total = await self.cog.process_youtube_playlist_fast(query, guild.me)
+                else:
+                    song = await self.cog.process_youtube(query, guild.me)
+                    songs = [song] if song else []
+            except Exception as error:
+                logger.error(f"Playlist search failed for {query!r}: {error}", exc_info=True)
+                return web.json_response({'error': str(error)}, status=500)
+            if not songs:
+                return web.json_response({'error': 'No songs found.'}, status=404)
+            room = max(0, 200 - len(entries))
+            songs = songs[:room]
+            if not songs:
+                return web.json_response({'error': 'This playlist already has 200 songs.'}, status=409)
+            entries.extend({
+                'title': song.title,
+                'url': song.url,
+                'duration': song.duration,
+                'source_type': song.source_type,
+                'thumbnail': song.thumbnail,
+            } for song in songs)
+            self.cog._write_playlists(data)
+            message = f'Added {len(songs)} song' + ('' if len(songs) == 1 else 's') + f' to {name}.'
+        elif action == 'remove_song':
+            entries = guild_lists.get(name)
+            if entries is None:
+                return web.json_response({'error': f'No playlist named {name}.'}, status=404)
+            index = int(body.get('index', -1))
+            if not 0 <= index < len(entries):
+                return web.json_response({'error': 'That song is no longer in the playlist.'}, status=404)
+            removed = entries.pop(index)
+            self.cog._write_playlists(data)
+            message = f"Removed {removed.get('title', 'song')} from {name}."
+        elif action in ('load', 'play'):
+            entries = guild_lists.get(name)
+            if entries is None:
+                return web.json_response({'error': f'No playlist named {name}.'}, status=404)
+            vc = guild.voice_client
+            if not vc or not vc.is_connected():
+                return web.json_response(
+                    {'error': 'Bot is not in a voice channel. Use /join in Discord first.'},
+                    status=409,
+                )
+            if action == 'play':
+                player.queue.clear()
+                player.loop = False
+                player.loop_queue = False
+                player.pending_playlist = None
+                player.clear_preloads()
+                playlist_info = next((item for item in self._playlist_json(guild.id) if item['name'] == name), None)
+                player.web_playlist_name = name
+                player.web_playlist_cover = playlist_info.get('cover') if playlist_info else None
+                player.web_playlist_urls = {entry.get('url') for entry in entries}
+                player.web_playlist_started_at = time.time()
+            for entry in entries:
+                player.queue.append(Song(
+                    title=entry.get('title', 'Unknown'),
+                    url=entry['url'],
+                    duration=entry.get('duration', 'Unknown'),
+                    requester=guild.me,
+                    source_type=entry.get('source_type', 'youtube'),
+                    thumbnail=entry.get('thumbnail'),
+                ))
+            if action == 'play' and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+            elif not vc.is_playing() and not vc.is_paused():
+                await player.play_next()
+            message = ('Playing' if action == 'play' else 'Added') + f' {name} ({len(entries)} songs).'
+        else:
+            return web.json_response({'error': f'unknown playlist action {action!r}'}, status=400)
+
+        return web.json_response({
+            'message': message,
+            'playlists': self._playlist_json(guild.id),
+            'state': self._guild_state(guild, player),
+        })
+
+    async def api_playlist_cover(self, request):
+        guild, _player = self._get_guild_and_player(request)
+        reader = await request.multipart()
+        name = ''
+        image = b''
+        content_type = ''
+        async for part in reader:
+            if part.name == 'name':
+                name = (await part.text()).strip()[:50]
+            elif part.name == 'cover':
+                content_type = part.headers.get('Content-Type', '')
+                image = await part.read(decode=False)
+        if not name or name not in self.cog._read_playlists().get(str(guild.id), {}):
+            return web.json_response({'error': 'Playlist not found.'}, status=404)
+        if not image or len(image) > 4 * 1024 * 1024:
+            return web.json_response({'error': 'Choose an image smaller than 4 MB.'}, status=400)
+        signatures = {
+            'png': image.startswith(b'\x89PNG\r\n\x1a\n'),
+            'jpg': image.startswith(b'\xff\xd8\xff'),
+            'webp': image.startswith(b'RIFF') and image[8:12] == b'WEBP',
+        }
+        extension = next((ext for ext, matches in signatures.items() if matches), None)
+        if not extension or not content_type.startswith('image/'):
+            return web.json_response({'error': 'Use a PNG, JPEG, or WebP image.'}, status=400)
+        os.makedirs(PLAYLIST_COVERS_DIR, exist_ok=True)
+        filename = hashlib.sha256(f'{guild.id}:{name}'.encode()).hexdigest()[:28] + '.' + extension
+        with open(os.path.join(PLAYLIST_COVERS_DIR, filename), 'wb') as file:
+            file.write(image)
+        meta_data = self._read_playlist_meta()
+        guild_meta = meta_data.setdefault(str(guild.id), {})
+        old_cover = guild_meta.get(name)
+        guild_meta[name] = '/playlist-covers/' + filename
+        self._write_playlist_meta(meta_data)
+        if old_cover and old_cover != guild_meta[name]:
+            try:
+                os.remove(os.path.join(PLAYLIST_COVERS_DIR, os.path.basename(old_cover)))
+            except FileNotFoundError:
+                pass
+        return web.json_response({'playlists': self._playlist_json(guild.id)})
+
 
 
 async def start_web_server(bot):
@@ -516,14 +755,19 @@ async def start_web_server(bot):
         return
 
     ui = WebUI(bot)
-    app = web.Application(middlewares=[ui.auth_middleware])
+    app = web.Application(middlewares=[ui.auth_middleware], client_max_size=6 * 1024 ** 2)
     app.router.add_get('/', ui.index)
     app.router.add_get('/api/guilds', ui.api_guilds)
     app.router.add_get('/api/guilds/{guild_id}', ui.api_guild_state)
     app.router.add_post('/api/guilds/{guild_id}/action', ui.api_action)
     app.router.add_post('/api/guilds/{guild_id}/play', ui.api_play)
     app.router.add_get('/api/guilds/{guild_id}/lyrics', ui.api_lyrics)
+    app.router.add_get('/api/guilds/{guild_id}/playlists', ui.api_playlists)
+    app.router.add_post('/api/guilds/{guild_id}/playlists', ui.api_playlist_action)
+    app.router.add_post('/api/guilds/{guild_id}/playlist-cover', ui.api_playlist_cover)
     app.router.add_get('/api/autocomplete', ui.api_autocomplete)
+    os.makedirs(PLAYLIST_COVERS_DIR, exist_ok=True)
+    app.router.add_static('/playlist-covers/', PLAYLIST_COVERS_DIR)
 
     try:
         import watchtogether
@@ -576,13 +820,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
     --bg-image: repeating-linear-gradient(90deg, rgba(0,0,0,.10) 0px, rgba(0,0,0,.10) 2px, transparent 2px, transparent 7px),
                 linear-gradient(180deg, #2b1b0b, #201306);
   }
+  body[data-theme="glass"], body[data-theme="vinyl-glass"] {
+    --bg: #090a0e; --panel: rgba(23,24,30,.58); --panel2: rgba(255,255,255,.09);
+    --text: #f8f8fb; --muted: #b8bac5; --accent: #a887ff; --accent2: #89f2d0;
+    --danger: #ff8290; --border: rgba(255,255,255,.16); --border2: rgba(255,255,255,.09);
+    --card-border: rgba(255,255,255,.14); --radius: 22px;
+    --bg-image: radial-gradient(900px 600px at 15% 5%, rgba(145,92,255,.24), transparent 65%),
+                radial-gradient(900px 650px at 92% 18%, rgba(55,195,203,.20), transparent 64%),
+                linear-gradient(145deg, #090a10, #121018 55%, #07090d);
+  }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); background-image: var(--bg-image);
          background-attachment: fixed; color: var(--text); min-height: 100vh;
          font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
   body[data-theme="vinyl-classic"] { font-family: Georgia, 'Palatino Linotype', 'Times New Roman', serif; }
   button, input, select { font-family: inherit; }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 16px; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 16px 16px 136px; }
   h1 { font-size: 20px; margin: 8px 0 16px; display: flex; align-items: center; gap: 10px; }
   h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); }
   h1 .dot.on { background: var(--accent2); }
@@ -626,6 +879,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .addrow input[type=text]:focus { outline: 1px solid var(--accent); }
   .qhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .qhead h2 { font-size: 15px; margin: 0; }
+  .section-actions { display:flex; align-items:center; gap:5px; }
+  .section-actions button { padding:6px 9px; font-size:12px; }
   .setting { display: flex; align-items: center; gap: 14px; padding: 10px 0;
              border-bottom: 1px solid var(--border2); }
   .setting:last-child { border-bottom: none; }
@@ -667,6 +922,109 @@ INDEX_HTML = r"""<!DOCTYPE html>
     font-weight: bold;
     font-size: 18px;
     transform: scale(1.05);
+  }
+  body[data-theme="glass"]::before, body[data-theme="vinyl-glass"]::before {
+    content: ''; position: fixed; inset: -50px; z-index: -1; pointer-events: none;
+    background-image: linear-gradient(rgba(8,9,13,.55), rgba(8,9,13,.82)), var(--ambient-art, none);
+    background-size: cover; background-position: center; filter: blur(38px) saturate(1.35);
+    transform: scale(1.08); opacity: .82;
+  }
+  body[data-theme="glass"] .card, body[data-theme="vinyl-glass"] .card,
+  body[data-theme="glass"] h1 select, body[data-theme="vinyl-glass"] h1 select,
+  body[data-theme="glass"] .tab, body[data-theme="vinyl-glass"] .tab {
+    background: linear-gradient(145deg, rgba(255,255,255,.12), rgba(255,255,255,.045));
+    border: 1px solid rgba(255,255,255,.16);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 18px 50px rgba(0,0,0,.28);
+    -webkit-backdrop-filter: blur(26px) saturate(1.35); backdrop-filter: blur(26px) saturate(1.35);
+  }
+  .playlist-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(190px,1fr)); gap: 14px; }
+  .playlist-card { min-width: 0; padding: 12px; border-radius: 18px; background: var(--panel2);
+                   border: 1px solid var(--border2); transition: transform .2s, border-color .2s; }
+  .playlist-card:hover { transform: translateY(-3px); border-color: var(--accent); }
+  .playlist-disc { position: relative; width: 100%; aspect-ratio: 1; border-radius: 12px; overflow: hidden;
+                   background: linear-gradient(145deg,#282834,#111117);
+                   box-shadow: 0 14px 26px rgba(0,0,0,.38), inset 0 0 0 2px rgba(255,255,255,.08); }
+  .playlist-disc .cover { position: absolute; inset: 0; background-size: cover;
+                          background-position: center; }
+  .playlist-card.no-cover .playlist-disc::after { content:'♫'; position:absolute; inset:0; display:grid; place-items:center;
+                                                    font-size:54px; color:var(--muted); }
+  .playlist-name { margin-top: 12px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .playlist-meta { color: var(--muted); font-size: 12px; margin: 4px 0 10px; }
+  .playlist-actions { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; }
+  .playlist-actions button { padding: 7px 8px; font-size: 12px; }
+  .playlist-create { display:flex; gap:8px; margin-bottom:14px; }
+  .playlist-create input { flex:1; min-width:0; background:var(--panel2); color:var(--text);
+                           border:1px solid var(--border); border-radius:10px; padding:10px 12px; }
+  .view-nav { display:flex; gap:8px; margin:0 0 16px; }
+  .view-nav button { border-radius:999px; padding:9px 18px; border:1px solid var(--border); }
+  .view-nav button.active { background:var(--text); color:var(--bg); font-weight:750; }
+  .library-head { display:flex; align-items:flex-end; justify-content:space-between; gap:18px; margin-bottom:20px; }
+  .library-head h2 { font-size:30px; margin:0 0 4px; }
+  .library-head p { color:var(--muted); margin:0; }
+  .library-create { display:flex; gap:8px; width:min(420px,100%); }
+  .library-create input, .playlist-add input { flex:1; min-width:0; background:var(--panel2); color:var(--text);
+    border:1px solid var(--border); border-radius:999px; padding:11px 16px; }
+  .playlist-card { cursor:pointer; }
+  .playlist-card .playlist-actions { opacity:0; transition:opacity .18s; }
+  .playlist-card:hover .playlist-actions, .playlist-card:focus-within .playlist-actions { opacity:1; }
+  .playlist-page { overflow:hidden; padding:0; }
+  .playlist-hero { min-height:310px; display:flex; align-items:flex-end; gap:26px; padding:34px;
+    background:linear-gradient(180deg,rgba(255,255,255,.13),rgba(0,0,0,.34)); }
+  .playlist-cover-large { position:relative; flex:0 0 230px; width:230px; height:230px; border-radius:12px;
+    background:linear-gradient(145deg,#31313d,#111117); background-size:cover; background-position:center;
+    box-shadow:0 22px 55px rgba(0,0,0,.5); overflow:hidden; }
+  .playlist-cover-large.empty::after { content:'♫'; position:absolute; inset:0; display:grid; place-items:center;
+    font-size:74px; color:var(--muted); }
+  .cover-upload { position:absolute; inset:auto 12px 12px; z-index:2; display:block; text-align:center; cursor:pointer;
+    background:rgba(10,10,14,.76); color:white; border:1px solid rgba(255,255,255,.25); border-radius:999px;
+    padding:9px 12px; font-size:12px; backdrop-filter:blur(12px); }
+  .cover-upload input { display:none; }
+  .playlist-eyebrow { text-transform:uppercase; letter-spacing:.11em; font-size:11px; font-weight:800; }
+  .playlist-hero h2 { font-size:clamp(32px,6vw,68px); line-height:.96; margin:10px 0 14px; letter-spacing:-.04em; }
+  .playlist-hero .playlist-meta { font-size:14px; }
+  .playlist-body { padding:24px 34px 34px; background:linear-gradient(180deg,rgba(0,0,0,.24),transparent 220px); }
+  .playlist-toolbar { display:flex; gap:10px; align-items:center; margin-bottom:22px; flex-wrap:wrap; }
+  .playlist-play { width:56px; height:56px; padding:0; border-radius:50%; background:#1ed760; color:#07130a;
+    font-size:22px; font-weight:900; box-shadow:0 12px 30px rgba(30,215,96,.24); }
+  .playlist-add { display:flex; gap:8px; flex:1; min-width:min(100%,340px); }
+  .track-head, .playlist-track { display:grid; grid-template-columns:34px minmax(220px,2fr) minmax(120px,1fr) 90px 42px;
+    gap:12px; align-items:center; padding:10px 8px; }
+  .track-head { color:var(--muted); font-size:12px; border-bottom:1px solid var(--border2); }
+  .playlist-track { border-radius:9px; }
+  .playlist-track:hover { background:var(--panel2); }
+  .track-main { display:flex; align-items:center; gap:11px; min-width:0; }
+  .track-main img { width:44px; height:44px; object-fit:cover; border-radius:5px; background:var(--panel2); }
+  .track-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .track-source, .track-duration, .track-number { color:var(--muted); font-size:13px; }
+  .controls { position: fixed; z-index: 20; left: 14px; right: 14px; bottom: 12px; margin: 0;
+              min-height: 88px; padding: 12px 18px; border: 1px solid var(--border);
+              border-radius: 24px; background: color-mix(in srgb, var(--panel) 88%, transparent);
+              box-shadow: 0 20px 70px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.08);
+              -webkit-backdrop-filter: blur(28px) saturate(1.35); backdrop-filter: blur(28px) saturate(1.35); }
+  .bottom-track { display:flex; align-items:center; gap:10px; width:min(280px,24vw); min-width:180px; }
+  .bottom-track img { width:52px; height:52px; border-radius:12px; object-fit:cover; background:var(--panel2); }
+  .bottom-track .bt-copy { min-width:0; }
+  .bottom-track .bt-title { font-weight:700; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .bottom-track .bt-sub { color:var(--muted); font-size:11px; margin-top:4px; }
+  .transport { display:flex; gap:7px; align-items:center; margin:auto; }
+  .transport .play-main { width:46px; height:46px; border-radius:50%; padding:0; font-size:18px;
+                          color:#111; background:var(--text); }
+  .bottom-progress { position:absolute; height:4px; left:18px; right:18px; bottom:6px; background:var(--panel2); border-radius:5px; cursor:pointer; overflow:hidden; }
+  .bottom-progress > div { height:100%; width:0; background:linear-gradient(90deg,var(--accent),var(--accent2)); }
+  @media (max-width: 760px) {
+    .wrap { padding-left:10px; padding-right:10px; padding-bottom:150px; }
+    h1 { flex-wrap:wrap; } h1 select { margin-left:0; flex:1; }
+    .controls { left:7px; right:7px; bottom:7px; padding:10px; justify-content:center; }
+    .bottom-track { width:100%; min-width:0; } .bottom-track img { width:40px; height:40px; }
+    .transport { margin:0; } .controls .vol { margin-left:0; } .controls .vol span { display:none; }
+    .controls .vol input { width:76px; } .playlist-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .library-head { align-items:stretch; flex-direction:column; } .library-create { width:100%; }
+    .playlist-hero { min-height:0; align-items:center; flex-direction:column; text-align:center; padding:24px 18px; }
+    .playlist-cover-large { width:190px; height:190px; flex-basis:190px; }
+    .playlist-body { padding:18px 14px 28px; }
+    .track-head { display:none; }
+    .playlist-track { grid-template-columns:26px minmax(0,1fr) 52px 36px; gap:7px; }
+    .playlist-track .track-source { display:none; }
   }
 
   /* ---------- turntable (vinyl themes) ---------- */
@@ -760,6 +1118,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
   body[data-theme="vinyl-classic"] .shaft { background: linear-gradient(90deg, #e6c268, #a9821f); }
   body[data-theme="vinyl-classic"] .head { background: linear-gradient(180deg, #caa14a, #7d6015); }
   body[data-theme="vinyl-classic"] .needle { background: #f0e2b0; }
+  body[data-theme="vinyl-glass"] .plinth {
+    background: linear-gradient(145deg,rgba(255,255,255,.16),rgba(255,255,255,.045));
+    border: 1px solid rgba(255,255,255,.22);
+    box-shadow: 0 24px 60px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.25);
+    -webkit-backdrop-filter: blur(26px); backdrop-filter: blur(26px);
+  }
+  body[data-theme="vinyl-glass"] .platter { background:radial-gradient(circle,#08090c 60%,#8d91a0 61%,#282a31 68%,#08090c 73%); }
+  body[data-theme="vinyl-glass"] .pivot { background:radial-gradient(circle at 35% 30%,#fff,#777b88); }
+  body[data-theme="vinyl-glass"] .weight { background:linear-gradient(90deg,#737784,#292b32); }
+  body[data-theme="vinyl-glass"] .shaft { background:linear-gradient(90deg,#f5f7ff,#9499a8); }
+  body[data-theme="vinyl-glass"] .head { background:rgba(20,22,28,.82); border:1px solid rgba(255,255,255,.3); }
+  body[data-theme="vinyl-glass"] .needle { background:#fff; }
+  .disc .album-art { position:absolute; inset:0; border-radius:50%; background-size:cover; background-position:center; }
+  .disc .label { inset:44%; z-index:1; background:rgba(8,9,12,.42) !important;
+                 box-shadow:0 0 0 3px rgba(255,255,255,.2), inset 0 0 8px rgba(0,0,0,.45); }
+  .disc::after { content:''; position:absolute; inset:0; border-radius:50%; pointer-events:none;
+    background:repeating-radial-gradient(circle,transparent 0 5px,rgba(255,255,255,.055) 6px,rgba(0,0,0,.10) 7px),
+               radial-gradient(circle,transparent 0 13%,rgba(0,0,0,.28) 13.5% 16%,transparent 16.5%),
+               conic-gradient(from 12deg,rgba(255,255,255,.14),transparent 14%,transparent 48%,rgba(255,255,255,.09),transparent 68%); }
 </style>
 </head>
 <body>
@@ -769,6 +1146,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <option value="default">🌙 Kivi Dark</option>
       <option value="vinyl-modern">💿 Vinyl · Modern</option>
       <option value="vinyl-classic">🎻 Vinyl · Classic</option>
+      <option value="vinyl-glass">🫧 Vinyl · Liquid Glass</option>
+      <option value="glass">💎 Liquid Glass</option>
       <option value="modern">✨ Modern</option>
       <option value="light">☀️ Light</option>
     </select>
@@ -776,15 +1155,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
             aria-expanded="false" aria-controls="settingsPanel">⚙️ Settings</button>
   </h1>
   <div class="tabs" id="tabs"></div>
+  <nav class="view-nav" aria-label="Main views">
+    <button id="playerViewBtn" class="active" onclick="showView('player')">▶ Player</button>
+    <button id="playlistViewBtn" onclick="showView('playlists')">▦ Playlists</button>
+  </nav>
   <div id="content"><div class="empty">Loading…</div></div>
-  
-  <div class="card" id="lyricsCard" style="display: none;">
-    <div class="qhead" style="cursor:pointer;" onclick="toggleLyrics()">
-      <h2>🎙️ LyricsNow</h2>
-      <span id="lyricsToggleBtn">▼ Hide</span>
-    </div>
-    <div id="lyricsContent" style="margin-top: 10px;"></div>
-  </div>
 </div>
 <div class="msg" id="msg"></div>
 <div id="login"><div class="box">
@@ -811,14 +1186,24 @@ if (urlGuild) {
 
 let token = sessionStorage.getItem('mb_token') || localStorage.getItem('mb_token') || '';
 let guilds = [], selected = sessionStorage.getItem('mb_guild') || localStorage.getItem('mb_guild') || null;
-let state = null, lastStateAt = 0;
-let lyricsData = null, lastLyricsTitle = null, lyricsVisible = true;
+let state = null, lastStateAt = 0, playlists = [], playlistsGuild = null;
+let activeView = localStorage.getItem('mb_view') || 'player', openPlaylistName = null;
+let lyricsData = null, lastLyricsTitle = null, lyricsVisible = localStorage.getItem('mb_lyrics_hidden') !== '1';
 let settingsOpen = false; // intentionally closed on every fresh page load
+let queueCollapsed = localStorage.getItem('mb_queue_collapsed') === '1';
+let historyCollapsed = localStorage.getItem('mb_history_collapsed') === '1';
+const DEFAULT_SECTION_ORDER = ['queue', 'history', 'lyrics'];
+let sectionOrder;
+try {
+  const savedOrder = JSON.parse(localStorage.getItem('mb_section_order') || 'null');
+  sectionOrder = Array.isArray(savedOrder) && DEFAULT_SECTION_ORDER.every(key => savedOrder.includes(key))
+    ? savedOrder.filter(key => DEFAULT_SECTION_ORDER.includes(key)).slice(0, 3) : [...DEFAULT_SECTION_ORDER];
+} catch (_) { sectionOrder = [...DEFAULT_SECTION_ORDER]; }
 
 // ---------- themes ----------
-const THEMES = ['default', 'vinyl-modern', 'vinyl-classic', 'modern', 'light'];
+const THEMES = ['default', 'vinyl-modern', 'vinyl-classic', 'vinyl-glass', 'glass', 'modern', 'light'];
 let theme = localStorage.getItem('mb_theme') || 'default';
-function isVinyl() { return theme === 'vinyl-modern' || theme === 'vinyl-classic'; }
+function isVinyl() { return theme.startsWith('vinyl-'); }
 function applyTheme(t) {
   if (!THEMES.includes(t)) t = 'default';
   theme = t;
@@ -862,10 +1247,190 @@ function fmt(sec) {
   const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
   return (h ? h + ':' + String(m).padStart(2,'0') : m) + ':' + String(s).padStart(2,'0');
 }
+function cssUrl(url) {
+  return encodeURI(String(url || '')).replace(/['()]/g, ch => '%' + ch.charCodeAt(0).toString(16));
+}
+
+function showView(view) {
+  activeView = view === 'playlists' ? 'playlists' : 'player';
+  localStorage.setItem('mb_view', activeView);
+  if (activeView === 'player') openPlaylistName = null;
+  renderViewNav();
+  render();
+}
+function renderViewNav() {
+  const playerBtn = document.getElementById('playerViewBtn');
+  const playlistBtn = document.getElementById('playlistViewBtn');
+  if (playerBtn) playerBtn.classList.toggle('active', activeView === 'player');
+  if (playlistBtn) playlistBtn.classList.toggle('active', activeView === 'playlists');
+  const settingsBtn = document.getElementById('settingsBtn');
+  if (settingsBtn) settingsBtn.style.display = activeView === 'player' ? '' : 'none';
+}
+
+function playerControlsHTML(s) {
+  const current = s.current;
+  return `<div class="controls">
+    <div class="bottom-track">${current && current.thumbnail ? `<img src="${esc(current.thumbnail)}" alt="">` : '<img alt="">'}
+      <div class="bt-copy"><div class="bt-title">${current ? esc(current.title) : 'Nothing playing'}</div>
+      <div class="bt-sub">${current ? esc(current.requester) : (s.connected ? 'Choose something to play' : 'Join voice in Discord')}</div></div></div>
+    <div class="transport">
+      <button class="${s.autoplay ? 'toggled' : ''}" onclick="act('autoplay')" title="Autoplay">✣</button>
+      <button onclick="act('shuffle')" title="Shuffle">↝</button>
+      <button class="play-main" onclick="act('${s.paused ? 'resume' : 'pause'}')" title="${s.paused ? 'Resume' : 'Pause'}">${s.paused ? '▶' : 'Ⅱ'}</button>
+      <button onclick="doSkip()" title="Skip">▶|</button>
+      <button class="${s.loop !== 'off' ? 'toggled' : ''}" onclick="cycleLoop()" title="${s.loop === 'song' ? 'Repeat song' : s.loop === 'queue' ? 'Repeat queue' : 'Loop off'}">${s.loop === 'song' ? '↻¹' : '↻'}</button>
+    </div>
+    <button class="danger" onclick="if(confirm('Stop and clear the queue?'))act('stop')" title="Stop">■</button>
+    <div class="vol">♫ <input type="range" min="0" max="100" value="${s.volume}" onchange="act('volume',{level:+this.value})"><span>${s.volume}%</span></div>
+    <div class="bottom-progress" onclick="seekProgress(event)"><div id="bottomPbar"></div></div>
+  </div>`;
+}
+
+function playlistCardsHTML() {
+  if (!playlists.length) return '<div class="empty">No playlists yet. Create one, then search for songs to add.</div>';
+  return playlists.map((playlist, index) => {
+    const cover = playlist.cover ? ` style="background-image:url('${cssUrl(playlist.cover)}')"` : '';
+    return `<article class="playlist-card ${playlist.cover ? '' : 'no-cover'}" tabindex="0" onclick="openPlaylist(${index})" onkeydown="if(event.key==='Enter')openPlaylist(${index})">
+      <div class="playlist-disc"><div class="cover"${cover}></div></div>
+      <div class="playlist-name">${esc(playlist.name)}</div>
+      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'}</div>
+      <div class="playlist-actions">
+        <button class="primary" onclick="event.stopPropagation();playlistByIndex('play',${index})">▶ Play</button>
+        <button onclick="event.stopPropagation();playlistByIndex('load',${index})">＋ Queue</button>
+        <button class="danger" onclick="event.stopPropagation();deletePlaylist(${index})" title="Delete playlist">✕</button>
+      </div></article>`;
+  }).join('');
+}
+
+function renderPlaylistPage() {
+  const content = document.getElementById('content');
+  const oldSearch = document.getElementById('playlistSongSearch');
+  const oldValue = oldSearch ? oldSearch.value : '';
+  const wasFocused = document.activeElement === oldSearch;
+  const playlist = playlists.find(item => item.name === openPlaylistName);
+  let html = '';
+  if (!playlist) {
+    openPlaylistName = null;
+    html = `<section class="card"><div class="library-head"><div><h2>Your library</h2><p>Create a playlist, then fill it one search at a time.</p></div>
+      <div class="library-create"><input id="playlistName" maxlength="50" placeholder="New playlist name" onkeydown="if(event.key==='Enter')createPlaylist()">
+      <button class="primary" onclick="createPlaylist()">＋ Create</button></div></div>
+      <div class="playlist-grid">${playlistCardsHTML()}</div></section>`;
+  } else {
+    const cover = playlist.cover ? `style="background-image:url('${cssUrl(playlist.cover)}')"` : '';
+    const rows = playlist.tracks.length ? playlist.tracks.map((track, index) => `<div class="playlist-track">
+      <div class="track-number">${index + 1}</div>
+      <div class="track-main">${track.thumbnail ? `<img src="${esc(track.thumbnail)}" alt="">` : '<img alt="">'}<div class="track-title">${esc(track.title)}</div></div>
+      <div class="track-source">${esc(track.source_type === 'spotify' ? 'Spotify' : 'YouTube')}</div>
+      <div class="track-duration">${esc(track.duration)}</div>
+      <button class="danger" onclick="removePlaylistSong(${index})" title="Remove song">✕</button>
+    </div>`).join('') : '<div class="empty">This playlist is empty. Search above to add its first song.</div>';
+    html = `<section class="card playlist-page"><div class="playlist-hero">
+      <div class="playlist-cover-large ${playlist.cover ? '' : 'empty'}" ${cover}>
+        <label class="cover-upload">▣ Change photo<input type="file" accept="image/png,image/jpeg,image/webp" onchange="uploadPlaylistCover(this.files[0])"></label>
+      </div><div><div class="playlist-eyebrow">Playlist</div><h2>${esc(playlist.name)}</h2>
+      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'} · Kivi Yeşili library</div></div></div>
+      <div class="playlist-body"><div class="playlist-toolbar">
+        <button class="playlist-play" onclick="playlistAction('play',openPlaylistName)" title="Play playlist">▶</button>
+        <button onclick="playlistAction('load',openPlaylistName)">＋ Add to queue</button>
+        <button onclick="openPlaylistName=null;render()">← Library</button>
+        <div class="playlist-add"><input id="playlistSongSearch" list="playlistSuggestions" placeholder="Search a song or paste a Spotify / YouTube link" oninput="handleAutocomplete(this.value,'playlistSuggestions')" onkeydown="if(event.key==='Enter')addSongToPlaylist()">
+          <datalist id="playlistSuggestions"></datalist><button class="primary" onclick="addSongToPlaylist()">＋ Add song</button></div>
+      </div><div class="track-head"><span>#</span><span>Title</span><span>Source</span><span>Duration</span><span></span></div>${rows}</div>
+    </section>`;
+  }
+  content.innerHTML = html + playerControlsHTML(state);
+  const restored = document.getElementById('playlistSongSearch');
+  if (restored) { restored.value = oldValue; if (wasFocused) restored.focus(); }
+  const lyricsCard = document.getElementById('lyricsCard');
+  if (lyricsCard) lyricsCard.style.display = 'none';
+  tickProgress();
+}
+
+async function playlistAction(action, name, extra) {
+  try {
+    const res = await api(basePath + 'api/guilds/' + selected + '/playlists',
+      {method:'POST', body:JSON.stringify(Object.assign({action, name}, extra || {}))});
+    playlists = res.playlists || playlists;
+    if (res.state) { state = res.state; lastStateAt = Date.now(); }
+    if (action === 'add_song') {
+      const search = document.getElementById('playlistSongSearch');
+      if (search) search.value = '';
+    }
+    toast((action === 'play' ? '▶ ' : '✓ ') + res.message);
+    render();
+  } catch (e) { toast('❌ ' + e.message); }
+}
+function playlistByIndex(action, index) {
+  const playlist = playlists[index];
+  if (playlist) playlistAction(action, playlist.name);
+}
+function openPlaylist(index) {
+  const playlist = playlists[index];
+  if (playlist) { openPlaylistName = playlist.name; activeView = 'playlists'; render(); }
+}
+function createPlaylist() {
+  const input = document.getElementById('playlistName');
+  const name = input ? input.value.trim() : '';
+  if (!name) { toast('Name the playlist first.'); if (input) input.focus(); return; }
+  openPlaylistName = name;
+  playlistAction('create', name);
+}
+function addSongToPlaylist() {
+  const input = document.getElementById('playlistSongSearch');
+  const query = input ? input.value.trim() : '';
+  if (!query) { toast('Search for a song first.'); if (input) input.focus(); return; }
+  toast('⏳ Finding that song…');
+  playlistAction('add_song', openPlaylistName, {query});
+}
+function removePlaylistSong(index) {
+  playlistAction('remove_song', openPlaylistName, {index});
+}
+async function uploadPlaylistCover(file) {
+  if (!file) return;
+  if (file.size > 4 * 1024 * 1024) { toast('❌ Cover must be smaller than 4 MB.'); return; }
+  const form = new FormData(); form.append('name', openPlaylistName); form.append('cover', file);
+  const headers = token ? {'X-Auth-Token': token} : {};
+  try {
+    toast('⏳ Uploading cover…');
+    const response = await fetch(basePath + 'api/guilds/' + selected + '/playlist-cover', {method:'POST', headers, body:form});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Upload failed');
+    playlists = result.playlists || playlists; toast('✓ Playlist cover updated.'); render();
+  } catch (error) { toast('❌ ' + error.message); }
+}
+function deletePlaylist(index) {
+  const playlist = playlists[index];
+  if (playlist && confirm(`Delete “${playlist.name}”?`)) playlistAction('delete', playlist.name);
+}
 
 function toggleSettings() {
   settingsOpen = !settingsOpen;
   if (state) render();
+}
+function toggleQueue() {
+  queueCollapsed = !queueCollapsed;
+  localStorage.setItem('mb_queue_collapsed', queueCollapsed ? '1' : '0');
+  render();
+}
+function toggleHistory() {
+  historyCollapsed = !historyCollapsed;
+  localStorage.setItem('mb_history_collapsed', historyCollapsed ? '1' : '0');
+  render();
+}
+function moveSection(key, direction) {
+  const index = sectionOrder.indexOf(key);
+  const target = index + direction;
+  if (index < 0 || target < 0 || target >= sectionOrder.length) return;
+  [sectionOrder[index], sectionOrder[target]] = [sectionOrder[target], sectionOrder[index]];
+  localStorage.setItem('mb_section_order', JSON.stringify(sectionOrder));
+  render();
+}
+function sectionActions(key, extra) {
+  const index = sectionOrder.indexOf(key);
+  return `<div class="section-actions">${extra || ''}
+    <button onclick="moveSection('${key}',-1)" ${index === 0 ? 'disabled' : ''} title="Move section up">↑</button>
+    <button onclick="moveSection('${key}',1)" ${index === sectionOrder.length - 1 ? 'disabled' : ''} title="Move section down">↓</button>
+  </div>`;
 }
 
 async function refreshGuilds() {
@@ -891,7 +1456,17 @@ function renderTabs() {
       (g.playing ? ' <span class="live">● live</span>' : '') + `</div>`).join('');
   }
 }
-function pick(id) { selected = id; localStorage.setItem('mb_guild', id); renderTabs(); refreshState(); }
+function pick(id) { selected = id; playlists = []; playlistsGuild = null; localStorage.setItem('mb_guild', id); renderTabs(); refreshState(); }
+
+async function refreshPlaylists() {
+  if (!selected) return;
+  try {
+    const data = await api(basePath + 'api/guilds/' + selected + '/playlists');
+    playlists = data.playlists || [];
+    playlistsGuild = selected;
+    if (state) render();
+  } catch (e) { if (e.message !== 'auth') console.error(e); }
+}
 
 async function refreshState() {
   if (!selected) return;
@@ -899,6 +1474,7 @@ async function refreshState() {
     state = await api(basePath + 'api/guilds/' + selected);
     lastStateAt = Date.now();
     render();
+    if (playlistsGuild !== selected) refreshPlaylists();
     
     // Fetch lyrics if song changed
     if (state.current) {
@@ -925,7 +1501,17 @@ function render() {
   const oldInput = document.getElementById('q');
   const inputVal = oldInput ? oldInput.value : '';
   const isFocused = (document.activeElement === oldInput);
+  const oldPlaylistInput = document.getElementById('playlistName');
+  const playlistInputVal = oldPlaylistInput ? oldPlaylistInput.value : '';
+  const playlistInputFocused = (document.activeElement === oldPlaylistInput);
   const s = state;
+  const ambientArt = s.current && s.current.thumbnail ? `url("${cssUrl(s.current.thumbnail)}")` : 'none';
+  document.body.style.setProperty('--ambient-art', ambientArt);
+  renderViewNav();
+  if (activeView === 'playlists') {
+    renderPlaylistPage();
+    return;
+  }
   const sleepMinutes = s.sleep_timer_ends_at
     ? Math.max(0, Math.ceil((s.sleep_timer_ends_at * 1000 - Date.now()) / 60000)) : 0;
   let html = '';
@@ -965,16 +1551,8 @@ function render() {
   } else {
     html += `<div class="empty">${s.connected ? 'Nothing playing — add a song below.' : 'Not in a voice channel. Use /join in Discord.'}</div>`;
   }
-  html += `<div class="controls">
-      <button onclick="act('${s.paused ? 'resume' : 'pause'}')">${s.paused ? '▶️ Resume' : '⏸ Pause'}</button>
-      <button onclick="doSkip()">⏭ Skip</button>
-      <button onclick="act('shuffle')">🔀 Shuffle</button>
-      <button class="${s.loop !== 'off' ? 'toggled' : ''}" onclick="cycleLoop()">${s.loop === 'song' ? '🔂 Song' : s.loop === 'queue' ? '🔁 Queue' : '➡️ No loop'}</button>
-      <button class="${s.autoplay ? 'toggled' : ''}" onclick="act('autoplay')">🎲 Autoplay</button>
-      <button class="danger" onclick="if(confirm('Stop and clear the queue?'))act('stop')">⏹ Stop</button>
-      <div class="vol">🔊 <input type="range" min="0" max="100" value="${s.volume}"
-        onchange="act('volume',{level:+this.value})"><span>${s.volume}%</span></div>
-    </div></div>`;
+  html += '</div>';
+  html += playerControlsHTML(s);
 
   html += `<div class="card"><div class="addrow" style="position:relative;">
       <input type="text" id="q" list="suggestions" placeholder="Song name or YouTube / Spotify link…" onkeydown="if(event.key==='Enter')addSong(false)" oninput="handleAutocomplete(this.value)" autocomplete="off">
@@ -1077,26 +1655,37 @@ function render() {
     </div>
   </div>`;
 
-  html += `<div class="card"><div class="qhead"><h2>📜 Queue (${s.queue_length})</h2>` +
-    (s.queue_length ? `<button class="danger" onclick="if(confirm('Clear the queue?'))act('clear')">Clear</button>` : '') + `</div>`;
-  if (s.queue.length) {
-    html += s.queue.map((q, i) =>
+  const queueButtons = `<button onclick="toggleQueue()">${queueCollapsed ? '▾ Show queue' : '▴ Hide queue'}</button>` +
+    (s.queue_length ? `<button class="danger" onclick="if(confirm('Clear the queue?'))act('clear')">Clear</button>` : '');
+  let queueHtml = `<div class="card"><div class="qhead"><h2>📜 Queue (${s.queue_length})</h2>${sectionActions('queue', queueButtons)}</div>`;
+  if (!queueCollapsed && s.queue.length) {
+    queueHtml += s.queue.map((q, i) =>
       `<div class="qitem"><span class="n">${i + 1}.</span><span class="t">${esc(q.title)}</span>` +
       `<span class="d">${esc(q.duration)}</span><span class="btns">` +
       `<button title="Play now" onclick="act('skipto',{index:${i}})">▶</button>` +
       `<button title="Move to top" onclick="act('top',{index:${i}})">⬆</button>` +
       `<button title="Remove" onclick="act('remove',{index:${i}})">✖</button></span></div>`).join('');
     if (s.queue_length > s.queue.length) html += `<div class="empty">…and ${s.queue_length - s.queue.length} more</div>`;
-  } else {
-    html += '<div class="empty">Queue is empty.</div>';
+  } else if (!queueCollapsed) {
+    queueHtml += '<div class="empty">Queue is empty.</div>';
   }
-  html += '</div>';
+  queueHtml += '</div>';
 
-  if (s.history.length) {
-    html += `<div class="card"><details><summary>🕘 Recently played (${s.history.length})</summary>` +
-      s.history.map((q, i) => `<div class="qitem"><span class="n">${i + 1}.</span><span class="t">${esc(q.title)}</span><span class="d">${esc(q.duration)}</span></div>`).join('') +
-      '</details></div>';
-  }
+  const historyButtons = `<button onclick="toggleHistory()">${historyCollapsed ? '▾ Show history' : '▴ Hide history'}</button>`;
+  const historyHtml = `<div class="card"><div class="qhead"><h2>🕘 Recently played (${s.history.length})</h2>
+    ${sectionActions('history', historyButtons)}</div>` +
+    (!historyCollapsed && s.history.length
+      ? s.history.map((q, i) => `<div class="qitem"><span class="n">${i + 1}.</span><span class="t">${esc(q.title)}</span><span class="d">${esc(q.duration)}</span></div>`).join('')
+      : !historyCollapsed ? '<div class="empty">Your listening history will appear here after the first song finishes.</div>' : '') +
+    '</div>';
+
+  const lyricsButtons = `<button id="lyricsToggleBtn" onclick="toggleLyrics()">${lyricsVisible ? '▴ Hide lyrics' : '▾ Show lyrics'}</button>`;
+  const lyricsHtml = `<div class="card" id="lyricsCard" ${s.current ? '' : 'style="display:none"'}>
+    <div class="qhead"><h2>🎙️ LyricsNow</h2>${sectionActions('lyrics', lyricsButtons)}</div>
+    <div id="lyricsContent" style="margin-top:10px;display:${lyricsVisible ? 'block' : 'none'}"></div></div>`;
+
+  const movableSections = {queue: queueHtml, history: historyHtml, lyrics: lyricsHtml};
+  html += sectionOrder.map(key => movableSections[key]).join('');
 
   if (settingsOpen) html = settingsHtml + html;
   document.getElementById('content').innerHTML = html;
@@ -1111,6 +1700,11 @@ function render() {
   if (newInput) {
     newInput.value = inputVal;
     if (isFocused) newInput.focus();
+  }
+  const newPlaylistInput = document.getElementById('playlistName');
+  if (newPlaylistInput) {
+    newPlaylistInput.value = playlistInputVal;
+    if (playlistInputFocused) newPlaylistInput.focus();
   }
   
   // Show/hide lyrics card based on playing state
@@ -1137,8 +1731,9 @@ function tickProgress() {
   let pos = c.position_seconds || 0;
   if (state.playing && !state.paused) pos += (Date.now() - lastStateAt) / 1000;
   const total = c.duration_seconds;
-  const bar = document.getElementById('pbar'), posEl = document.getElementById('pos');
+  const bar = document.getElementById('pbar'), bottomBar = document.getElementById('bottomPbar'), posEl = document.getElementById('pos');
   if (bar && total) bar.style.width = Math.min(100, pos / total * 100) + '%';
+  if (bottomBar && total) bottomBar.style.width = Math.min(100, pos / total * 100) + '%';
   if (posEl) posEl.textContent = fmt(pos);
   
   // Update lyrics scroll progress
@@ -1184,8 +1779,11 @@ function seekProgress(event) {
 
 function toggleLyrics() {
   lyricsVisible = !lyricsVisible;
-  document.getElementById('lyricsContent').style.display = lyricsVisible ? 'block' : 'none';
-  document.getElementById('lyricsToggleBtn').textContent = lyricsVisible ? '▼ Hide' : '▲ Show';
+  localStorage.setItem('mb_lyrics_hidden', lyricsVisible ? '0' : '1');
+  const content = document.getElementById('lyricsContent');
+  const button = document.getElementById('lyricsToggleBtn');
+  if (content) content.style.display = lyricsVisible ? 'block' : 'none';
+  if (button) button.textContent = lyricsVisible ? '▴ Hide lyrics' : '▾ Show lyrics';
 }
 
 function updateLyricsProgress(pos) {
@@ -1229,10 +1827,11 @@ function updateLyricsProgress(pos) {
 
 let autocompleteTimeout = null;
 
-function handleAutocomplete(val) {
+function handleAutocomplete(val, targetId) {
+  targetId = targetId || 'suggestions';
   clearTimeout(autocompleteTimeout);
   if (!val || val.trim().length < 2) {
-    const dl = document.getElementById('suggestions');
+    const dl = document.getElementById(targetId);
     if (dl) dl.innerHTML = '';
     return;
   }
@@ -1240,7 +1839,7 @@ function handleAutocomplete(val) {
   autocompleteTimeout = setTimeout(async () => {
     try {
       const suggestions = await api(basePath + 'api/autocomplete?q=' + encodeURIComponent(val));
-      const dl = document.getElementById('suggestions');
+      const dl = document.getElementById(targetId);
       if (dl) {
         dl.innerHTML = suggestions.map(s => `<option value="${esc(s)}">`).join('');
       }
@@ -1261,13 +1860,14 @@ let lastVinylTitle = null, lastManualSkipAt = 0, lastFrame = null;
 
 function turntableHTML(s) {
   const c = s.current;
-  const label = c && c.thumbnail ? ` style="background-image:url('${c.thumbnail}')"` : '';
+  const vinylCover = s.active_playlist_cover || (c && c.thumbnail);
+  const art = vinylCover ? ` style="background-image:url('${cssUrl(vinylCover)}')"` : '';
   return `<div class="deck">
       <div class="plinth"></div>
       <div class="platter"></div>
       <div class="vinyl-wrap" id="vinylWrap">
         <div class="vinyl" onclick="vinylClick()" title="Click record: pause / resume">
-          <div class="disc" id="disc"><div class="mark"></div><div class="label"${label}></div></div>
+          <div class="disc" id="disc"><div class="album-art"${art}></div><div class="mark"></div><div class="label"></div></div>
           <div class="sheen"></div>
           <div class="spindle"></div>
         </div>
