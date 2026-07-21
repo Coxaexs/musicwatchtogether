@@ -42,7 +42,7 @@ server {
     real_ip_header CF-Connecting-IP;
     
     location / {
-        proxy_pass http://127.0.0.1:5000;
+        proxy_pass http://127.0.0.1:8722;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -56,20 +56,6 @@ server {
         proxy_read_timeout 86400;
     }
     
-    location /socket.io {
-        proxy_pass http://127.0.0.1:5000/socket.io;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
-        
-        # WebSocket timeout
-        proxy_read_timeout 86400;
-    }
 }
 EOF
 
@@ -87,8 +73,8 @@ sudo systemctl enable nginx
 echo ""
 echo "*** Cloudflare SSL/TLS Settings:"
 echo "   1. Cloudflare Dashboard > SSL/TLS > Overview"
-echo "   2. Encryption mode: 'Flexible' veya 'Full' sec"
-echo "   3. (Recommended: Flexible - home server'da SSL sertifikasi gerekmez)"
+echo "   2. Encryption mode: Full (strict)"
+echo "   3. Never use Flexible mode for authenticated pages"
 echo ""
 
 # 5. Systemd service oluştur
@@ -98,7 +84,7 @@ PYTHON_PATH="$CURRENT_DIR/env/bin/python"
 
 sudo tee /etc/systemd/system/deeppixel-watch.service > /dev/null << EOF
 [Unit]
-Description=DeepPixel Watch Together Server
+Description=DeepPixel Music and Watch Together Bot
 After=network.target
 
 [Service]
@@ -106,7 +92,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$CURRENT_DIR
 Environment="PATH=$CURRENT_DIR/env/bin"
-ExecStart=$PYTHON_PATH web_player.py
+ExecStart=$PYTHON_PATH music.py
 Restart=always
 RestartSec=10
 
@@ -153,5 +139,5 @@ echo ""
 echo "Update .env file:"
 echo "   WEB_SERVER_URL=https://deeppixel.online"
 echo ""
-echo "Restart bot: ./env/bin/python music_bot.py"
+echo "Restart bot: ./env/bin/python music.py"
 echo ""

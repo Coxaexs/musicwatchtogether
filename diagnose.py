@@ -9,6 +9,9 @@ import shutil
 
 def check_python():
     print(f"✓ Python version: {sys.version}")
+    if sys.version_info < (3, 11):
+        print("✗ Python 3.11 or newer is required")
+        return False
     return True
 
 def check_ffmpeg():

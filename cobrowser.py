@@ -357,6 +357,7 @@ class CoBrowserSession:
             env['PULSE_SINK'] = self.sink
         self.procs['ff'] = await asyncio.create_subprocess_exec(
             'firefox', '--no-remote', '--new-instance', '--profile', profile,
+            '--kiosk',
             f'--remote-debugging-port={self.rdp_port}',
             '--remote-allow-hosts=localhost',
             url or 'https://duckduckgo.com',

@@ -5,10 +5,10 @@ Mounted onto the bot's existing aiohttp app (webui.py) under /watch/:
     /watch/                page: synced video player + chat + queue
     /watch/reels           page: ReelsTogether - synced vertical swipe feed
     /watch/ws              websocket: room sync (chat, play/pause/seek, queue, swipes)
-    /watch/media/{file}    downloaded video files (range requests supported)
+    /watch/media/{room}/{file} downloaded video files (range requests supported)
 
 Rooms are keyed to a Discord channel; /watch and /reels slash commands hand
-out a tokenized link (deeppixel.online/watch/?room=...&token=...).
+out a tokenized link (deeppixel.online/watch/?room=...#token=...).
 
 Videos are anything yt-dlp can resolve (YouTube, Shorts, Reels, TikTok,
 Twitter/X, ...). They are downloaded to a local cache and served from disk so
@@ -35,6 +35,11 @@ import yt_dlp
 from aiohttp import web, WSMsgType
 
 import config
+from security import (
+    PublicURLRequired, SlidingWindowLimiter, client_identity,
+    validate_public_url,
+)
+from storage import load_json, save_json
 
 try:
     import cobrowser
@@ -55,6 +60,11 @@ TOKEN_TTL = 7 * 86400          # links stay valid for a week
 MAX_MEDIA_CACHE = 10           # WatchTogether + ReelsTogether files combined
 REELS_HISTORY = 5              # recent backward history within the shared cache cap
 CHAT_HISTORY = 100
+MAX_ACTIVE_ROOMS = 50
+MAX_ROOM_TOKENS = 500
+MAX_QUEUE_ITEMS = 200
+ROOM_IDLE_TTL = 2 * 3600
+GLOBAL_DOWNLOADS = 4
 REELS_READY_AHEAD = 3          # keep this many reels downloaded ahead of the cursor
 REELS_MAX_DURATION = 150       # seconds - skip anything longer in the shorts feed
 HLS_MIN_DURATION = 8 * 60      # longer than this -> stream while downloading
@@ -68,6 +78,10 @@ DEFAULT_TOPICS = [
     'cooking', 'magic tricks', 'parkour', 'gaming moments', 'science facts',
     'street food', 'car', 'basketball', 'animals',
 ]
+
+global_download_sem = asyncio.Semaphore(GLOBAL_DOWNLOADS)
+create_limiter = SlidingWindowLimiter(8, 10 * 60)
+message_limiter = SlidingWindowLimiter(120, 60)
 
 STOPWORDS = {
     'the', 'and', 'for', 'with', 'this', 'that', 'you', 'your', 'shorts',
@@ -119,22 +133,11 @@ def _dl_opts(cache_dir, vertical=False, quality=720, sponsorblock=False):
 # ---------------------------------------------------------------- persistence
 
 def _load_json(path, default):
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default
-    except Exception as e:
-        logger.warning(f"Could not load {path}: {e}")
-        return default
+    return load_json(path, default, logger)
 
 
 def _save_json(path, data):
-    try:
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f)
-    except Exception as e:
-        logger.warning(f"Could not save {path}: {e}")
+    return save_json(path, data, logger)
 
 
 tokens = _load_json(TOKENS_FILE, {})
@@ -175,6 +178,10 @@ def get_room_link(channel_id, channel_name, mode):
     for k, v in list(tokens.items()):
         if now - v.get('created_at', 0) > TOKEN_TTL:
             tokens.pop(k, None)
+    if len(tokens) >= MAX_ROOM_TOKENS:
+        oldest = sorted(tokens, key=lambda key: tokens[key].get('created_at', 0))
+        for key in oldest[:len(tokens) - MAX_ROOM_TOKENS + 1]:
+            tokens.pop(key, None)
     token = None
     for k, v in tokens.items():
         if v.get('room') == room_id:
@@ -186,7 +193,7 @@ def get_room_link(channel_id, channel_name, mode):
         _save_json(TOKENS_FILE, tokens)
     base = getattr(config, 'WEB_SERVER_URL', 'https://deeppixel.online').rstrip('/')
     path = '/watch/' if mode == 'watch' else '/watch/reels'
-    return f"{base}{path}?room={room_id}&token={token}"
+    return f"{base}{path}?room={room_id}#token={token}"
 
 
 def _token_room(token):
@@ -220,6 +227,7 @@ class Room:
         self._advanced_past = -1   # 'ended' debounce
         self.last_query = None     # avoid back-to-back identical feed searches
         self._topup_busy = False   # topup is not reentrant-safe
+        self.last_activity = time.monotonic()
         # reels profile
         prof = profiles.get(self.id, {})
         self.interests = prof.get('interests', {})
@@ -253,14 +261,82 @@ class Room:
 rooms = {}
 
 
+def _prune_rooms():
+    now = time.monotonic()
+    stale = [room_id for room_id, room in rooms.items()
+             if not room.sockets and now - room.last_activity >= ROOM_IDLE_TTL]
+    for room_id in stale:
+        room = rooms.pop(room_id)
+        for task in (room.sync_task, room.reels_task):
+            if task and not task.done():
+                task.cancel()
+
+
 def _get_room(room_id, name=None):
+    _prune_rooms()
     room = rooms.get(room_id)
     if not room:
+        if len(rooms) >= MAX_ACTIVE_ROOMS:
+            empty = [candidate for candidate in rooms.values()
+                     if not candidate.sockets]
+            if empty:
+                victim = min(empty, key=lambda candidate: candidate.last_activity)
+                rooms.pop(victim.id, None)
+            else:
+                raise RuntimeError('server room limit reached')
         room = Room(room_id, name)
         rooms[room_id] = room
     elif name and room.name != name:
         room.name = name
     return room
+
+
+def _room_cookie_name(room_id):
+    safe = re.sub(r'[^A-Za-z0-9_]', '_', room_id)[:64]
+    return f'wt_session_{safe}'
+
+
+def _request_room_token(request, room_id):
+    return request.cookies.get(_room_cookie_name(room_id), '')
+
+
+def _client_key(request):
+    return client_identity(request)
+
+
+def _room_owns_file(room, rel):
+    normalized = rel.replace('\\', '/').lstrip('/')
+    if '..' in normalized.split('/'):
+        return False
+    for item in room.queue:
+        owned = str(item.get('file') or '').replace('\\', '/').lstrip('/')
+        if not owned:
+            continue
+        if normalized == owned:
+            return True
+        if owned.endswith('/index.m3u8'):
+            directory = owned.rsplit('/', 1)[0] + '/'
+            if normalized.startswith(directory):
+                return True
+    return False
+
+
+def _safe_int(value, default=-1, minimum=-1, maximum=1_000_000):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _safe_float(value, default=0.0, minimum=0.0, maximum=7 * 86400.0):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if parsed != parsed:  # NaN
+        return default
+    return max(minimum, min(maximum, parsed))
 
 
 def _item_public(item):
@@ -540,6 +616,12 @@ def _protected_files(extra=()):
 # ---------------------------------------------------------------- downloads
 
 async def _download_item(room, item):
+    """Apply both global and per-room capacity before doing network work."""
+    async with global_download_sem:
+        await _download_item_inner(room, item)
+
+
+async def _download_item_inner(room, item):
     cache_dir = REELS_CACHE_DIR if room.mode == 'reels' else WATCH_CACHE_DIR
     loop = asyncio.get_running_loop()
     async with room.dl_sem:
@@ -620,6 +702,11 @@ async def _download_item(room, item):
 
 
 async def _hls_item(room, item):
+    async with global_download_sem, room.dl_sem:
+        await _hls_item_inner(room, item)
+
+
+async def _hls_item_inner(room, item):
     """Stream-while-downloading: ffmpeg pulls the source and writes an HLS
     playlist that becomes playable after a few segments, long before the
     whole video is on disk."""
@@ -724,6 +811,15 @@ async def _after_ready(room, item):
 
 
 async def _add_query(room, query, added_by, play_next=False):
+    if len(room.queue) >= MAX_QUEUE_ITEMS:
+        await _notice(room, f'❌ Queue limit reached ({MAX_QUEUE_ITEMS} items)')
+        return
+    if URL_RE.match(query):
+        try:
+            await validate_public_url(query)
+        except PublicURLRequired as exc:
+            await _notice(room, f'❌ {exc}')
+            return
     item = {
         'uid': secrets.token_hex(6), 'vid': None, 'url': query,
         'title': query if URL_RE.match(query) else f'🔎 {query}',
@@ -941,7 +1037,9 @@ async def _reels_topup_inner(room):
     added = 0
     checked = 0
     for e in entries:
-        if added >= 2 or checked >= 6 or _viable_ahead(room) >= REELS_READY_AHEAD:
+        if (added >= 2 or checked >= 6 or
+                _viable_ahead(room) >= REELS_READY_AHEAD or
+                len(room.queue) >= MAX_QUEUE_ITEMS):
             break
         vid = e.get('id')
         dur = e.get('duration')
@@ -1009,16 +1107,176 @@ async def _sync_loop(room):
 
 # ---------------------------------------------------------------- ws handler
 
+async def _handle_browser_message(room, ws, name, data):
+    """Handle the co-browser/settings protocol; return whether it was handled."""
+    event = data.get('t')
+    browser_events = {
+        'browser_start', 'settings', 'browser_stop', 'browser_control',
+        'browser_nav', 'bmouse', 'bkey', 'browser_media', 'browser_pick',
+        'pick_choice',
+    }
+    if event not in browser_events:
+        return False
+    sess = cobrowser.get(room.id) if cobrowser else None
+
+    if event == 'browser_start':
+        if not cobrowser:
+            await _notice(room, '❌ Browser mode is not available on this server')
+            return True
+        url = str(data.get('url') or '').strip()[:500]
+        if url:
+            try:
+                await validate_public_url(url)
+            except PublicURLRequired as exc:
+                await _notice(room, f'❌ {exc}')
+                return True
+        if sess:
+            if url:
+                await sess.navigate(url)
+            return True
+        room.set_position(room.get_position(), playing=False)
+        await _notice(room, f'🌐 {name} is starting the shared browser…')
+        await _broadcast_state(room)
+
+        async def on_change():
+            await _broadcast_state(room)
+        try:
+            cfg = get_settings(room.id)
+            await cobrowser.start(room.id, url, started_by=name,
+                                  on_change=on_change, adblock=cfg['adblock'],
+                                  quality=cfg['quality'])
+        except Exception as exc:
+            logger.exception('Shared browser failed to start')
+            await _notice(room, f'❌ Browser failed to start: {exc}')
+        await _broadcast_state(room)
+
+    elif event == 'settings':
+        cfg = get_settings(room.id)
+        changed = []
+        for key in ('adblock', 'sponsorblock'):
+            if key in data and bool(data[key]) != cfg[key]:
+                cfg[key] = bool(data[key])
+                changed.append(f"{key} {'on' if cfg[key] else 'off'}")
+        try:
+            quality = int(data.get('quality')) if 'quality' in data else 0
+        except (TypeError, ValueError):
+            quality = 0
+        if quality in (360, 480, 720, 1080) and quality != cfg['quality']:
+            cfg['quality'] = quality
+            changed.append(f'quality {quality}p')
+        if changed:
+            room_settings[room.id] = cfg
+            _save_json(SETTINGS_FILE, room_settings)
+            await _notice(room, f'⚙️ {name} set ' + ', '.join(changed))
+            await _broadcast_state(room)
+
+    elif event == 'browser_stop' and sess:
+        await _notice(room, f'🌐 {name} closed the shared browser')
+        await sess.stop()
+    elif event == 'browser_control' and sess:
+        sess.controller = name
+        await _notice(room, f'🖱️ {name} took control of the browser')
+        await _broadcast_state(room)
+    elif event == 'browser_nav' and sess and sess.controller == name:
+        url = str(data.get('url') or '').strip()[:500]
+        if url:
+            try:
+                await validate_public_url(url)
+                await sess.navigate(url)
+            except PublicURLRequired as exc:
+                await _notice(room, f'❌ {exc}')
+    elif event == 'bmouse' and sess and sess.controller == name:
+        try:
+            action = data.get('a', 'move')
+            x = max(0.0, min(1.0, float(data.get('x') or 0)))
+            y = max(0.0, min(1.0, float(data.get('y') or 0)))
+            button = max(1, min(5, int(data.get('b') or 1)))
+            delta = max(-1000.0, min(1000.0, float(data.get('dy') or 0)))
+        except (TypeError, ValueError):
+            return True
+        sess.mouse(action, x, y, button, delta)
+        if action in ('move', 'down', 'up'):
+            await _broadcast(room, {'t': 'bcursor', 'x': x, 'y': y,
+                                    'down': action == 'down'})
+    elif event == 'bkey' and sess and sess.controller == name:
+        key = str(data.get('key') or '')[:32]
+        # Browser chrome is kiosked and navigation must pass browser_nav URL
+        # validation. Modifier/location shortcuts would bypass that boundary.
+        if key not in {'Control', 'Alt', 'Meta', 'F4', 'F6'}:
+            sess.key(data.get('a', 'down'), key)
+    elif event == 'browser_media' and sess:
+        try:
+            await sess.probe_candidates()
+        except Exception:
+            logger.debug('Browser media probe failed', exc_info=True)
+        await ws.send_str(json.dumps(
+            {'t': 'bmedia', 'items': sess.get_media(), 'page': sess.page_url}))
+    elif event == 'browser_pick' and sess:
+        url = str(data.get('url') or '').strip()
+        if not url:
+            return True
+        try:
+            await validate_public_url(url)
+        except PublicURLRequired as exc:
+            await _notice(room, f'❌ {exc}')
+            return True
+        if len(room.queue) >= MAX_QUEUE_ITEMS:
+            await _notice(room, f'❌ Queue limit reached ({MAX_QUEUE_ITEMS} items)')
+            return True
+        await _notice(room, f'📹 {name} grabbed media from the page')
+        item = {
+            'uid': secrets.token_hex(6), 'vid': None, 'url': url,
+            'title': url.split('?')[0].rstrip('/').split('/')[-1] or url,
+            'duration': None, 'thumbnail': None,
+            'uploader': ((sess.page_url or '').split('/')[2]
+                         if '://' in (sess.page_url or '') else None),
+            'status': 'pending', 'progress': 0, 'file': None,
+            'added_by': name, 'likes': 0, 'tags': [],
+            '_http_headers': sess.media_headers(url),
+            '_media_kind': sess.media_kind(url),
+        }
+        room.queue.append(item)
+        await _broadcast_state(room)
+        asyncio.create_task(_download_item(room, item))
+    elif event == 'pick_choice':
+        uid = str(data.get('uid') or '')
+        url = str(data.get('url') or '')
+        item = next((entry for entry in room.queue if entry['uid'] == uid), None)
+        if item and url and item.get('choices') and \
+                any(choice['url'] == url for choice in item['choices']):
+            try:
+                await validate_public_url(url)
+            except PublicURLRequired as exc:
+                await _notice(room, f'❌ {exc}')
+                return True
+            chosen = next(choice for choice in item['choices'] if choice['url'] == url)
+            item['_http_headers'] = (item.get('_choice_headers') or {}).get(url) or {}
+            item['_http_headers'].setdefault('Referer', item['url'])
+            item['_media_kind'] = chosen.get('kind')
+            item['url'] = url
+            item['title'] = chosen.get('name') or item['title']
+            item['status'] = 'pending'
+            item['choices'] = None
+            item.pop('_choice_headers', None)
+            await _notice(room, f"📹 {name} picked: {chosen.get('name', 'media')}")
+            await _broadcast_state(room)
+            asyncio.create_task(_download_item(room, item))
+    return True
+
 async def ws_handler(request):
     room_id = request.query.get('room', '')
-    token = request.query.get('token', '')
+    token = _request_room_token(request, room_id)
     info = _token_room(token)
     if not info or info['room'] != room_id:
         raise web.HTTPUnauthorized(text='bad token')
 
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
-    room = _get_room(room_id, info.get('name'))
+    try:
+        room = _get_room(room_id, info.get('name'))
+    except RuntimeError as exc:
+        await ws.close(code=1013, message=str(exc).encode())
+        return ws
     name = 'Guest'
     joined = False
 
@@ -1030,7 +1288,15 @@ async def ws_handler(request):
                 data = json.loads(msg.data)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(data, dict):
+                continue
             t = data.get('t')
+            room.last_activity = time.monotonic()
+            if not message_limiter.allow((room.id, id(ws))):
+                await ws.send_str(json.dumps(
+                    {'t': 'chat', 'name': None,
+                     'text': '⚠️ Slow down for a moment.', 'ts': time.time()}))
+                continue
 
             if t == 'join':
                 name = str(data.get('name') or 'Guest')[:24].strip() or 'Guest'
@@ -1060,21 +1326,23 @@ async def ws_handler(request):
                 sess = cobrowser.get(room.id) if cobrowser else None
                 if sess:   # resuming the video ends browser mode
                     await sess.stop()
-                room.set_position(data.get('pos', room.get_position()), playing=True)
+                room.set_position(_safe_float(data.get('pos'), room.get_position()),
+                                  playing=True)
                 await _broadcast(room, {'t': 'sync', 'index': room.index,
                                         'playing': True,
                                         'position': round(room.position, 2),
                                         'by': name, 'action': 'play'})
 
             elif t == 'pause':
-                room.set_position(data.get('pos', room.get_position()), playing=False)
+                room.set_position(_safe_float(data.get('pos'), room.get_position()),
+                                  playing=False)
                 await _broadcast(room, {'t': 'sync', 'index': room.index,
                                         'playing': False,
                                         'position': round(room.position, 2),
                                         'by': name, 'action': 'pause'})
 
             elif t == 'seek':
-                room.set_position(data.get('pos', 0))
+                room.set_position(_safe_float(data.get('pos')))
                 await _broadcast(room, {'t': 'sync', 'index': room.index,
                                         'playing': room.playing,
                                         'position': round(room.position, 2),
@@ -1088,7 +1356,7 @@ async def ws_handler(request):
                                                    bool(data.get('next'))))
 
             elif t == 'jump':
-                idx = int(data.get('index', -1))
+                idx = _safe_int(data.get('index'))
                 if 0 <= idx < len(room.queue):
                     sess = cobrowser.get(room.id) if cobrowser else None
                     if sess:
@@ -1109,7 +1377,7 @@ async def ws_handler(request):
                 await _broadcast_state(room)
 
             elif t == 'remove':
-                idx = int(data.get('index', -1))
+                idx = _safe_int(data.get('index'))
                 if 0 <= idx < len(room.queue) and idx != room.index:
                     room.queue.pop(idx)
                     if idx < room.index:
@@ -1128,7 +1396,7 @@ async def ws_handler(request):
                     await _broadcast_state(room)
 
             elif t == 'ended':
-                idx = int(data.get('index', -1))
+                idx = _safe_int(data.get('index'))
                 if idx == room.index and idx > room._advanced_past:
                     room._advanced_past = idx
                     if room.mode == 'watch':
@@ -1154,8 +1422,8 @@ async def ws_handler(request):
 
             elif t == 'swipe' and room.mode == 'reels':
                 cur = room.current()
-                watched = float(data.get('watched') or 0)
-                dur = float(data.get('dur') or 0) or (cur or {}).get('duration') or 0
+                watched = _safe_float(data.get('watched'))
+                dur = _safe_float(data.get('dur')) or (cur or {}).get('duration') or 0
                 if cur and dur:
                     ratio = watched / dur
                     if ratio < 0.35:
@@ -1208,147 +1476,12 @@ async def ws_handler(request):
                                             'uid': cur['uid'],
                                             'likes': cur['likes']})
 
-            # ---- shared co-browser ----
-            elif t == 'browser_start':
-                if not cobrowser:
-                    await _notice(room, '❌ Browser mode is not available on this server')
-                    continue
-                url = str(data.get('url') or '').strip()[:500]
-                if cobrowser.get(room.id):
-                    if url:
-                        await cobrowser.get(room.id).navigate(url)
-                    continue
-                room.set_position(room.get_position(), playing=False)
-                await _notice(room, f'🌐 {name} is starting the shared browser…')
-                await _broadcast_state(room)
-
-                async def on_change():
-                    await _broadcast_state(room)
-                try:
-                    cfg = get_settings(room.id)
-                    await cobrowser.start(room.id, url, started_by=name,
-                                          on_change=on_change,
-                                          adblock=cfg['adblock'],
-                                          quality=cfg['quality'])
-                except Exception as e:
-                    await _notice(room, f'❌ Browser failed to start: {e}')
-                await _broadcast_state(room)
-
-            elif t == 'settings':
-                cfg = get_settings(room.id)
-                changed = []
-                for k in ('adblock', 'sponsorblock'):
-                    if k in data and bool(data[k]) != cfg[k]:
-                        cfg[k] = bool(data[k])
-                        changed.append(f"{k} {'on' if cfg[k] else 'off'}")
-                if 'quality' in data:
-                    try:
-                        q = int(data['quality'])
-                    except (TypeError, ValueError):
-                        q = 0
-                    if q in (360, 480, 720, 1080) and q != cfg['quality']:
-                        cfg['quality'] = q
-                        changed.append(f'quality {q}p')
-                if changed:
-                    room_settings[room.id] = cfg
-                    _save_json(SETTINGS_FILE, room_settings)
-                    await _notice(room, f'⚙️ {name} set ' + ', '.join(changed))
-                    await _broadcast_state(room)
-
-            elif t == 'browser_stop':
-                sess = cobrowser.get(room.id) if cobrowser else None
-                if sess:
-                    await _notice(room, f'🌐 {name} closed the shared browser')
-                    await sess.stop()
-
-            elif t == 'browser_control':
-                sess = cobrowser.get(room.id) if cobrowser else None
-                if sess:
-                    sess.controller = name
-                    await _notice(room, f'🖱️ {name} took control of the browser')
-                    await _broadcast_state(room)
-
-            elif t == 'browser_nav':
-                sess = cobrowser.get(room.id) if cobrowser else None
-                if sess and sess.controller == name:
-                    url = str(data.get('url') or '').strip()[:500]
-                    if url:
-                        await sess.navigate(url)
-
-            elif t == 'bmouse':
-                sess = cobrowser.get(room.id) if cobrowser else None
-                if sess and sess.controller == name:
-                    a = data.get('a', 'move')
-                    x = float(data.get('x') or 0)
-                    y = float(data.get('y') or 0)
-                    sess.mouse(a, x, y, int(data.get('b') or 1),
-                               float(data.get('dy') or 0))
-                    # so everyone sees where the controller is pointing
-                    if a in ('move', 'down', 'up'):
-                        await _broadcast(room, {'t': 'bcursor', 'x': x, 'y': y,
-                                                'down': a == 'down'})
-
-            elif t == 'bkey':
-                sess = cobrowser.get(room.id) if cobrowser else None
-                if sess and sess.controller == name:
-                    sess.key(data.get('a', 'down'), str(data.get('key') or ''))
-
-            elif t == 'browser_media':
-                sess = cobrowser.get(room.id) if cobrowser else None
-                if sess:
-                    # content-probe any disguised responses (e.g. an .m3u8
-                    # served as .txt) before handing back the list
-                    try:
-                        await sess.probe_candidates()
-                    except Exception:
-                        pass
-                    await ws.send_str(json.dumps(
-                        {'t': 'bmedia', 'items': sess.get_media(),
-                         'page': sess.page_url}))
-
-            elif t == 'browser_pick':
-                sess = cobrowser.get(room.id) if cobrowser else None
-                url = str(data.get('url') or '').strip()
-                if sess and url:
-                    await _notice(room, f'📹 {name} grabbed media from the page')
-                    # direct media URL: skip re-extraction, replay the
-                    # browser's own headers so the CDN accepts the download
-                    item = {
-                        'uid': secrets.token_hex(6), 'vid': None, 'url': url,
-                        'title': url.split('?')[0].rstrip('/').split('/')[-1] or url,
-                        'duration': None, 'thumbnail': None,
-                        'uploader': (sess.page_url or '').split('/')[2]
-                                    if '://' in (sess.page_url or '') else None,
-                        'status': 'pending', 'progress': 0, 'file': None,
-                        'added_by': name, 'likes': 0, 'tags': [],
-                        '_http_headers': sess.media_headers(url),
-                        '_media_kind': sess.media_kind(url),
-                    }
-                    room.queue.append(item)
-                    await _broadcast_state(room)
-                    asyncio.create_task(_download_item(room, item))
-
-            elif t == 'pick_choice':
-                uid = str(data.get('uid') or '')
-                url = str(data.get('url') or '')
-                item = next((i for i in room.queue if i['uid'] == uid), None)
-                if item and url and item.get('choices') \
-                        and any(c['url'] == url for c in item['choices']):
-                    chosen = next(c for c in item['choices'] if c['url'] == url)
-                    item['_http_headers'] = \
-                        (item.get('_choice_headers') or {}).get(url) or {}
-                    item['_http_headers'].setdefault('Referer', item['url'])
-                    item['_media_kind'] = chosen.get('kind')
-                    item['url'] = url
-                    item['title'] = chosen.get('name') or item['title']
-                    item['status'] = 'pending'
-                    item['choices'] = None
-                    item.pop('_choice_headers', None)
-                    await _notice(room, f"📹 {name} picked: {chosen.get('name','media')}")
-                    await _broadcast_state(room)
-                    asyncio.create_task(_download_item(room, item))
+            elif await _handle_browser_message(room, ws, name, data):
+                pass
     finally:
         room.sockets.pop(ws, None)
+        room.last_activity = time.monotonic()
+        message_limiter.discard((room.id, id(ws)))
         if joined:
             await _notice(room, f'💨 {name} left')
             await _broadcast_state(room)
@@ -1358,15 +1491,41 @@ async def ws_handler(request):
 # ---------------------------------------------------------------- http routes
 
 async def watch_page(request):
-    return web.Response(text=WATCH_HTML, content_type='text/html')
+    return web.Response(text=WATCH_HTML, content_type='text/html', headers={
+        'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
 
 
 async def reels_page(request):
-    return web.Response(text=REELS_HTML, content_type='text/html')
+    return web.Response(text=REELS_HTML, content_type='text/html', headers={
+        'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+
+
+async def api_session(request):
+    """Exchange a link fragment for a room-scoped HttpOnly cookie."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(text='invalid json')
+    room_id = str(body.get('room') or '')[:80]
+    token = str(body.get('token') or '')
+    info = _token_room(token)
+    if not info or info.get('room') != room_id:
+        raise web.HTTPUnauthorized(text='bad token')
+    response = web.json_response({'ok': True})
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', '')
+    response.set_cookie(
+        _room_cookie_name(room_id), token, max_age=TOKEN_TTL,
+        httponly=True, secure=request.secure or forwarded_proto == 'https',
+        samesite='Strict', path='/watch/')
+    return response
 
 
 async def api_create(request):
     """Standalone rooms: anyone on the landing page can create one."""
+    client = _client_key(request)
+    if not create_limiter.allow(client):
+        return web.json_response({'error': 'too many rooms created; try later'},
+                                 status=429)
     try:
         body = await request.json()
     except Exception:
@@ -1376,20 +1535,31 @@ async def api_create(request):
         ('📱 Reels Party' if mode == 'reels' else '🍿 Watch Party')
     room_id = ('r' if mode == 'reels' else 'w') + 'p' + secrets.token_hex(5)
     token = secrets.token_urlsafe(12)
-    tokens[token] = {'room': room_id, 'name': name, 'created_at': time.time()}
+    now = time.time()
+    for key, value in list(tokens.items()):
+        if now - value.get('created_at', 0) >= TOKEN_TTL:
+            tokens.pop(key, None)
+    if len(tokens) >= MAX_ROOM_TOKENS:
+        return web.json_response({'error': 'server room limit reached'}, status=503)
+    tokens[token] = {'room': room_id, 'name': name, 'created_at': now}
     _save_json(TOKENS_FILE, tokens)
     base = getattr(config, 'WEB_SERVER_URL', 'https://deeppixel.online').rstrip('/')
     path = '/watch/' if mode == 'watch' else '/watch/reels'
-    return web.json_response({'url': f'{base}{path}?room={room_id}&token={token}'})
+    return web.json_response({'url': f'{base}{path}?room={room_id}#token={token}'})
 
 
 async def media(request):
     # HLS segment requests are playlist-relative and carry no query string,
     # so the page also stores the token in a cookie
-    token = request.query.get('token') or request.cookies.get('wt_token', '')
-    if not _token_room(token):
+    room_id = request.match_info['room_id']
+    token = _request_room_token(request, room_id)
+    info = _token_room(token)
+    if not info or info.get('room') != room_id:
         raise web.HTTPUnauthorized(text='bad token')
+    room = rooms.get(room_id)
     rel = request.match_info['file']
+    if not room or not _room_owns_file(room, rel):
+        raise web.HTTPForbidden(text='media does not belong to this room')
     for d in (WATCH_CACHE_DIR, REELS_CACHE_DIR):
         root = os.path.realpath(d)
         path = os.path.realpath(os.path.join(d, rel))
@@ -1417,7 +1587,7 @@ async def static_file(request):
 async def stream_ws(request):
     """Binary MPEG-TS stream of the room's shared browser."""
     room_id = request.query.get('room', '')
-    token = request.query.get('token', '')
+    token = _request_room_token(request, room_id)
     info = _token_room(token)
     if not info or info['room'] != room_id:
         raise web.HTTPUnauthorized(text='bad token')
@@ -1461,8 +1631,9 @@ def setup(app, bot=None):
     app.router.add_get('/watch/ws', ws_handler)
     app.router.add_get('/watch/stream', stream_ws)
     app.router.add_get('/watch/static/{file}', static_file)
+    app.router.add_post('/watch/api/session', api_session)
     app.router.add_post('/watch/api/create', api_create)
-    app.router.add_get('/watch/media/{file:.+}', media)
+    app.router.add_get('/watch/media/{room_id}/{file:.+}', media)
     logger.info("🎬 Watch Together mounted at /watch/")
 
 
@@ -1663,13 +1834,21 @@ WATCH_HTML = r"""<!DOCTYPE html>
 </div></div>
 <script>
 const P = new URLSearchParams(location.search);
-const ROOM = P.get('room') || '', TOKEN = P.get('token') || '';
+const ROOM = P.get('room') || '';
+const LINK_TOKEN = new URLSearchParams(location.hash.slice(1)).get('token') || '';
 let ws = null, st = null, myName = localStorage.getItem('wt_name') || '';
 let sup = {play:0, pause:0, seek:0};  // suppress echoing remote-triggered events
 let needGesture = true, syncAt = 0, endedSent = -1;
 const v = document.getElementById('v');
-// HLS segment requests are playlist-relative (no query), auth rides a cookie
-if(TOKEN) document.cookie = 'wt_token='+encodeURIComponent(TOKEN)+'; path=/watch; SameSite=Lax; max-age=604800';
+async function exchangeRoomToken(){
+  if(!ROOM || !LINK_TOKEN)return true;
+  const r=await fetch('/watch/api/session',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({room:ROOM,token:LINK_TOKEN})});
+  history.replaceState(null,'',location.pathname+'?room='+encodeURIComponent(ROOM));
+  if(!r.ok){toast('❌ This room link is invalid or expired');return false}
+  return true;
+}
 
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
 function fmt(sec){if(sec==null||isNaN(sec))return'?:??';sec=Math.max(0,Math.floor(sec));
@@ -1688,7 +1867,7 @@ function saveName(){
 }
 function connect(){
   const proto = location.protocol==='https:'?'wss://':'ws://';
-  ws = new WebSocket(proto+location.host+'/watch/ws?room='+encodeURIComponent(ROOM)+'&token='+encodeURIComponent(TOKEN));
+  ws = new WebSocket(proto+location.host+'/watch/ws?room='+encodeURIComponent(ROOM));
   ws.onopen = ()=>{document.getElementById('dot').classList.add('on');send({t:'join',name:myName})};
   ws.onclose = ()=>{document.getElementById('dot').classList.remove('on');
     setTimeout(connect, 2500)};
@@ -1790,8 +1969,7 @@ function destroyHls(){ if(hlsP){ try{hlsP.destroy()}catch(_){} hlsP=null; } }
 function setVideoSrc(cur){
   destroyHls();
   curSrcUid = cur.uid;
-  const url = 'media/'+cur.file.split('/').map(encodeURIComponent).join('/')
-            + '?token='+encodeURIComponent(TOKEN);
+  const url = 'media/'+encodeURIComponent(ROOM)+'/'+cur.file.split('/').map(encodeURIComponent).join('/');
   if(cur.file.endsWith('.m3u8')
      && !v.canPlayType('application/vnd.apple.mpegurl')
      && window.Hls && Hls.isSupported()){
@@ -1879,7 +2057,7 @@ function pickMedia(url){
 function startStream(){
   if(typeof JSMpeg === 'undefined'){ toast('❌ stream player failed to load'); return; }
   const proto = location.protocol==='https:'?'wss://':'ws://';
-  const url = proto+location.host+'/watch/stream?room='+encodeURIComponent(ROOM)+'&token='+encodeURIComponent(TOKEN);
+  const url = proto+location.host+'/watch/stream?room='+encodeURIComponent(ROOM);
   bPlayer = new JSMpeg.Player(url, {
     canvas: document.getElementById('bcanvas'),
     audio: true, pauseWhenHidden: false,
@@ -2076,11 +2254,14 @@ async function createRoom(mode){
   }catch(e){ toast('❌ Could not create room'); }
 }
 
-if(!ROOM || !TOKEN){
-  document.getElementById('landing').classList.remove('hidden');
-}else if(myName){ connect(); }
-else{ document.getElementById('nameModal').classList.remove('hidden');
-      document.getElementById('nameInput').focus(); }
+async function startPage(){
+  if(!ROOM){document.getElementById('landing').classList.remove('hidden');return}
+  if(!await exchangeRoomToken())return;
+  if(myName){connect();return}
+  document.getElementById('nameModal').classList.remove('hidden');
+  document.getElementById('nameInput').focus();
+}
+startPage();
 </script>
 </body>
 </html>
@@ -2216,10 +2397,21 @@ REELS_HTML = r"""<!DOCTYPE html>
 
 <script>
 const P = new URLSearchParams(location.search);
-const ROOM = P.get('room')||'', TOKEN = P.get('token')||'';
+const ROOM = P.get('room')||'';
+const LINK_TOKEN = new URLSearchParams(location.hash.slice(1)).get('token')||'';
 let ws=null, st=null, myName=localStorage.getItem('wt_name')||'';
 let sup={play:0,pause:0,seek:0}, syncAt=0, swipeLock=0, watchedStart=0;
 const v=document.getElementById('v');
+
+async function exchangeRoomToken(){
+  if(!ROOM||!LINK_TOKEN)return true;
+  const r=await fetch('/watch/api/session',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({room:ROOM,token:LINK_TOKEN})});
+  history.replaceState(null,'',location.pathname+'?room='+encodeURIComponent(ROOM));
+  if(!r.ok){toast('❌ This room link is invalid or expired');return false}
+  return true;
+}
 
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML}
 function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))}
@@ -2234,7 +2426,7 @@ function saveName(){
 }
 function connect(){
   const proto=location.protocol==='https:'?'wss://':'ws://';
-  ws=new WebSocket(proto+location.host+'/watch/ws?room='+encodeURIComponent(ROOM)+'&token='+encodeURIComponent(TOKEN));
+  ws=new WebSocket(proto+location.host+'/watch/ws?room='+encodeURIComponent(ROOM));
   ws.onopen=()=>send({t:'join',name:myName});
   ws.onclose=()=>setTimeout(connect,2500);
   ws.onmessage=e=>{
@@ -2263,7 +2455,7 @@ function applyState(d){
     } else {
       if(embedUid) clearReelEmbed();
       if(cur.uid!==prevUid || !v.src.includes(encodeURIComponent(cur.file))){
-        v.src='media/'+encodeURIComponent(cur.file)+'?token='+encodeURIComponent(TOKEN);
+        v.src='media/'+encodeURIComponent(ROOM)+'/'+encodeURIComponent(cur.file);
         v.load(); watchedStart=Date.now();
         sup.play++; tryPlay();
       }
@@ -2443,10 +2635,13 @@ setInterval(()=>{
   if(v.duration)document.getElementById('pbar').style.width=(v.currentTime/v.duration*100)+'%';
 },200);
 
-if(!ROOM||!TOKEN){
-  location.replace('./');  // room creation lives on the /watch/ landing page
-}else if(myName){document.getElementById('nameOvl').classList.add('hidden');connect();}
-else{document.getElementById('nameInput').focus();}
+async function startPage(){
+  if(!ROOM){location.replace('./');return}
+  if(!await exchangeRoomToken())return;
+  if(myName){document.getElementById('nameOvl').classList.add('hidden');connect();}
+  else{document.getElementById('nameInput').focus();}
+}
+startPage();
 </script>
 </body>
 </html>

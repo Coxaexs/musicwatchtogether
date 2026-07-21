@@ -24,8 +24,10 @@ A Discord music bot (`music.py`) with a browser-based control dashboard and a
 
 ## Setup
 
+Python 3.11 or newer is required.
+
 ```bash
-python3 -m venv env && ./env/bin/pip install -r requirements.txt
+python3 -m venv env && ./env/bin/pip install -r requirements.lock
 cp .env.example .env         # fill in DISCORD_TOKEN (+ optional Spotify)
 ./env/bin/python webstatic/... # see webstatic/README.md for adguard.xpi
 ./start_bot.sh
@@ -34,6 +36,23 @@ cp .env.example .env         # fill in DISCORD_TOKEN (+ optional Spotify)
 The web stack listens on `WEB_UI_PORT` (default 8722) and is meant to sit
 behind a reverse proxy — see `setup_watch_nginx.sh` and `ultimate-fix.conf`
 for the `/watch/` + websocket routing.
+
+Set a strong `WEB_UI_PASSWORD` whenever `WEB_UI_HOST` is not loopback. Room
+and dashboard invitation links exchange their fragment token for a scoped,
+HttpOnly session cookie. URL fragments are never sent to the reverse proxy.
+
+## Development
+
+```bash
+./env/bin/python -m unittest discover -s tests -v
+./env/bin/ruff check .
+```
+
+Runtime dependency ranges are maintained in `requirements.txt`. CI and
+deployments use the exact versions in `requirements.lock`; regenerate it with
+`pip-compile --generate-hashes --output-file=requirements.lock requirements-dev.txt`
+on Linux after an intentional dependency update (the lock includes the
+Linux-only `python-xlib` co-browser dependency).
 
 ## Notes
 

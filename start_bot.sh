@@ -14,7 +14,7 @@ if [ ! -d "env" ]; then
     python3 -m venv env
     source env/bin/activate
     echo "Installing requirements..."
-    pip install -r requirements.txt
+    pip install -r requirements.lock
 else
     # Activate virtual environment
     source env/bin/activate

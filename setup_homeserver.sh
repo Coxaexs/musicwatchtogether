@@ -21,7 +21,7 @@ server {
     server_name deeppixel.online www.deeppixel.online;
     
     location / {
-        proxy_pass http://127.0.0.1:5000;
+        proxy_pass http://127.0.0.1:8722;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -31,16 +31,6 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
     
-    location /socket.io {
-        proxy_pass http://127.0.0.1:5000/socket.io;
-        proxy_http_version 1.1;
-        proxy_buffering off;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
 }
 EOF
 
@@ -68,7 +58,7 @@ PYTHON_PATH="$CURRENT_DIR/env/bin/python"
 
 sudo tee /etc/systemd/system/deeppixel-watch.service > /dev/null << EOF
 [Unit]
-Description=DeepPixel Watch Together Server
+Description=DeepPixel Music and Watch Together Bot
 After=network.target
 
 [Service]
@@ -76,7 +66,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$CURRENT_DIR
 Environment="PATH=$CURRENT_DIR/env/bin"
-ExecStart=$PYTHON_PATH web_player.py
+ExecStart=$PYTHON_PATH music.py
 Restart=always
 RestartSec=10
 
@@ -95,7 +85,6 @@ if command -v ufw &> /dev/null; then
     echo "🔥 Firewall ayarlanıyor..."
     sudo ufw allow 80/tcp
     sudo ufw allow 443/tcp
-    sudo ufw allow 5000/tcp
 fi
 
 echo ""
@@ -108,5 +97,5 @@ echo ""
 echo "🎬 .env dosyasındaki WEB_SERVER_URL'i güncellemeyi unutma:"
 echo "   WEB_SERVER_URL=https://deeppixel.online"
 echo ""
-echo "🤖 Botu yeniden başlat: ./env/bin/python music_bot.py"
+echo "🤖 Botu yeniden başlat: ./env/bin/python music.py"
 echo ""

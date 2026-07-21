@@ -11,7 +11,7 @@ SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
 # Watch Together Web Server
-WEB_SERVER_URL = os.getenv("WEB_SERVER_URL", "http://localhost:5000")
+WEB_SERVER_URL = os.getenv("WEB_SERVER_URL", "http://localhost:8722")
 
 # FFmpeg options for audio streaming
 FFMPEG_OPTIONS = {

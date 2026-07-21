@@ -23,6 +23,8 @@ from aiohttp import web
 
 import config
 from music import Song, get_autocomplete_suggestions
+from security import SlidingWindowLimiter, client_identity
+from storage import load_json, save_json
 
 logger = logging.getLogger('MusicBot.WebUI')
 
@@ -32,33 +34,33 @@ PLAYLIST_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'p
 PLAYLIST_COVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'playlist_covers')
 
 
-def _load_tokens():
-    try:
-        with open(TOKENS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    except Exception as e:
-        logger.warning(f"Could not load web tokens: {e}")
-        return {}
+WEB_TOKEN_TTL = 24 * 3600
+LOGIN_LIMITER = SlidingWindowLimiter(10, 5 * 60)
 
 
 def _save_tokens():
-    try:
-        with open(TOKENS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(temp_tokens, f)
-    except Exception as e:
-        logger.warning(f"Could not save web tokens: {e}")
+    save_json(TOKENS_FILE, temp_tokens, logger)
 
 
-temp_tokens = _load_tokens()
+temp_tokens = load_json(TOKENS_FILE, {}, logger)
+
+
+def _valid_token_info(token):
+    info = temp_tokens.get(token or '')
+    if not info:
+        return None
+    if time.time() - info.get('created_at', 0) >= WEB_TOKEN_TTL:
+        temp_tokens.pop(token, None)
+        _save_tokens()
+        return None
+    return info
 
 def generate_token(guild_id):
     token = secrets.token_urlsafe(16)
     # Clean up expired tokens (older than 24 hours)
     now = time.time()
     for k, v in list(temp_tokens.items()):
-        if now - v['created_at'] > 86400:
+        if now - v.get('created_at', 0) >= WEB_TOKEN_TTL:
             temp_tokens.pop(k, None)
     temp_tokens[token] = {'guild_id': guild_id, 'created_at': now}
     _save_tokens()
@@ -114,15 +116,25 @@ class WebUI:
 
     # ---------- auth ----------
 
+    @staticmethod
+    def _supplied_token(request):
+        return request.cookies.get('mb_session') or ''
+
+    @staticmethod
+    def _set_session_cookie(request, response, token):
+        forwarded_proto = request.headers.get('X-Forwarded-Proto', '')
+        response.set_cookie(
+            'mb_session', token, max_age=WEB_TOKEN_TTL, httponly=True,
+            secure=request.secure or forwarded_proto == 'https',
+            samesite='Strict', path='/')
+
     def _authorized(self, request):
-        supplied = request.headers.get('X-Auth-Token') or request.query.get('auth') or ''
+        supplied = self._supplied_token(request)
         
-        # If a token was supplied, it must be valid (either config password or temp token)
+        # Passwords are exchanged at /api/session; API calls only accept an
+        # opaque session/invitation token.
         if supplied:
-            password = config.WEB_UI_PASSWORD
-            if password and secrets.compare_digest(supplied, password):
-                return True
-            if supplied in temp_tokens:
+            if _valid_token_info(supplied):
                 return True
             return False # Supplied token was invalid/expired
             
@@ -135,21 +147,19 @@ class WebUI:
 
 
     def _get_allowed_guild_id(self, request):
-        supplied = request.headers.get('X-Auth-Token') or request.query.get('auth') or ''
+        supplied = self._supplied_token(request)
         if not supplied:
             return None
-        # Master password bypasses restriction
-        password = config.WEB_UI_PASSWORD
-        if password and secrets.compare_digest(supplied, password):
-            return None
-        # Return guild ID for temp token
-        token_info = temp_tokens.get(supplied)
+        # Return guild ID for invitation tokens; password sessions have None.
+        token_info = _valid_token_info(supplied)
         if token_info:
             return token_info['guild_id']
         return None
 
     @web.middleware
     async def auth_middleware(self, request, handler):
+        if request.path == '/api/session':
+            return await handler(request)
         if request.path.startswith('/api/') and not self._authorized(request):
             return web.json_response({'error': 'unauthorized'}, status=401)
         return await handler(request)
@@ -219,6 +229,36 @@ class WebUI:
 
     async def index(self, request):
         return web.Response(text=INDEX_HTML, content_type='text/html')
+
+    async def api_session(self, request):
+        peer = client_identity(request)
+        if not LOGIN_LIMITER.allow(peer):
+            return web.json_response({'error': 'too many login attempts'}, status=429)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        invitation = str(body.get('token') or '')
+        if invitation:
+            info = _valid_token_info(invitation)
+            guild_id = str(body.get('guild_id') or '')
+            if not info or str(info.get('guild_id')) != guild_id:
+                return web.json_response({'error': 'invalid or expired link'}, status=401)
+            response = web.json_response({'ok': True})
+            self._set_session_cookie(request, response, invitation)
+            return response
+        password = str(body.get('password') or '')
+        configured = config.WEB_UI_PASSWORD
+        if not configured or not secrets.compare_digest(password, configured):
+            return web.json_response({'error': 'invalid password'}, status=401)
+        token = secrets.token_urlsafe(24)
+        temp_tokens[token] = {
+            'guild_id': None, 'created_at': time.time(), 'kind': 'session'
+        }
+        _save_tokens()
+        response = web.json_response({'ok': True})
+        self._set_session_cookie(request, response, token)
+        return response
 
     async def api_guilds(self, request):
         guilds = []
@@ -556,15 +596,10 @@ class WebUI:
         return web.json_response(suggestions)
 
     def _read_playlist_meta(self):
-        try:
-            with open(PLAYLIST_META_FILE, 'r', encoding='utf-8') as file:
-                return json.load(file)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+        return load_json(PLAYLIST_META_FILE, {}, logger)
 
     def _write_playlist_meta(self, data):
-        with open(PLAYLIST_META_FILE, 'w', encoding='utf-8') as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
+        save_json(PLAYLIST_META_FILE, data, logger)
 
     def _playlist_json(self, guild_id):
         playlists = self.cog._read_playlists().get(str(guild_id), {})
@@ -782,10 +817,15 @@ async def start_web_server(bot):
     if not config.WEB_UI_ENABLED:
         logger.info("Web UI disabled (WEB_UI_ENABLED=0)")
         return
+    if config.WEB_UI_HOST not in ('127.0.0.1', '::1', 'localhost') and \
+            not config.WEB_UI_PASSWORD:
+        raise RuntimeError(
+            'WEB_UI_PASSWORD is required when WEB_UI_HOST is not loopback')
 
     ui = WebUI(bot)
     app = web.Application(middlewares=[ui.auth_middleware], client_max_size=6 * 1024 ** 2)
     app.router.add_get('/', ui.index)
+    app.router.add_post('/api/session', ui.api_session)
     app.router.add_get('/api/guilds', ui.api_guilds)
     app.router.add_get('/api/guilds/{guild_id}', ui.api_guild_state)
     app.router.add_post('/api/guilds/{guild_id}/action', ui.api_action)
@@ -1201,14 +1241,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </div></div>
 <script>
 const urlParams = new URLSearchParams(window.location.search);
-const urlToken = urlParams.get('token');
 const urlGuild = urlParams.get('guild_id');
-
-if (urlToken) {
-  sessionStorage.setItem('mb_token', urlToken);
-} else {
-  sessionStorage.removeItem('mb_token');
-}
+const linkToken = new URLSearchParams(window.location.hash.slice(1)).get('token') || '';
 
 if (urlGuild) {
   sessionStorage.setItem('mb_guild', urlGuild);
@@ -1216,7 +1250,6 @@ if (urlGuild) {
   sessionStorage.removeItem('mb_guild');
 }
 
-let token = sessionStorage.getItem('mb_token') || localStorage.getItem('mb_token') || '';
 let guilds = [], selected = sessionStorage.getItem('mb_guild') || localStorage.getItem('mb_guild') || null;
 let state = null, lastStateAt = 0, playlists = [], playlistsGuild = null;
 let activeView = localStorage.getItem('mb_view') || 'player', openPlaylistName = null;
@@ -1249,8 +1282,7 @@ applyTheme(theme);
 
 const basePath = window.location.pathname.endsWith('/') ? window.location.pathname : window.location.pathname + '/';
 
-function hdrs() { return token ? {'X-Auth-Token': token, 'Content-Type': 'application/json'}
-                               : {'Content-Type': 'application/json'}; }
+function hdrs() { return {'Content-Type': 'application/json'}; }
 async function api(path, opts) {
   const r = await fetch(path, Object.assign({headers: hdrs()}, opts || {}));
   if (r.status === 401) { document.getElementById('login').style.display = 'flex'; throw new Error('auth'); }
@@ -1261,9 +1293,24 @@ async function api(path, opts) {
   }
   return r.json();
 }
-function savePw() {
-  token = document.getElementById('pw').value;
-  localStorage.setItem('mb_token', token);
+async function exchangeLinkToken() {
+  if(!linkToken || !urlGuild)return true;
+  const r = await fetch(basePath + 'api/session', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token:linkToken,guild_id:urlGuild})
+  });
+  history.replaceState(null,'',location.pathname+'?guild_id='+encodeURIComponent(urlGuild));
+  if(!r.ok){document.getElementById('login').style.display='flex';return false}
+  return true;
+}
+async function savePw() {
+  const password = document.getElementById('pw').value;
+  const r = await fetch(basePath + 'api/session', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password})
+  });
+  if(!r.ok){ toast('❌ Invalid password'); return; }
+  document.getElementById('pw').value = '';
   document.getElementById('login').style.display = 'none';
   refreshGuilds();
 }
@@ -1427,10 +1474,9 @@ async function uploadPlaylistCover(file) {
   if (!file) return;
   if (file.size > 4 * 1024 * 1024) { toast('❌ Cover must be smaller than 4 MB.'); return; }
   const form = new FormData(); form.append('name', openPlaylistName); form.append('cover', file);
-  const headers = token ? {'X-Auth-Token': token} : {};
   try {
     toast('⏳ Uploading cover…');
-    const response = await fetch(basePath + 'api/guilds/' + selected + '/playlist-cover', {method:'POST', headers, body:form});
+    const response = await fetch(basePath + 'api/guilds/' + selected + '/playlist-cover', {method:'POST', body:form});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Upload failed');
     playlists = result.playlists || playlists; toast('✓ Playlist cover updated.'); render();
@@ -2062,7 +2108,7 @@ requestAnimationFrame(deckFrame);
 setInterval(refreshGuilds, 10000);
 setInterval(refreshState, 3000);
 setInterval(tickProgress, 500);
-refreshGuilds();
+exchangeLinkToken().then(ok=>{if(ok)refreshGuilds()});
 </script>
 </body>
 </html>

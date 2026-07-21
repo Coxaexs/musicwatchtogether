@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import config
+from storage import load_json, save_json
 
 # Setup musics folder for downloaded songs
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2837,13 +2838,7 @@ class MusicCog(commands.Cog):
             return {}
 
     def _save_guild_settings(self):
-        try:
-            tmp_path = self.SETTINGS_FILE + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(self.guild_settings, f, indent=2, sort_keys=True)
-            os.replace(tmp_path, self.SETTINGS_FILE)
-        except Exception as e:
-            logger.warning(f"Could not save guild settings: {e}")
+        save_json(self.SETTINGS_FILE, self.guild_settings, logger)
 
     def set_artist_diversity(self, player: MusicPlayer, enabled: bool):
         """Persist the Smart Autoplay artist-streak preference for a server."""
@@ -4407,12 +4402,7 @@ class MusicCog(commands.Cog):
             break
 
         # Save to local cache (even if None, so we don't request it again)
-        try:
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Error writing lyrics cache for {query}: {e}")
+        save_json(cache_path, result, logger)
 
         return result
 
@@ -5500,15 +5490,10 @@ class MusicCog(commands.Cog):
     PLAYLISTS_FILE = os.path.join(BOT_DIR, 'playlists.json')
 
     def _read_playlists(self) -> dict:
-        try:
-            with open(self.PLAYLISTS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+        return load_json(self.PLAYLISTS_FILE, {}, logger)
 
     def _write_playlists(self, data: dict):
-        with open(self.PLAYLISTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        save_json(self.PLAYLISTS_FILE, data, logger)
 
     playlist = app_commands.Group(name="playlist", description="Save and load the queue as a named playlist")
 
@@ -5643,11 +5628,7 @@ class MusicCog(commands.Cog):
         feats['mtime'] = mtime
         self._audio_features[path] = feats
         with self._features_lock:
-            try:
-                with open(self.FEATURES_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(self._audio_features, f, ensure_ascii=False)
-            except Exception as e:
-                logger.debug(f"Could not save audio features: {e}")
+            save_json(self.FEATURES_FILE, self._audio_features, logger)
         return feats
 
     @staticmethod
@@ -5692,8 +5673,7 @@ class MusicCog(commands.Cog):
         return _load_json_file(self.DISLIKES_FILE, {})
 
     def _write_dislikes(self, data: dict):
-        with open(self.DISLIKES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        save_json(self.DISLIKES_FILE, data, logger)
 
     def toggle_dislike(self, user_id: int, song: Song) -> tuple[bool, str]:
         """Add or remove a song from a user's dislikes. Returns (added, title)."""
@@ -5763,8 +5743,7 @@ class MusicCog(commands.Cog):
             return {}
 
     def _write_favorites(self, data: dict):
-        with open(self.FAVORITES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        save_json(self.FAVORITES_FILE, data, logger)
 
     def toggle_favorite(self, user_id: int, song: Song) -> tuple[bool, str]:
         """Add or remove a song from a user's favorites. Returns (added, title)."""
@@ -6120,8 +6099,8 @@ class MusicCog(commands.Cog):
                             except Exception as e:
                                 logger.warning(f"Wrapped auto-post failed for {guild.name}: {e}")
 
-                        with open(self.WRAPPED_STATE_FILE, 'w', encoding='utf-8') as f:
-                            json.dump({'last_posted': month_key}, f)
+                        save_json(self.WRAPPED_STATE_FILE,
+                                  {'last_posted': month_key}, logger)
             except Exception as e:
                 logger.warning(f"Wrapped auto-post loop error: {e}")
             await asyncio.sleep(6 * 3600)
@@ -6201,10 +6180,7 @@ class MusicCog(commands.Cog):
                 serialized = json.dumps(state, ensure_ascii=False, sort_keys=True)
                 if serialized == self._last_saved_state:
                     continue
-                tmp_path = self.STATE_FILE + '.tmp'
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    f.write(serialized)
-                os.replace(tmp_path, self.STATE_FILE)
+                save_json(self.STATE_FILE, state, logger)
                 self._last_saved_state = serialized
             except asyncio.CancelledError:
                 return
@@ -6658,7 +6634,7 @@ class MusicCog(commands.Cog):
         if base_url.endswith("/"):
             base_url = base_url[:-1]
             
-        url = f"{base_url}/musicbot/?guild_id={interaction.guild.id}&token={token}"
+        url = f"{base_url}/musicbot/?guild_id={interaction.guild.id}#token={token}"
         
         await interaction.response.send_message(
             f"🔗 **Web Player Link:** [Control Dashboard]({url})\n"
@@ -6973,11 +6949,7 @@ class MusicCog(commands.Cog):
                     
                     # Update cache periodically (every 10 songs)
                     if len(all_discovered) % 5 == 0:
-                        try:
-                            with open(cache_json, 'w') as f:
-                                json.dump(all_discovered, f, indent=2)
-                        except:
-                            pass
+                        save_json(cache_json, all_discovered, logger)
                     
                     await asyncio.sleep(0.01)  # Yield to other tasks
             
@@ -6987,11 +6959,7 @@ class MusicCog(commands.Cog):
                     player.queue.append(song)
             
             # Final cache update
-            try:
-                with open(cache_json, 'w') as f:
-                    json.dump(all_discovered, f, indent=2)
-            except:
-                pass
+            save_json(cache_json, all_discovered, logger)
             
             logger.info(f"✅ Background scan complete: {len(all_discovered)} total songs")
             
