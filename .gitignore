@@ -33,6 +33,7 @@ webstatic/adguard.xpi
 
 # ---- logs ----
 *.log
+*.log.*
 logs/
 backups/
 
@@ -49,6 +50,7 @@ playlists.json
 playlist_meta.json
 playlist_covers/
 stats.jsonl
+audio_features.json
 .cache
 
 # ---- editor / os ----
