@@ -39,6 +39,7 @@ from security import (
     PublicURLRequired, SlidingWindowLimiter, client_identity,
     validate_public_url,
 )
+from runtime import TaskRegistry, increment, prometheus
 from storage import load_json, save_json
 
 try:
@@ -61,8 +62,12 @@ MAX_MEDIA_CACHE = 10           # WatchTogether + ReelsTogether files combined
 REELS_HISTORY = 5              # recent backward history within the shared cache cap
 CHAT_HISTORY = 100
 MAX_ACTIVE_ROOMS = 50
+MAX_ROOM_PARTICIPANTS = 100
+MAX_RETAINED_ROOM_MEMBERS = 500
 MAX_ROOM_TOKENS = 500
 MAX_QUEUE_ITEMS = 200
+MAX_ROOM_PLAYLISTS = 30
+MAX_PLAYLIST_ITEMS = 50
 ROOM_IDLE_TTL = 2 * 3600
 GLOBAL_DOWNLOADS = 4
 REELS_READY_AHEAD = 3          # keep this many reels downloaded ahead of the cursor
@@ -70,6 +75,7 @@ REELS_MAX_DURATION = 150       # seconds - skip anything longer in the shorts fe
 HLS_MIN_DURATION = 8 * 60      # longer than this -> stream while downloading
 
 SETTINGS_FILE = os.path.join(BASE_DIR, 'room_settings.json')
+ROOM_PLAYLISTS_FILE = os.path.join(BASE_DIR, 'room_playlists.json')
 DEFAULT_SETTINGS = {'adblock': True, 'sponsorblock': True, 'quality': 720}
 SB_CATEGORIES = ['sponsor', 'selfpromo', 'interaction']
 
@@ -79,9 +85,21 @@ DEFAULT_TOPICS = [
     'street food', 'car', 'basketball', 'animals',
 ]
 
-global_download_sem = asyncio.Semaphore(GLOBAL_DOWNLOADS)
+global_download_sem = None
 create_limiter = SlidingWindowLimiter(8, 10 * 60)
 message_limiter = SlidingWindowLimiter(120, 60)
+task_registry = TaskRegistry('watch')
+
+
+def _spawn(coroutine, name):
+    return task_registry.create(coroutine, name)
+
+
+def _global_download_limiter():
+    global global_download_sem
+    if global_download_sem is None:
+        global_download_sem = asyncio.Semaphore(GLOBAL_DOWNLOADS)
+    return global_download_sem
 
 STOPWORDS = {
     'the', 'and', 'for', 'with', 'this', 'that', 'you', 'your', 'shorts',
@@ -143,6 +161,7 @@ def _save_json(path, data):
 tokens = _load_json(TOKENS_FILE, {})
 profiles = _load_json(PROFILES_FILE, {})
 room_settings = _load_json(SETTINGS_FILE, {})
+room_playlists = _load_json(ROOM_PLAYLISTS_FILE, {})
 
 
 def get_settings(room_id):
@@ -220,8 +239,11 @@ class Room:
         self.position = 0.0
         self.pos_ts = time.monotonic()
         self.chat = deque(maxlen=CHAT_HISTORY)
-        self.sockets = {}          # ws -> {'name': str}
-        self.dl_sem = asyncio.Semaphore(2)
+        self.sockets = {}          # ws -> {'id': str, 'name': str, 'role': str, 'order': int}
+        self.roles = {}            # private member session -> role
+        self.member_ids = {}       # private member session -> public UI id
+        self._join_sequence = 0
+        self.dl_sem = None
         self.reels_task = None
         self.sync_task = None
         self._advanced_past = -1   # 'ended' debounce
@@ -250,12 +272,60 @@ class Room:
             return self.queue[self.index]
         return None
 
+    def download_limiter(self):
+        if self.dl_sem is None:
+            self.dl_sem = asyncio.Semaphore(2)
+        return self.dl_sem
+
     def save_profile(self):
         profiles[self.id] = {
             'interests': self.interests,
             'seen': list(self.seen)[-500:],
         }
         _save_json(PROFILES_FILE, profiles)
+
+    def join(self, ws, member_session, name):
+        self._join_sequence += 1
+        if member_session not in self.roles:
+            active_sessions = {member['session'] for member in self.sockets.values()}
+            removable = [session for session, role in self.roles.items()
+                         if session not in active_sessions and role != 'host']
+            while len(self.roles) >= MAX_RETAINED_ROOM_MEMBERS and removable:
+                expired_session = removable.pop(0)
+                self.roles.pop(expired_session, None)
+                self.member_ids.pop(expired_session, None)
+            has_host = any(role == 'host' for role in self.roles.values())
+            self.roles[member_session] = 'viewer' if has_host else 'host'
+        public_id = self.member_ids.setdefault(member_session, secrets.token_urlsafe(9))
+        member = {
+            'id': public_id,
+            'session': member_session,
+            'name': name,
+            'role': self.roles[member_session],
+            'order': self._join_sequence,
+        }
+        self.sockets[ws] = member
+        return member
+
+    def role_for(self, member_session):
+        return self.roles.get(member_session, 'viewer')
+
+    def ensure_active_host(self):
+        active = sorted(self.sockets.values(), key=lambda member: member['order'])
+        if any(member['role'] == 'host' for member in active):
+            return None
+        active_sessions = {member['session'] for member in active}
+        for member_session, role in list(self.roles.items()):
+            if role == 'host' and member_session not in active_sessions:
+                self.roles[member_session] = 'moderator'
+        replacement = next((member for member in active if member['role'] == 'moderator'),
+                           active[0] if active else None)
+        if replacement:
+            old_role = replacement['role']
+            replacement['role'] = 'host'
+            self.roles[replacement['session']] = 'host'
+            return replacement, old_role
+        return None
 
 
 rooms = {}
@@ -286,6 +356,7 @@ def _get_room(room_id, name=None):
                 raise RuntimeError('server room limit reached')
         room = Room(room_id, name)
         rooms[room_id] = room
+        increment('rooms_created_total')
     elif name and room.name != name:
         room.name = name
     return room
@@ -294,6 +365,11 @@ def _get_room(room_id, name=None):
 def _room_cookie_name(room_id):
     safe = re.sub(r'[^A-Za-z0-9_]', '_', room_id)[:64]
     return f'wt_session_{safe}'
+
+
+def _room_member_cookie_name(room_id):
+    safe = re.sub(r'[^A-Za-z0-9_]', '_', room_id)[:64]
+    return f'wt_member_{safe}'
 
 
 def _request_room_token(request, room_id):
@@ -339,6 +415,27 @@ def _safe_float(value, default=0.0, minimum=0.0, maximum=7 * 86400.0):
     return max(minimum, min(maximum, parsed))
 
 
+def _can_moderate(member):
+    return bool(member and member.get('role') in ('host', 'moderator'))
+
+
+def _is_host(member):
+    return bool(member and member.get('role') == 'host')
+
+
+def _playlist_summaries(room_id):
+    playlists = room_playlists.get(room_id, {})
+    return [
+        {
+            'name': name,
+            'count': len(value.get('items') or []),
+            'updated_by': value.get('updated_by'),
+            'updated_at': value.get('updated_at'),
+        }
+        for name, value in sorted(playlists.items(), key=lambda pair: pair[0].lower())
+    ]
+
+
 def _item_public(item):
     return {k: item.get(k) for k in
             ('uid', 'vid', 'title', 'duration', 'thumbnail', 'status',
@@ -380,7 +477,11 @@ def _room_state(room):
         'playing': room.playing, 'position': round(room.get_position(), 2),
         'queue': [_item_public(i) for i in items],
         'total': len(room.queue),
-        'participants': sorted({m['name'] for m in room.sockets.values()}),
+        'participants': [
+            {'id': member['id'], 'name': member['name'], 'role': member['role']}
+            for member in sorted(room.sockets.values(), key=lambda value: value['order'])
+        ],
+        'playlists': _playlist_summaries(room.id),
         'chat': list(room.chat)[-50:],
         'need_seed': room.mode == 'reels' and not room.interests and not room.queue,
         'browser': (cobrowser.get(room.id).public_state()
@@ -399,6 +500,7 @@ async def _broadcast(room, payload):
             dead.append(ws)
     for ws in dead:
         room.sockets.pop(ws, None)
+    room.ensure_active_host()
 
 
 async def _broadcast_state(room):
@@ -617,14 +719,26 @@ def _protected_files(extra=()):
 
 async def _download_item(room, item):
     """Apply both global and per-room capacity before doing network work."""
-    async with global_download_sem:
-        await _download_item_inner(room, item)
+    increment('downloads_started_total')
+    try:
+        async with _global_download_limiter():
+            await _download_item_inner(room, item)
+        if item.get('status') in ('ready', 'embed'):
+            increment('downloads_completed_total')
+        else:
+            increment('downloads_failed_total')
+    except asyncio.CancelledError:
+        increment('downloads_cancelled_total')
+        raise
+    except Exception:
+        increment('downloads_failed_total')
+        raise
 
 
 async def _download_item_inner(room, item):
     cache_dir = REELS_CACHE_DIR if room.mode == 'reels' else WATCH_CACHE_DIR
     loop = asyncio.get_running_loop()
-    async with room.dl_sem:
+    async with room.download_limiter():
         if item.get('status') in ('ready', 'error'):
             return
         # cache hit?
@@ -702,8 +816,20 @@ async def _download_item_inner(room, item):
 
 
 async def _hls_item(room, item):
-    async with global_download_sem, room.dl_sem:
-        await _hls_item_inner(room, item)
+    increment('downloads_started_total')
+    try:
+        async with _global_download_limiter(), room.download_limiter():
+            await _hls_item_inner(room, item)
+        if item.get('status') == 'ready':
+            increment('downloads_completed_total')
+        else:
+            increment('downloads_failed_total')
+    except asyncio.CancelledError:
+        increment('downloads_cancelled_total')
+        raise
+    except Exception:
+        increment('downloads_failed_total')
+        raise
 
 
 async def _hls_item_inner(room, item):
@@ -862,9 +988,9 @@ async def _add_query(room, query, added_by, play_next=False):
         _learn(room, item, 3)
     await _broadcast_state(room)
     if room.mode == 'watch' and (info.get('duration') or 0) >= HLS_MIN_DURATION:
-        asyncio.create_task(_hls_item(room, item))
+        _spawn(_hls_item(room, item), f'hls:{room.id}:{item["uid"]}')
     else:
-        asyncio.create_task(_download_item(room, item))
+        _spawn(_download_item(room, item), f'download:{room.id}:{item["uid"]}')
 
 
 async def _sniff_or_fallback(room, item, err):
@@ -1074,7 +1200,7 @@ async def _reels_topup_inner(room):
         }
         room.queue.append(item)
         added += 1
-        asyncio.create_task(_download_item(room, item))
+        _spawn(_download_item(room, item), f'download:{room.id}:{item["uid"]}')
     if added:
         room.save_profile()
         await _broadcast_state(room)
@@ -1105,9 +1231,81 @@ async def _sync_loop(room):
         room.sync_task = None
 
 
+def _clean_playlist_name(value):
+    return re.sub(r'\s+', ' ', str(value or '').strip())[:50]
+
+
+async def _save_room_playlist(room, name, member):
+    name = _clean_playlist_name(name)
+    if not name:
+        await _notice(room, '❌ Give the playlist a name')
+        return
+    playlists = room_playlists.setdefault(room.id, {})
+    if name not in playlists and len(playlists) >= MAX_ROOM_PLAYLISTS:
+        await _notice(room, f'❌ Playlist limit reached ({MAX_ROOM_PLAYLISTS})')
+        return
+    items = []
+    for item in room.queue[:MAX_PLAYLIST_ITEMS]:
+        url = str(item.get('url') or '')
+        if not URL_RE.match(url):
+            continue
+        items.append({
+            'url': url,
+            'title': str(item.get('title') or '')[:200],
+            'duration': item.get('duration'),
+            'thumbnail': item.get('thumbnail'),
+            'uploader': item.get('uploader'),
+        })
+    if not items:
+        await _notice(room, '❌ There are no reusable URLs in the queue')
+        return
+    playlists[name] = {
+        'items': items,
+        'updated_by': member['name'],
+        'updated_at': time.time(),
+    }
+    _save_json(ROOM_PLAYLISTS_FILE, room_playlists)
+    increment('playlists_saved_total')
+    await _notice(room, f'💾 {member["name"]} saved “{name}” ({len(items)} items)')
+    await _broadcast_state(room)
+
+
+async def _load_room_playlist(room, name, member):
+    playlist = room_playlists.get(room.id, {}).get(_clean_playlist_name(name))
+    if not playlist:
+        await _notice(room, '❌ Playlist not found')
+        return
+    available = max(0, MAX_QUEUE_ITEMS - len(room.queue))
+    entries = list(playlist.get('items') or [])[:min(MAX_PLAYLIST_ITEMS, available)]
+    if not entries:
+        await _notice(room, '❌ The queue is full')
+        return
+    await _notice(room, f'📚 {member["name"]} is loading “{name}”…')
+    increment('playlists_loaded_total')
+    for entry in entries:
+        if task_registry.closing:
+            return
+        await _add_query(room, str(entry.get('url') or ''), member['name'])
+
+
+async def _delete_room_playlist(room, name, member):
+    name = _clean_playlist_name(name)
+    playlists = room_playlists.get(room.id, {})
+    if name not in playlists:
+        await _notice(room, '❌ Playlist not found')
+        return
+    playlists.pop(name, None)
+    if not playlists:
+        room_playlists.pop(room.id, None)
+    _save_json(ROOM_PLAYLISTS_FILE, room_playlists)
+    increment('playlists_deleted_total')
+    await _notice(room, f'🗑️ {member["name"]} deleted “{name}”')
+    await _broadcast_state(room)
+
+
 # ---------------------------------------------------------------- ws handler
 
-async def _handle_browser_message(room, ws, name, data):
+async def _handle_browser_message(room, ws, member, data):
     """Handle the co-browser/settings protocol; return whether it was handled."""
     event = data.get('t')
     browser_events = {
@@ -1117,6 +1315,11 @@ async def _handle_browser_message(room, ws, name, data):
     }
     if event not in browser_events:
         return False
+    name = member['name']
+    if not _can_moderate(member):
+        await _notice(room, f'🔒 {name}, that action requires a moderator')
+        increment('role_denials_total')
+        return True
     sess = cobrowser.get(room.id) if cobrowser else None
 
     if event == 'browser_start':
@@ -1237,7 +1440,7 @@ async def _handle_browser_message(room, ws, name, data):
         }
         room.queue.append(item)
         await _broadcast_state(room)
-        asyncio.create_task(_download_item(room, item))
+        _spawn(_download_item(room, item), f'download:{room.id}:{item["uid"]}')
     elif event == 'pick_choice':
         uid = str(data.get('uid') or '')
         url = str(data.get('url') or '')
@@ -1260,7 +1463,7 @@ async def _handle_browser_message(room, ws, name, data):
             item.pop('_choice_headers', None)
             await _notice(room, f"📹 {name} picked: {chosen.get('name', 'media')}")
             await _broadcast_state(room)
-            asyncio.create_task(_download_item(room, item))
+            _spawn(_download_item(room, item), f'download:{room.id}:{item["uid"]}')
     return True
 
 async def ws_handler(request):
@@ -1270,15 +1473,22 @@ async def ws_handler(request):
     if not info or info['room'] != room_id:
         raise web.HTTPUnauthorized(text='bad token')
 
-    ws = web.WebSocketResponse(heartbeat=30)
-    await ws.prepare(request)
     try:
         room = _get_room(room_id, info.get('name'))
     except RuntimeError as exc:
-        await ws.close(code=1013, message=str(exc).encode())
-        return ws
+        raise web.HTTPServiceUnavailable(text=str(exc))
+    if len(room.sockets) >= MAX_ROOM_PARTICIPANTS:
+        raise web.HTTPServiceUnavailable(text='room participant limit reached')
+
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
     name = 'Guest'
+    member = None
     joined = False
+    member_session = re.sub(
+        r'[^A-Za-z0-9_-]', '',
+        request.cookies.get(_room_member_cookie_name(room_id), ''),
+    )[:64] or secrets.token_urlsafe(24)
 
     try:
         async for msg in ws:
@@ -1291,6 +1501,7 @@ async def ws_handler(request):
             if not isinstance(data, dict):
                 continue
             t = data.get('t')
+            increment('websocket_messages_total')
             room.last_activity = time.monotonic()
             if not message_limiter.allow((room.id, id(ws))):
                 await ws.send_str(json.dumps(
@@ -1300,19 +1511,27 @@ async def ws_handler(request):
 
             if t == 'join':
                 name = str(data.get('name') or 'Guest')[:24].strip() or 'Guest'
-                room.sockets[ws] = {'name': name}
+                member = room.join(ws, member_session, name)
                 joined = True
+                increment('websocket_joins_total')
                 if room.sync_task is None:
-                    room.sync_task = asyncio.create_task(_sync_loop(room))
+                    room.sync_task = _spawn(_sync_loop(room), f'sync:{room.id}')
                 if room.mode == 'reels' and room.reels_task is None \
                         and (room.interests or room.queue):
-                    room.reels_task = asyncio.create_task(_reels_loop(room))
+                    room.reels_task = _spawn(_reels_loop(room), f'reels:{room.id}')
+                await ws.send_str(json.dumps({'t': 'welcome', 'id': member['id']}))
                 await ws.send_str(json.dumps(_room_state(room)))
-                await _notice(room, f'👋 {name} joined')
+                await _notice(room, f'👋 {name} joined as {member["role"]}')
                 await _broadcast_state(room)
                 continue
 
             if not joined:
+                continue
+
+            if room.mode == 'watch' and t in {'play', 'pause', 'seek', 'jump', 'skip'} and \
+                    not _can_moderate(member):
+                await _notice(room, f'🔒 {name}, playback controls require a moderator')
+                increment('role_denials_total')
                 continue
 
             if t == 'chat':
@@ -1352,8 +1571,8 @@ async def ws_handler(request):
                 q = str(data.get('q') or '').strip()
                 if q:
                     await _notice(room, f'➕ {name} added: {q[:80]}')
-                    asyncio.create_task(_add_query(room, q, name,
-                                                   bool(data.get('next'))))
+                    _spawn(_add_query(room, q, name, bool(data.get('next'))),
+                           f'add:{room.id}')
 
             elif t == 'jump':
                 idx = _safe_int(data.get('index'))
@@ -1377,6 +1596,10 @@ async def ws_handler(request):
                 await _broadcast_state(room)
 
             elif t == 'remove':
+                if not _can_moderate(member):
+                    await _notice(room, f'🔒 {name}, removing items requires a moderator')
+                    increment('role_denials_total')
+                    continue
                 idx = _safe_int(data.get('index'))
                 if 0 <= idx < len(room.queue) and idx != room.index:
                     room.queue.pop(idx)
@@ -1385,6 +1608,10 @@ async def ws_handler(request):
                     await _broadcast_state(room)
 
             elif t == 'remove_current':
+                if not _can_moderate(member):
+                    await _notice(room, f'🔒 {name}, removing items requires a moderator')
+                    increment('role_denials_total')
+                    continue
                 # drop the item being watched (e.g. a dead/unpickable one)
                 if 0 <= room.index < len(room.queue):
                     room.queue.pop(room.index)
@@ -1417,7 +1644,7 @@ async def ws_handler(request):
                     room.save_profile()
                     await _notice(room, f'✨ {name} seeded the feed: {text}')
                     if room.reels_task is None:
-                        room.reels_task = asyncio.create_task(_reels_loop(room))
+                        room.reels_task = _spawn(_reels_loop(room), f'reels:{room.id}')
                     await _broadcast_state(room)
 
             elif t == 'swipe' and room.mode == 'reels':
@@ -1442,7 +1669,7 @@ async def ws_handler(request):
                 else:
                     # out of reels: fetch more right now instead of waiting
                     # for the next loop tick
-                    asyncio.create_task(_reels_topup(room))
+                    _spawn(_reels_topup(room), f'topup:{room.id}')
                 await _broadcast_state(room)
 
             elif t == 'swipe_back' and room.mode == 'reels':
@@ -1476,14 +1703,57 @@ async def ws_handler(request):
                                             'uid': cur['uid'],
                                             'likes': cur['likes']})
 
-            elif await _handle_browser_message(room, ws, name, data):
+            elif t == 'playlist_save':
+                await _save_room_playlist(room, data.get('name'), member)
+
+            elif t == 'playlist_load':
+                playlist_name = _clean_playlist_name(data.get('name'))
+                _spawn(_load_room_playlist(room, playlist_name, member),
+                       f'playlist:{room.id}:{playlist_name}')
+
+            elif t == 'playlist_delete':
+                if not _can_moderate(member):
+                    await _notice(room, f'🔒 {name}, deleting playlists requires a moderator')
+                    increment('role_denials_total')
+                    continue
+                await _delete_room_playlist(room, data.get('name'), member)
+
+            elif t == 'role_set':
+                if not _is_host(member):
+                    await _notice(room, f'🔒 {name}, only the host can change roles')
+                    increment('role_denials_total')
+                    continue
+                target_id = re.sub(r'[^A-Za-z0-9_-]', '',
+                                   str(data.get('id') or ''))[:64]
+                role = str(data.get('role') or '')
+                target = next((value for value in room.sockets.values()
+                               if value['id'] == target_id), None)
+                if not target or role not in ('viewer', 'moderator', 'host'):
+                    continue
+                if role == 'host':
+                    if target['id'] == member['id']:
+                        continue
+                    member['role'] = 'moderator'
+                    room.roles[member['session']] = 'moderator'
+                elif target['role'] == 'host':
+                    continue
+                target['role'] = role
+                room.roles[target['session']] = role
+                await _notice(room, f'🛡️ {target["name"]} is now {role}')
+                await _broadcast_state(room)
+
+            elif await _handle_browser_message(room, ws, member, data):
                 pass
     finally:
         room.sockets.pop(ws, None)
         room.last_activity = time.monotonic()
         message_limiter.discard((room.id, id(ws)))
         if joined:
+            promoted = room.ensure_active_host()
             await _notice(room, f'💨 {name} left')
+            if promoted:
+                replacement, _old_role = promoted
+                await _notice(room, f'👑 {replacement["name"]} is now the host')
             await _broadcast_state(room)
     return ws
 
@@ -1513,10 +1783,19 @@ async def api_session(request):
         raise web.HTTPUnauthorized(text='bad token')
     response = web.json_response({'ok': True})
     forwarded_proto = request.headers.get('X-Forwarded-Proto', '')
+    cookies = getattr(request, 'cookies', {})
+    member_session = re.sub(
+        r'[^A-Za-z0-9_-]', '',
+        cookies.get(_room_member_cookie_name(room_id), ''),
+    )[:64] or secrets.token_urlsafe(24)
+    secure = request.secure or forwarded_proto == 'https'
     response.set_cookie(
         _room_cookie_name(room_id), token, max_age=TOKEN_TTL,
-        httponly=True, secure=request.secure or forwarded_proto == 'https',
+        httponly=True, secure=secure,
         samesite='Strict', path='/watch/')
+    response.set_cookie(
+        _room_member_cookie_name(room_id), member_session, max_age=TOKEN_TTL,
+        httponly=True, secure=secure, samesite='Strict', path='/watch/')
     return response
 
 
@@ -1610,8 +1889,48 @@ async def stream_ws(request):
     return ws
 
 
+def runtime_stats():
+    return {
+        'rooms': len(rooms),
+        'participants': sum(len(room.sockets) for room in rooms.values()),
+        'queued_items': sum(len(room.queue) for room in rooms.values()),
+        'background_tasks': task_registry.active,
+        'browser_sessions': len(cobrowser.sessions) if cobrowser else 0,
+    }
+
+
+def metrics_text():
+    return prometheus(runtime_stats())
+
+
+async def shutdown(_app=None):
+    """Stop accepting room work and release every external process/task."""
+    logger.info('Stopping Watch Together (%s rooms, %s tasks)',
+                len(rooms), task_registry.active)
+    sockets = [ws for room in rooms.values() for ws in room.sockets]
+    for ws in sockets:
+        try:
+            await ws.close(code=1001, message=b'server shutting down')
+        except Exception:
+            pass
+    if cobrowser:
+        try:
+            await cobrowser.stop_all()
+        except Exception:
+            logger.exception('Shared browsers did not all stop cleanly')
+    await task_registry.cancel_all()
+    _save_json(PROFILES_FILE, profiles)
+    _save_json(ROOM_PLAYLISTS_FILE, room_playlists)
+    rooms.clear()
+    increment('graceful_shutdowns_total')
+
+
 def setup(app, bot=None):
     import shutil
+    global task_registry, global_download_sem
+    if task_registry.closing:
+        task_registry = TaskRegistry('watch')
+        global_download_sem = None
     if cobrowser:
         cobrowser.cleanup_orphans()   # kill co-browsers leaked by a prior run
     os.makedirs(WATCH_CACHE_DIR, exist_ok=True)
@@ -1634,6 +1953,7 @@ def setup(app, bot=None):
     app.router.add_post('/watch/api/session', api_session)
     app.router.add_post('/watch/api/create', api_create)
     app.router.add_get('/watch/media/{room_id}/{file:.+}', media)
+    app.on_shutdown.append(shutdown)
     logger.info("🎬 Watch Together mounted at /watch/")
 
 
@@ -1698,6 +2018,9 @@ WATCH_HTML = r"""<!DOCTYPE html>
   button.primary{background:var(--accent)}
   .qhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
   .qhead h2{font-size:14px;margin:0;color:var(--muted)}
+  .playlistbar{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px}
+  .playlistbar input,.playlistbar select{background:var(--panel2);border:1px solid #333350;
+    color:var(--text);border-radius:8px;padding:8px 10px;min-width:120px}
   .qitem{display:flex;align-items:center;gap:10px;padding:8px 6px;border-bottom:1px solid #2a2a40;
          font-size:14px;border-radius:6px}
   .qitem:last-child{border-bottom:none}
@@ -1740,7 +2063,7 @@ WATCH_HTML = r"""<!DOCTYPE html>
   <h1><span class="dot" id="dot"></span>🎬 <span id="roomName">Watch Together</span></h1>
   <div class="who" id="who"></div>
   <button class="chip" style="cursor:pointer;border:1px solid var(--accent)" onclick="copyLink()">🔗 invite</button>
-  <button class="chip" style="cursor:pointer" onclick="openSettings()">⚙️</button>
+  <button id="settingsBtn" class="chip" style="cursor:pointer" onclick="openSettings()">⚙️</button>
 </div>
 <div class="layout">
   <div>
@@ -1786,6 +2109,13 @@ WATCH_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="card">
       <div class="qhead"><h2>📜 Up next</h2><span class="s" id="qcount"></span></div>
+      <div class="playlistbar">
+        <select id="roomPlaylist"><option value="">Shared playlists…</option></select>
+        <button onclick="loadPlaylist()">Load</button>
+        <button id="deletePlaylistBtn" onclick="deletePlaylist()">Delete</button>
+        <input id="playlistName" maxlength="50" placeholder="New playlist name">
+        <button class="primary" onclick="savePlaylist()">Save queue</button>
+      </div>
       <div id="queue"><div class="empty">Nothing queued — add something!</div></div>
     </div>
   </div>
@@ -1836,6 +2166,7 @@ WATCH_HTML = r"""<!DOCTYPE html>
 const P = new URLSearchParams(location.search);
 const ROOM = P.get('room') || '';
 const LINK_TOKEN = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+let CLIENT_ID='';
 let ws = null, st = null, myName = localStorage.getItem('wt_name') || '';
 let sup = {play:0, pause:0, seek:0};  // suppress echoing remote-triggered events
 let needGesture = true, syncAt = 0, endedSent = -1;
@@ -1873,7 +2204,8 @@ function connect(){
     setTimeout(connect, 2500)};
   ws.onmessage = e=>{
     let d; try{d=JSON.parse(e.data)}catch(_){return}
-    if(d.t==='state') applyState(d);
+    if(d.t==='welcome') CLIENT_ID=d.id;
+    else if(d.t==='state') applyState(d);
     else if(d.t==='sync') applySync(d);
     else if(d.t==='chat') addMsg(d);
     else if(d.t==='progress') updateProgress(d);
@@ -1887,6 +2219,32 @@ function curItem(){
   const i = st.index - st.offset;
   return (i>=0 && i<st.queue.length) ? st.queue[i] : null;
 }
+function me(){return st&&st.participants.find(p=>p.id===CLIENT_ID)}
+function canModerate(){const m=me();return m&&(m.role==='host'||m.role==='moderator')}
+function requireControl(){
+  if(canModerate())return true;
+  toast('🔒 Ask the host for moderator access');
+  if(st)applySync(st);
+  return false;
+}
+function roleIcon(role){return role==='host'?'👑':role==='moderator'?'🛡️':'👤'}
+function manageRole(id,role){
+  const m=me(); if(!m||m.role!=='host'||id===CLIENT_ID)return;
+  const next=prompt('Set role: viewer, moderator, or host',role);
+  if(next&&['viewer','moderator','host'].includes(next.toLowerCase()))
+    send({t:'role_set',id,role:next.toLowerCase()});
+}
+function renderPlaylists(){
+  const sel=document.getElementById('roomPlaylist'), current=sel.value;
+  sel.innerHTML='<option value="">Shared playlists…</option>'+((st&&st.playlists)||[]).map(p=>
+    `<option value="${encodeURIComponent(p.name)}">${esc(p.name)} (${p.count})</option>`).join('');
+  if([...sel.options].some(o=>o.value===current))sel.value=current;
+  document.getElementById('deletePlaylistBtn').disabled=!canModerate();
+  document.getElementById('settingsBtn').disabled=!canModerate();
+}
+function savePlaylist(){const n=document.getElementById('playlistName').value.trim();if(n){send({t:'playlist_save',name:n});document.getElementById('playlistName').value=''}}
+function loadPlaylist(){const v=document.getElementById('roomPlaylist').value;if(v)send({t:'playlist_load',name:decodeURIComponent(v)})}
+function deletePlaylist(){const v=document.getElementById('roomPlaylist').value,n=v?decodeURIComponent(v):'';if(n&&confirm('Delete “'+n+'”?'))send({t:'playlist_delete',name:n})}
 
 function applyState(d){
   const prev = st ? curItem() : null;
@@ -1895,10 +2253,11 @@ function applyState(d){
   document.getElementById('roomName').textContent = d.name;
   document.title = d.name + ' — Watch Together';
   document.getElementById('who').innerHTML = d.participants.map(p=>
-    `<span class="chip ${p===myName?'me':''}">${esc(p)}</span>`).join('');
+    `<span class="chip ${p.id===CLIENT_ID?'me':''}" title="${esc(p.role)}" onclick='manageRole(${JSON.stringify(p.id)},${JSON.stringify(p.role)})'>${roleIcon(p.role)} ${esc(p.name)}</span>`).join('');
   if(d.chat && !document.getElementById('msgs').childElementCount)
     d.chat.forEach(addMsg);
   renderQueue();
+  renderPlaylists();
   updateBrowserView();
   const cur = curItem();
   const failOvl = document.getElementById('failOvl');
@@ -1982,6 +2341,7 @@ function setVideoSrc(cur){
   }
 }
 function openSettings(){
+  if(!requireControl())return;
   if(!st || !st.settings) return;
   document.getElementById('setAdblock').checked = !!st.settings.adblock;
   document.getElementById('setSponsor').checked = !!st.settings.sponsorblock;
@@ -2069,10 +2429,12 @@ function stopStream(){
 }
 function resyncStream(){ stopStream(); startStream(); toast('⟳ jumped to live'); }
 function startBrowser(){
+  if(!requireControl())return;
   send({t:'browser_start'});
   toast('🌐 Starting the shared browser… (takes ~10s)');
 }
 function openInBrowser(){
+  if(!requireControl())return;
   const cur = curItem();
   send({t:'browser_start', url: cur ? (cur.url||'') : ''});
   toast('🌐 Starting the shared browser… (takes ~10s)');
@@ -2155,10 +2517,10 @@ document.getElementById('ovl').onclick = ()=>{
   if(st && st.playing){ sup.play++; tryPlay(); }
 };
 
-v.addEventListener('play', ()=>{ if(sup.play>0){sup.play--;return} send({t:'play',pos:v.currentTime}) });
+v.addEventListener('play', ()=>{ if(sup.play>0){sup.play--;return} if(!requireControl())return; send({t:'play',pos:v.currentTime}) });
 v.addEventListener('pause', ()=>{ if(v.ended)return; if(sup.pause>0){sup.pause--;return}
-  if(v.seeking)return; send({t:'pause',pos:v.currentTime}) });
-v.addEventListener('seeked', ()=>{ if(sup.seek>0){sup.seek--;return} send({t:'seek',pos:v.currentTime}) });
+  if(v.seeking||!requireControl())return; send({t:'pause',pos:v.currentTime}) });
+v.addEventListener('seeked', ()=>{ if(sup.seek>0){sup.seek--;return} if(!requireControl())return; send({t:'seek',pos:v.currentTime}) });
 v.addEventListener('ended', ()=>{ if(st && endedSent!==st.index){endedSent=st.index; send({t:'ended',index:st.index})} });
 
 function renderQueue(){
@@ -2179,10 +2541,10 @@ function renderQueue(){
     else status = fmt(it.duration);
     return `<div class="qitem ${now?'now':''}" data-uid="${it.uid}">`+
       (it.thumbnail?`<img src="${esc(it.thumbnail)}" loading="lazy">`:'<img>')+
-      `<span class="t" onclick="send({t:'jump',index:${gi}})" title="${esc(it.title)}">${now?'▶ ':''}${esc(it.title)}</span>`+
+      `<span class="t" onclick="if(requireControl())send({t:'jump',index:${gi}})" title="${esc(it.title)}">${now?'▶ ':''}${esc(it.title)}</span>`+
       `<span class="s" data-status>${status}</span>`+
       `<span class="s">${esc(it.added_by||'')}</span>`+
-      (now?'':`<span class="x" onclick="send({t:'remove',index:${gi}})">✖</span>`)+
+      (now||!canModerate()?'':`<span class="x" onclick="send({t:'remove',index:${gi}})">✖</span>`)+
       `</div>`;
   }).join('');
 }
@@ -2399,6 +2761,7 @@ REELS_HTML = r"""<!DOCTYPE html>
 const P = new URLSearchParams(location.search);
 const ROOM = P.get('room')||'';
 const LINK_TOKEN = new URLSearchParams(location.hash.slice(1)).get('token')||'';
+let CLIENT_ID='';
 let ws=null, st=null, myName=localStorage.getItem('wt_name')||'';
 let sup={play:0,pause:0,seek:0}, syncAt=0, swipeLock=0, watchedStart=0;
 const v=document.getElementById('v');
@@ -2431,7 +2794,8 @@ function connect(){
   ws.onclose=()=>setTimeout(connect,2500);
   ws.onmessage=e=>{
     let d; try{d=JSON.parse(e.data)}catch(_){return}
-    if(d.t==='state')applyState(d);
+    if(d.t==='welcome')CLIENT_ID=d.id;
+    else if(d.t==='state')applyState(d);
     else if(d.t==='sync')applySync(d);
     else if(d.t==='chat')addMsg(d);
     else if(d.t==='heart')onHeart(d);
@@ -2445,7 +2809,9 @@ function curItem(){
 function applyState(d){
   const prev=curItem(); const prevUid=prev?prev.uid:null;
   st=d; syncAt=Date.now();
-  document.getElementById('whoCount').textContent='👥 '+d.participants.length;
+  const mine=d.participants.find(p=>p.id===CLIENT_ID);
+  const badge=mine?(mine.role==='host'?' 👑':mine.role==='moderator'?' 🛡️':''):'';
+  document.getElementById('whoCount').textContent='👥 '+d.participants.length+badge;
   document.getElementById('seedOvl').classList.toggle('hidden', !d.need_seed);
   const cur=curItem();
   if(cur&&(cur.file||cur.status==='embed')){

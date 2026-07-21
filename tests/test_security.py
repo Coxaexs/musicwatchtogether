@@ -110,8 +110,11 @@ class SessionExchangeTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status, 200)
             name = watchtogether._room_cookie_name(room_id)
+            member_name = watchtogether._room_member_cookie_name(room_id)
             self.assertIn(name, response.cookies)
             self.assertTrue(response.cookies[name]["httponly"])
+            self.assertIn(member_name, response.cookies)
+            self.assertTrue(response.cookies[member_name]["httponly"])
         finally:
             watchtogether.tokens.pop(token, None)
 

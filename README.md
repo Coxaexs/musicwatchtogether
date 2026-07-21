@@ -12,7 +12,12 @@ A Discord music bot (`music.py`) with a browser-based control dashboard and a
 - 🎬 **Watch Together** (`watchtogether.py`) — synced video rooms with chat.
   Add anything yt-dlp resolves (YouTube, Shorts, Reels, TikTok, Twitter…).
   Long videos stream while they download (progressive HLS). Per-room settings
-  for quality, SponsorBlock, and adblock.
+  for quality, SponsorBlock, and adblock. Rooms have host, moderator, and viewer
+  roles; moderators manage playback and destructive queue actions, while the
+  host can assign roles.
+- 📚 **Collaborative room playlists** — participants can save the current
+  queue as a persistent shared playlist and load it together later. Moderators
+  can remove obsolete room playlists.
 - 📱 **ReelsTogether** — a synced, swipeable short-form feed with backward
   navigation through recent reels and a per-room taste algorithm. Watch and
   Reels rooms share a hard 10-video download cache.
@@ -39,7 +44,13 @@ for the `/watch/` + websocket routing.
 
 Set a strong `WEB_UI_PASSWORD` whenever `WEB_UI_HOST` is not loopback. Room
 and dashboard invitation links exchange their fragment token for a scoped,
-HttpOnly session cookie. URL fragments are never sent to the reverse proxy.
+HttpOnly session cookie. Room roles use a separate private member cookie, so a
+participant cannot claim a privileged role by changing browser-side state. URL
+fragments are never sent to the reverse proxy.
+
+`GET /healthz` provides public liveness/readiness data for a reverse proxy or
+service manager. `GET /api/metrics` exposes Prometheus text metrics and follows
+the dashboard API authentication policy.
 
 ## Development
 

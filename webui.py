@@ -260,6 +260,27 @@ class WebUI:
         self._set_session_cookie(request, response, token)
         return response
 
+    async def health(self, request):
+        try:
+            import watchtogether
+            watch = watchtogether.runtime_stats()
+        except Exception:
+            watch = {}
+        return web.json_response({
+            'status': 'ok',
+            'ready': bool(self.bot and self.bot.is_ready()),
+            'watch': watch,
+        }, headers={'Cache-Control': 'no-store'})
+
+    async def api_metrics(self, request):
+        import watchtogether
+        return web.Response(
+            text=watchtogether.metrics_text(),
+            content_type='text/plain',
+            charset='utf-8',
+            headers={'Cache-Control': 'no-store'},
+        )
+
     async def api_guilds(self, request):
         guilds = []
         allowed_guild_id = self._get_allowed_guild_id(request)
@@ -825,7 +846,9 @@ async def start_web_server(bot):
     ui = WebUI(bot)
     app = web.Application(middlewares=[ui.auth_middleware], client_max_size=6 * 1024 ** 2)
     app.router.add_get('/', ui.index)
+    app.router.add_get('/healthz', ui.health)
     app.router.add_post('/api/session', ui.api_session)
+    app.router.add_get('/api/metrics', ui.api_metrics)
     app.router.add_get('/api/guilds', ui.api_guilds)
     app.router.add_get('/api/guilds/{guild_id}', ui.api_guild_state)
     app.router.add_post('/api/guilds/{guild_id}/action', ui.api_action)
@@ -850,6 +873,7 @@ async def start_web_server(bot):
     await site.start()
     protected = "password-protected" if config.WEB_UI_PASSWORD else "no password set"
     logger.info(f"🌐 Web UI running on http://{config.WEB_UI_HOST}:{config.WEB_UI_PORT} ({protected})")
+    return runner
 
 
 INDEX_HTML = r"""<!DOCTYPE html>

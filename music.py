@@ -6275,6 +6275,31 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 logger.error(f"State restore failed: {e}", exc_info=True)
 
+    async def shutdown(self):
+        """Persist the final player snapshot and stop owned background work."""
+        tasks = [self._state_saver_task, self._wrapped_task]
+        tasks.extend(self.lyricsnow_tasks.values())
+        tasks.extend(self.nowplaying_tasks.values())
+        for player in self.players.values():
+            player.cancel_idle_disconnect()
+            player.cancel_autoplay_prefetch()
+            player.cancel_automix()
+            player.clear_preloads()
+            for attr in ('sleep_timer_task',):
+                task = getattr(player, attr, None)
+                if task:
+                    tasks.append(task)
+                    setattr(player, attr, None)
+        tasks = [task for task in tasks if task and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.lyricsnow_tasks.clear()
+        self.nowplaying_tasks.clear()
+        save_json(self.STATE_FILE, self.snapshot_player_state(), logger)
+        logger.info("Music background tasks stopped cleanly")
+
     # ---------- audio filters & crossfade ----------
 
     @app_commands.command(name="filter", description="Apply an audio filter to playback")
@@ -7260,13 +7285,22 @@ async def on_voice_state_update(member, before, after):
 
 async def main():
     async with bot:
-        await bot.add_cog(MusicCog(bot))
+        cog = MusicCog(bot)
+        await bot.add_cog(cog)
+        web_runner = None
         try:
             import webui
-            await webui.start_web_server(bot)
+            web_runner = await webui.start_web_server(bot)
         except Exception as e:
             logger.error(f"Web UI failed to start (bot will run without it): {e}")
-        await bot.start(config.DISCORD_TOKEN)
+        try:
+            await bot.start(config.DISCORD_TOKEN)
+        finally:
+            try:
+                await cog.shutdown()
+            finally:
+                if web_runner:
+                    await web_runner.cleanup()
 
 
 if __name__ == "__main__":
