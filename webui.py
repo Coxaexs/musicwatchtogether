@@ -104,6 +104,8 @@ def _song_json(song):
         'requester': getattr(song.requester, 'display_name', str(song.requester)),
         'source_type': song.source_type,
         'thumbnail': _thumbnail_from_url(song.url, song.thumbnail),
+        'autoplay_score': getattr(song, 'autoplay_score', None),
+        'autoplay_reason': getattr(song, 'autoplay_reason', None),
     }
 
 
@@ -434,6 +436,7 @@ class WebUI:
             elif action == 'skip':
                 player.loop = False
                 if vc:
+                    player._end_reason = 'skip'
                     vc.stop()
             elif action == 'previous':
                 history = list(player.history)
@@ -448,6 +451,7 @@ class WebUI:
                     player.queue.appendleft(previous)
                     player.clear_preloads()
                     if vc and (vc.is_playing() or vc.is_paused()):
+                        player._end_reason = 'manual'
                         vc.stop()
                     elif vc:
                         await player.play_next()
@@ -467,6 +471,7 @@ class WebUI:
                 player.cancel_autoplay_prefetch()
                 player.reset_playback_clock()
                 if vc:
+                    player._end_reason = 'stop'
                     vc.stop()
             elif action == 'shuffle':
                 import random
@@ -602,6 +607,7 @@ class WebUI:
                     for _ in range(index):
                         player.queue.popleft()
                     player.loop = False
+                    player._end_reason = 'manual'
                     vc.stop()  # after_playing advances to the new queue head
             elif action == 'seek':
                 seconds = body.get('seconds')
@@ -1911,6 +1917,7 @@ function render() {
       html += `<div class="vinyl-info">
         <div class="title">${esc(c.title)}</div>
         <div class="sub">requested by ${esc(c.requester)}${s.channel ? ' • 🔊 ' + esc(s.channel) : ''}${s.is_247 ? ' • 🔄 24/7' : ''}</div>
+        ${c.autoplay_reason ? `<div class="sub" title="${esc(c.autoplay_reason)}">🧭 ${esc(c.autoplay_reason)}</div>` : ''}
         <div class="times"><span id="pos"></span><span>${esc(c.duration)}</span></div>
       </div>`;
     } else {
@@ -1924,6 +1931,7 @@ function render() {
         <div class="title">${esc(c.title)}</div>
         <div class="sub">requested by ${esc(c.requester)}${s.channel ? ' • 🔊 ' + esc(s.channel) : ''}` +
         `${s.is_247 ? ' • 🔄 24/7' : ''}</div>
+        ${c.autoplay_reason ? `<div class="sub" title="${esc(c.autoplay_reason)}">🧭 ${esc(c.autoplay_reason)}</div>` : ''}
         <div class="bar" onclick="seekProgress(event)"><div id="pbar"></div></div>
         <div class="times"><span id="pos"></span><span>${esc(c.duration)}</span></div>
       </div></div>`;

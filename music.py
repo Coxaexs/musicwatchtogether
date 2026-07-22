@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Optional
 import aiohttp
 import ctypes.util
+import difflib
 import re
 import json
 import random
@@ -76,7 +77,10 @@ if DOWNLOADS_FOLDER != MUSICS_FOLDER:
 
 LYRICSNOW_AHEAD_SECONDS = 2
 IDLE_DISCONNECT_SECONDS = 300
-AUTOPLAY_PREFETCH_SECONDS = 75  # lookup must finish well before the last 20s / AutoMix window
+AUTOPLAY_SELECT_DELAY_SECONDS = 12  # rank/validate while most of the song is still ahead
+AUTOPLAY_COMMIT_SECONDS = 90        # only enter the public queue near the final 90s
+AUTOPLAY_SCORE_TEMPERATURE = 18.0   # lower = safer picks; higher = more discovery
+AUTOPLAY_TRANSITION_HALF_LIFE_DAYS = 45
 
 # ---------- audio filter chains ----------
 # Every source is decoded through FFmpeg, so filters are plain -af chains.
@@ -118,6 +122,7 @@ AUTOMIX_BPM_MIN = 60.0
 AUTOMIX_BPM_MAX = 200.0
 AUTOMIX_BPM_MIN_CONFIDENCE = 0.30  # normalized autocorrelation peak to trust a tempo
 AUTOMIX_MIN_ONSET_FLUX = 0.025     # mean log-energy rise; below this there is no beat to find
+AUTOMIX_OVERLAP_GAIN = 0.82        # leave headroom while two normalized tracks overlap
 
 # Give up on loading a song after this long so one giant/slow download can't
 # freeze the whole player (the queue just moves on to the next song)
@@ -222,7 +227,8 @@ def _rms_envelope(pcm: bytes, hop_samples: int) -> list:
             for i in range(0, len(pcm) - frame_bytes + 1, frame_bytes)]
 
 
-def _estimate_bpm(pcm: bytes, rate: int = AUTOMIX_ANALYSIS_RATE):
+def _estimate_bpm(pcm: bytes, rate: int = AUTOMIX_ANALYSIS_RATE,
+                  include_phase: bool = False):
     """Estimate tempo of mono s16 PCM via onset-energy autocorrelation.
 
     Returns (bpm, confidence). Confidence is the autocorrelation peak
@@ -231,10 +237,11 @@ def _estimate_bpm(pcm: bytes, rate: int = AUTOMIX_ANALYSIS_RATE):
     readings are acceptable here because _tempo_match_ratio treats them
     as the same groove.
     """
+    empty = (None, 0.0, None) if include_phase else (None, 0.0)
     hop, win = 128, 256
     total_samples = len(pcm) // 2
     if total_samples < rate * 10:  # need ~10s to lock onto a tempo
-        return None, 0.0
+        return empty
 
     energies = [audioop.rms(pcm[2 * s: 2 * (s + win)], 2)
                 for s in range(0, total_samples - win, hop)]
@@ -248,14 +255,14 @@ def _estimate_bpm(pcm: bytes, rate: int = AUTOMIX_ANALYSIS_RATE):
         prev = cur
     mean_onset = sum(onsets) / len(onsets)
     if mean_onset < AUTOMIX_MIN_ONSET_FLUX:
-        return None, 0.0  # too little energy movement: drone/silence, no beat
+        return empty  # too little energy movement: drone/silence, no beat
     onsets = [o - mean_onset for o in onsets]
 
     frames_per_sec = rate / hop
     min_lag = max(1, int(frames_per_sec * 60.0 / AUTOMIX_BPM_MAX))
     max_lag = int(frames_per_sec * 60.0 / AUTOMIX_BPM_MIN)
     if max_lag + 1 >= len(onsets):
-        return None, 0.0
+        return empty
 
     count = len(onsets) - max_lag
     zero_lag = sum(o * o for o in onsets[:count]) / count
@@ -269,7 +276,7 @@ def _estimate_bpm(pcm: bytes, rate: int = AUTOMIX_ANALYSIS_RATE):
     best_lag = max(scores, key=scores.get)
     best = scores[best_lag]
     if best <= 0 or zero_lag <= 0:
-        return None, 0.0
+        return empty
     confidence = best / zero_lag
 
     # Parabolic interpolation around the peak for sub-frame lag precision
@@ -280,7 +287,18 @@ def _estimate_bpm(pcm: bytes, rate: int = AUTOMIX_ANALYSIS_RATE):
         if abs(denom) > 1e-12:
             refined += 0.5 * (y0 - y2) / denom
 
-    return 60.0 * frames_per_sec / refined, confidence
+    bpm = 60.0 * frames_per_sec / refined
+    if not include_phase:
+        return bpm, confidence
+    # Strongest recurring onset position inside the beat period. This is a
+    # beat phase (not a full downbeat detector), but it lets both sources
+    # enter on the same pulse instead of merely sharing a BPM value.
+    phase_frame = max(
+        range(best_lag),
+        key=lambda phase: sum(max(0.0, onsets[i])
+                              for i in range(phase, len(onsets), best_lag)),
+    )
+    return bpm, confidence, phase_frame / frames_per_sec
 
 
 def _tempo_match_ratio(bpm_out: float, bpm_in: float) -> Optional[float]:
@@ -413,9 +431,18 @@ def analyze_track_edges(path: str) -> Optional[dict]:
             end_at = min(duration, tail_start + (i + 1) * hop / rate)
             break
 
-    bpm_head, conf_head = _estimate_bpm(head[int(start_at * rate) * 2:])
+    bpm_head, conf_head, phase_head = _estimate_bpm(
+        head[int(start_at * rate) * 2:], include_phase=True)
     tail_cut = int(max(0.0, end_at - tail_start) * rate) * 2
-    bpm_tail, conf_tail = _estimate_bpm(tail[:tail_cut])
+    bpm_tail, conf_tail, phase_tail = _estimate_bpm(
+        tail[:tail_cut], include_phase=True)
+
+    # Dense-to-dense overlaps are where vocals and full arrangements most
+    # often wash into each other. This inexpensive activity estimate is a
+    # conservative proxy when no source-separation model is available.
+    activity_floor = peak * 0.18
+    head_activity = sum(level >= activity_floor for level in head_env) / len(head_env)
+    tail_activity = sum(level >= activity_floor for level in tail_env) / len(tail_env)
 
     return {
         'duration': duration,
@@ -423,6 +450,12 @@ def analyze_track_edges(path: str) -> Optional[dict]:
         'end_at': end_at,
         'bpm_head': bpm_head if conf_head >= AUTOMIX_BPM_MIN_CONFIDENCE else None,
         'bpm_tail': bpm_tail if conf_tail >= AUTOMIX_BPM_MIN_CONFIDENCE else None,
+        'beat_phase_head': phase_head if conf_head >= AUTOMIX_BPM_MIN_CONFIDENCE else None,
+        'beat_phase_tail': ((tail_start + phase_tail)
+                            if phase_tail is not None and conf_tail >= AUTOMIX_BPM_MIN_CONFIDENCE
+                            else None),
+        'head_activity': round(head_activity, 3),
+        'tail_activity': round(tail_activity, 3),
     }
 
 
@@ -436,6 +469,7 @@ class AutoMixPlan:
     atempo: float = 1.0              # tempo stretch to match the outgoing song
     bpm_out: Optional[float] = None
     bpm_in: Optional[float] = None
+    release_seconds: Optional[float] = None  # resume the original tempo here
 
 
 class AutoMixTransition(discord.AudioSource):
@@ -448,17 +482,21 @@ class AutoMixTransition(discord.AudioSource):
     (a follow-up transition unwraps it again via active_source()).
     """
 
-    def __init__(self, outgoing, incoming, fade_seconds: float):
+    def __init__(self, outgoing, incoming, fade_seconds: float,
+                 continuation=None, on_release=None):
         if isinstance(outgoing, AutoMixTransition):
             outgoing = outgoing.active_source()  # don't nest finished transitions
         self.outgoing = outgoing
         self.incoming = incoming
+        self.continuation = continuation
+        self.on_release = on_release
+        self._active = incoming
         self.total_frames = max(1, int(fade_seconds * 1000 / 20))  # 20ms frames
         self.frames_done = 0
         self._outgoing_finished = False
 
     def active_source(self):
-        return self.incoming if self._outgoing_finished else self
+        return self._active if self._outgoing_finished else self
 
     @property
     def volume(self):
@@ -473,39 +511,68 @@ class AutoMixTransition(discord.AudioSource):
     def is_opus(self) -> bool:
         return False
 
-    def _finish_outgoing(self):
+    def _finish_outgoing(self, use_continuation: bool = False):
+        if self._outgoing_finished:
+            return
         self._outgoing_finished = True
         try:
             self.outgoing.cleanup()
         except Exception:
             pass
+        if self.continuation is not None and use_continuation:
+            try:
+                self.incoming.cleanup()
+            except Exception:
+                pass
+            self._active = self.continuation
+        if self.on_release and use_continuation:
+            try:
+                self.on_release()
+            except Exception:
+                pass
 
     def read(self) -> bytes:
-        in_frame = self.incoming.read()
+        try:
+            in_frame = self._active.read()
+        except Exception as exc:
+            logger.warning(f"AutoMix incoming source ended unexpectedly: {exc}")
+            in_frame = b''
         if self._outgoing_finished:
             return in_frame
-        out_frame = self.outgoing.read()
+        try:
+            out_frame = self.outgoing.read()
+        except Exception as exc:
+            # discord.py can clean the previous FFmpeg source during the live
+            # source swap. Treat that race exactly like a natural outro.
+            logger.debug(f"AutoMix outgoing source closed during handoff: {exc}")
+            out_frame = b''
         if not out_frame:
             self._finish_outgoing()
             return in_frame
 
         self.frames_done += 1
         progress = min(1.0, self.frames_done / self.total_frames)
-        faded_out = audioop.mul(out_frame, 2, math.cos(progress * math.pi / 2))
+        faded_out = audioop.mul(
+            out_frame, 2, AUTOMIX_OVERLAP_GAIN * math.cos(progress * math.pi / 2))
         if self.frames_done >= self.total_frames:
-            self._finish_outgoing()  # blend done; drop the old song's remainder
+            self._finish_outgoing(use_continuation=True)  # resume at native tempo
         if not in_frame:
             return faded_out  # incoming ran dry mid-blend; let the old song carry it
 
         if len(in_frame) < len(faded_out):
             in_frame += b'\x00' * (len(faded_out) - len(in_frame))
-        faded_in = audioop.mul(in_frame, 2, math.sin(progress * math.pi / 2))
+        faded_in = audioop.mul(
+            in_frame, 2, AUTOMIX_OVERLAP_GAIN * math.sin(progress * math.pi / 2))
         if len(faded_out) < len(faded_in):
             faded_out += b'\x00' * (len(faded_in) - len(faded_out))
         return audioop.add(faded_out, faded_in, 2)
 
     def cleanup(self):
-        for source in (self.outgoing, self.incoming):
+        seen = set()
+        for source in (self.outgoing, self.incoming, self.continuation):
+            if source is None or id(source) in seen:
+                continue
+            seen.add(id(source))
             try:
                 source.cleanup()
             except Exception:
@@ -1071,6 +1138,10 @@ class Song:
     genres: tuple[str, ...] = ()
     played_at: Optional[int] = None
     playlist: Optional[str] = None  # Saved-playlist name this song was queued from
+    autoplay: bool = False
+    autoplay_score: Optional[float] = None
+    autoplay_reason: Optional[str] = None
+    autoplay_traits: tuple[str, ...] = ()
 
 
 class YTDLSource(discord.PCMVolumeTransformer):
@@ -1346,6 +1417,7 @@ class MusicControlView(View):
 
         await interaction.response.send_message(f"⏮️ Going back to **{previous.title}**")
         if voice_client.is_playing() or voice_client.is_paused():
+            player._end_reason = 'manual'
             voice_client.stop()  # after_playing advances to the requeued previous song
         else:
             player.last_message_channel = interaction.channel
@@ -1390,6 +1462,7 @@ class MusicControlView(View):
         player = self.get_player()
         if player:
             player.loop = False
+            player._end_reason = 'skip'
 
         await interaction.response.defer()
         voice_client.stop()
@@ -1474,6 +1547,8 @@ class MusicControlView(View):
 
         voice_client = interaction.guild.voice_client
         if voice_client:
+            if player:
+                player._end_reason = 'stop'
             voice_client.stop()
 
         await interaction.response.send_message("⏹️ Stopped!", ephemeral=True)
@@ -1490,7 +1565,8 @@ class MusicControlView(View):
             await interaction.response.send_message("❌ No player found!", ephemeral=True)
             return
 
-        added, title = cog.toggle_dislike(interaction.user.id, player.current)
+        added, title = cog.toggle_dislike(
+            interaction.user.id, player.current, interaction.guild.id)
         if not added:
             await interaction.response.send_message(f"👍 Removed **{title}** from your dislikes.", ephemeral=True)
             return
@@ -1501,6 +1577,7 @@ class MusicControlView(View):
         vc = interaction.guild.voice_client
         if getattr(requester, 'bot', False) and vc and (vc.is_playing() or vc.is_paused()):
             player.loop = False
+            player._end_reason = 'skip'
             vc.stop()
             msg += " Skipping!"
         await interaction.response.send_message(msg, ephemeral=True)
@@ -1517,7 +1594,8 @@ class MusicControlView(View):
             await interaction.response.send_message("❌ No player found!", ephemeral=True)
             return
 
-        added, title = cog.toggle_favorite(interaction.user.id, player.current)
+        added, title = cog.toggle_favorite(
+            interaction.user.id, player.current, interaction.guild.id)
         if added:
             await interaction.response.send_message(f"❤️ Added **{title}** to your favorites! See them with `/favorites list`", ephemeral=True)
         else:
@@ -1905,6 +1983,9 @@ class MusicPlayer:
         self.vibe_match = True  # energy/genre matching + like-weighting in autoplay
         self._autoplay_prefetch_task: Optional[asyncio.Task] = None
         self._autoplay_pick_lock = asyncio.Lock()
+        self._autoplay_candidate: Optional[Song] = None
+        self._autoplay_candidate_for_key: Optional[str] = None
+        self._end_reason: Optional[str] = None
         self.sleep_timer_task: Optional[asyncio.Task] = None
         self.sleep_timer_ends_at: Optional[float] = None  # unix time, for display
         self.history = deque(maxlen=25)  # Recently played songs, newest first
@@ -1947,6 +2028,8 @@ class MusicPlayer:
         if task and not task.done() and task is not asyncio.current_task():
             task.cancel()
         self._autoplay_prefetch_task = None
+        self._autoplay_candidate = None
+        self._autoplay_candidate_for_key = None
 
     def clear_preloads(self):
         """Drop preloaded sources, killing the ffmpeg process each one holds."""
@@ -1969,7 +2052,12 @@ class MusicPlayer:
             if expected_key is not None and self.current_song_key != expected_key:
                 return None
 
-            pick = await self._pick_autoplay_song()
+            active_key = expected_key or self.current_song_key
+            pick = None
+            if self._autoplay_candidate_for_key == active_key:
+                pick = self._autoplay_candidate
+            if pick is None:
+                pick = await self._pick_autoplay_song()
             if not pick:
                 return None
             # Re-check after network lookups: playback or the queue may have
@@ -1980,15 +2068,46 @@ class MusicPlayer:
                 return None
             if expected_key is not None and self.current_song_key != expected_key:
                 return None
+            self._autoplay_candidate = None
+            self._autoplay_candidate_for_key = None
             self.queue.append(pick)
-            logger.info(f"⏱️ Autoplay prefetched: {pick.title}")
+            logger.info(f"⏱️ Autoplay committed: {pick.title}")
             return pick
 
+    async def _prepare_autoplay_candidate(self, song: Song, song_key: str):
+        """Rank early and cache privately without taking a human queue slot."""
+        async with self._autoplay_pick_lock:
+            if (self.current is not song or self.current_song_key != song_key
+                    or not self.autoplay or self.queue):
+                return None
+            pick = await self._pick_autoplay_song()
+            if not pick or self.current is not song or self.current_song_key != song_key:
+                return None
+            self._autoplay_candidate = pick
+            self._autoplay_candidate_for_key = song_key
+        logger.info(f"🧭 Autoplay prepared early: {pick.title}")
+        if pick.source_type != 'local':
+            try:
+                source = await YTDLSource.from_url(
+                    pick.url, loop=self.bot.loop, stream=True,
+                    audio_options=self.build_source_options(pick))
+                source.cleanup()  # the downloaded file remains in the cache
+            except Exception as exc:
+                logger.debug(f"Early autoplay cache failed for {pick.title}: {exc}")
+        return pick
+
     async def _autoplay_prefetch_watcher(self, song: Song, song_key: str):
-        """Resolve the next autoplay track well before AutoMix needs it."""
+        """Prepare early, but leave space for human requests until the outro."""
         try:
             duration = parse_duration_to_seconds(song.duration)
             if not duration:
+                return
+            await asyncio.sleep(min(AUTOPLAY_SELECT_DELAY_SECONDS, max(2, duration * 0.08)))
+            if (self.current is not song or self.current_song_key != song_key
+                    or not self.autoplay or self.queue):
+                return
+            pick = await self._prepare_autoplay_candidate(song, song_key)
+            if not pick:
                 return
             speed = FILTER_SPEED_FACTORS.get(self.audio_filter, 1.0) * self._automix_speed
             position = self.get_playback_position_seconds()
@@ -1997,14 +2116,14 @@ class MusicPlayer:
             ) * speed
             remaining_wall_time = max(0.0, (
                 max(0.0, duration - file_position) / max(0.01, speed)
-            ) - AUTOPLAY_PREFETCH_SECONDS)
+            ) - AUTOPLAY_COMMIT_SECONDS)
             await asyncio.sleep(remaining_wall_time)
             if (self.current is not song or self.current_song_key != song_key
                     or not self.autoplay or self.queue):
                 return
             pick = await self._ensure_autoplay_queued(song, song_key)
             if pick and self.current is song and self.current_song_key == song_key:
-                # Download/cache immediately so AutoMix can analyze the intro.
+                # Build the ready-to-read source now that the song is public.
                 await self.preload_next_song()
         except asyncio.CancelledError:
             return
@@ -2216,7 +2335,18 @@ class MusicPlayer:
             end_at = out_info['end_at']
             if end_at - self._automix_file_offset < AUTOMIX_MIN_TRACK_SECONDS:
                 return  # too short to be worth blending out of
-            trigger_at = end_at - effective_blend * speed - 0.2
+            def transition_trigger():
+                desired = end_at - effective_blend * speed - 0.2
+                bpm = out_info.get('bpm_tail')
+                phase = out_info.get('beat_phase_tail')
+                if bpm and phase is not None:
+                    beat_seconds = 60.0 / bpm
+                    # Begin on the last detected beat at or before the desired
+                    # overlap. Blend lengths are rounded to four-beat phrases.
+                    return phase + math.floor((desired - phase) / beat_seconds) * beat_seconds
+                return desired
+
+            trigger_at = transition_trigger()
 
             in_info = None
             in_path = None
@@ -2265,10 +2395,19 @@ class MusicPlayer:
                         # have compatible, trustworthy tempos. Otherwise the
                         # shorter transition avoids a long vocal-on-vocal wash.
                         if info and out_info.get('bpm_tail') and info.get('bpm_head'):
-                            ratio = _tempo_match_ratio(out_info['bpm_tail'], info['bpm_head'])
+                            incoming_speed = FILTER_SPEED_FACTORS.get(self.audio_filter, 1.0)
+                            audible_out_bpm = out_info['bpm_tail'] * speed
+                            audible_in_bpm = info['bpm_head'] * incoming_speed
+                            ratio = _tempo_match_ratio(audible_out_bpm, audible_in_bpm)
                             if ratio:
                                 effective_blend = blend
-                                trigger_at = end_at - effective_blend * speed - 0.2
+                                beat_wall = 60.0 / audible_out_bpm
+                                phrase_beats = max(4, round(effective_blend / beat_wall / 4) * 4)
+                                effective_blend = min(blend, phrase_beats * beat_wall)
+                        if (info and out_info.get('tail_activity', 0) >= 0.65
+                                and info.get('head_activity', 0) >= 0.65):
+                            effective_blend = min(effective_blend, 4.0)
+                        trigger_at = transition_trigger()
                         continue  # analysis took time; recompute the position first
 
                 if remaining <= 0.05:
@@ -2286,12 +2425,20 @@ class MusicPlayer:
             if in_info and analyzed_song is next_song and in_path:
                 plan.file_path = in_path
                 plan.start_seconds = in_info['start_at']
-                plan.bpm_out = out_info.get('bpm_tail')
-                plan.bpm_in = in_info.get('bpm_head')
+                incoming_speed = FILTER_SPEED_FACTORS.get(self.audio_filter, 1.0)
+                plan.bpm_out = ((out_info.get('bpm_tail') or 0) * speed) or None
+                plan.bpm_in = ((in_info.get('bpm_head') or 0) * incoming_speed) or None
                 if plan.bpm_out and plan.bpm_in:
                     ratio = _tempo_match_ratio(plan.bpm_out, plan.bpm_in)
                     if ratio:
                         plan.atempo = ratio
+                        phase = in_info.get('beat_phase_head')
+                        if phase is not None:
+                            plan.start_seconds += phase
+                        # The stretched decoder exists only for the overlap;
+                        # resume the file at native tempo on the next beat.
+                        plan.release_seconds = (
+                            plan.start_seconds + effective_blend * ratio * incoming_speed)
             await self.play_next(automix_plan=plan)
         except asyncio.CancelledError:
             pass
@@ -2306,6 +2453,15 @@ class MusicPlayer:
 
         self._play_next_running = True
         try:
+            outcome = self._end_reason or ('finished' if automix_plan else None)
+            self._end_reason = None
+            if outcome in ('finished', 'skip') and self.current:
+                cog = self.bot.get_cog('MusicCog')
+                if cog:
+                    try:
+                        await cog.record_autoplay_transition(self, outcome)
+                    except Exception as exc:
+                        logger.debug(f"Transition feedback failed: {exc}")
             if self.loop and self.current:
                 self.queue.appendleft(self.current)
             elif self.loop_queue and self.current:
@@ -2341,6 +2497,17 @@ class MusicPlayer:
                 self.schedule_idle_disconnect()
                 logger.info("Queue is empty, nothing to play")
                 return
+
+            # A human request always outranks a prepared autoplay item, even
+            # if it arrived after the 90-second commit point. Keep autoplay as
+            # the fallback behind every explicitly queued song.
+            if self.queue and self.queue[0].autoplay \
+                    and any(not queued.autoplay for queued in self.queue):
+                ordered = list(self.queue)
+                self.queue = deque(
+                    [queued for queued in ordered if not queued.autoplay]
+                    + [queued for queued in ordered if queued.autoplay])
+                automix_plan = None
 
             self.cancel_idle_disconnect()
             self.current = self.queue.popleft()
@@ -2411,6 +2578,7 @@ class MusicPlayer:
                         and voice_client.is_playing() and voice_client.source is not None):
                     handoff = automix_plan
 
+                continuation = None
                 if handoff and handoff.file_path:
                     # Open the analyzed local file directly: skip lead-in
                     # silence and stretch tempo to beat-match the outgoing song
@@ -2425,6 +2593,16 @@ class MusicPlayer:
                                                     extra_filters=extra_filters),
                     )
                     source = discord.PCMVolumeTransformer(raw, volume=self.volume)
+                    if handoff.release_seconds and abs(handoff.atempo - 1.0) >= 0.003:
+                        continuation_raw = discord.FFmpegPCMAudio(
+                            handoff.file_path,
+                            before_options=f'-ss {handoff.release_seconds:.2f}',
+                            options=build_audio_options(
+                                filter_name=self.audio_filter,
+                                extra_filters=['afade=t=in:st=0:d=0.08']),
+                        )
+                        continuation = discord.PCMVolumeTransformer(
+                            continuation_raw, volume=self.volume)
                     stale = self.preloaded_sources.pop(song_key, None)  # built for a normal start
                     if stale:
                         try:
@@ -2491,6 +2669,8 @@ class MusicPlayer:
                         logger.error(f"Player error: {error}", exc_info=error)
                     else:
                         logger.info("Song finished playing normally")
+                        if self._end_reason is None:
+                            self._end_reason = 'finished'
                     coro = self.play_next()
                     fut = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
                     try:
@@ -2501,7 +2681,19 @@ class MusicPlayer:
                 started_at_offset = 0.0
                 self._automix_speed = 1.0
                 if handoff:
-                    transition = AutoMixTransition(voice_client.source, source, handoff.fade_seconds)
+                    def release_tempo():
+                        if handoff.release_seconds is not None:
+                            self._automix_speed = 1.0
+                            self._automix_file_offset = handoff.release_seconds
+                            self.song_started_at = time.monotonic() - handoff.release_seconds
+                            logger.info(
+                                f"🎚️ AutoMix returned {self.current.title} to its configured tempo")
+
+                    transition = AutoMixTransition(
+                        voice_client.source, source, handoff.fade_seconds,
+                        continuation=continuation,
+                        on_release=release_tempo,
+                    )
                     swapped = False
                     try:
                         voice_client.source = transition
@@ -2591,8 +2783,11 @@ class MusicPlayer:
             # Bias toward songs people favorited so autoplay feels curated
             cog = self.bot.get_cog('MusicCog')
             if cog and random.random() < 0.4:
-                favorite = cog.pick_random_favorite(self.guild, exclude_urls={s.url for s in self.history})
+                favorite = cog.pick_random_favorite(
+                    self.guild, exclude_urls={s.url for s in self.history},
+                    user_ids=cog._listener_user_ids(self))
                 if favorite:
+                    favorite.autoplay = True
                     logger.info(f"🎲 Autoplay picked a favorite: {favorite.title}")
                     return favorite
 
@@ -2604,7 +2799,8 @@ class MusicPlayer:
                 files = list_library_files()
                 if not files:
                     return None, None
-                dis_urls, dis_titles, _counts = cog._dislike_index() if cog else (set(), set(), {})
+                dis_urls, dis_titles, _counts = cog._dislike_index(
+                    self.guild.id, cog._listener_user_ids(self)) if cog else (set(), set(), {})
                 fresh = []
                 for f in files:
                     if f in recent_urls or f in dis_urls:
@@ -2627,7 +2823,8 @@ class MusicPlayer:
                 if cog and duration_seconds else "Unknown",
                 requester=self.guild.me,
                 source_type='local',
-                artist=artist
+                artist=artist,
+                autoplay=True,
             )
         except Exception as e:
             logger.warning(f"Autoplay pick failed: {e}")
@@ -2831,6 +3028,8 @@ class MusicCog(commands.Cog):
         self._lyrics_file_cache = {}  # cache_path -> (mtime, parsed json)
         # Spotify-style audio features per local file, learned lazily
         self._audio_features = _load_json_file(self.FEATURES_FILE, {})
+        self._transition_feedback = state_store.load(
+            'autoplay_transition_feedback', {}, self.TRANSITIONS_FILE)
         self._features_lock = threading.Lock()
         self.guild_settings = self._load_guild_settings()
 
@@ -3011,6 +3210,8 @@ class MusicCog(commands.Cog):
                             'title': track.get('title_short') or track.get('title'),
                             'artist': (track.get('artist') or {}).get('name') or item.get('name'),
                             'album': (track.get('album') or {}).get('title'),
+                            'duration': track.get('duration'),
+                            'rank': track.get('rank') or 0,
                             'related': item['id'] != seed['id'],
                         } for track in data]
                     except Exception:
@@ -3026,169 +3227,389 @@ class MusicCog(commands.Cog):
         )
         return station
 
+    @staticmethod
+    def _listener_user_ids(player: MusicPlayer) -> set[int]:
+        voice = player.guild.voice_client
+        channel = getattr(voice, 'channel', None)
+        return {member.id for member in getattr(channel, 'members', [])
+                if not getattr(member, 'bot', False)}
+
+    @staticmethod
+    def _normalized_words(value: str) -> set[str]:
+        return set(re.findall(r'[a-z0-9\u00c0-\u024f]+', (value or '').lower()))
+
+    @classmethod
+    def _feedback_title_key(cls, title: str, artist: Optional[str] = None) -> str:
+        noise = {'official', 'audio', 'video', 'lyrics', 'lyric', 'hd', 'hq', 'topic'}
+        words = cls._normalized_words(title) - cls._normalized_words(artist or '') - noise
+        return ''.join(sorted(words))
+
+    @staticmethod
+    def _transition_traits(seed_artist: str, candidate_artist: str,
+                           seed_features: Optional[dict], candidate_features: Optional[dict],
+                           related_keys: Optional[set] = None) -> list[str]:
+        seed_key = MusicCog._artist_key(seed_artist)
+        candidate_key = MusicCog._artist_key(candidate_artist)
+        if seed_key and candidate_key and seed_key == candidate_key:
+            artist_trait = 'artist:same'
+        elif candidate_key and candidate_key in (related_keys or set()):
+            artist_trait = 'artist:related'
+        else:
+            artist_trait = 'artist:change'
+        traits = [artist_trait]
+        if seed_features and candidate_features:
+            ea, eb = seed_features.get('energy'), candidate_features.get('energy')
+            if ea is not None and eb is not None:
+                delta = eb - ea
+                traits.append('energy:steady' if abs(delta) < 0.18
+                              else ('energy:up' if delta > 0 else 'energy:down'))
+            ba, bb = seed_features.get('bpm'), candidate_features.get('bpm')
+            if ba and bb:
+                ratio = max(ba, bb) / min(ba, bb)
+                while ratio >= 1.5:
+                    ratio /= 2
+                if ratio < 1:
+                    ratio = 1 / ratio
+                traits.append('tempo:close' if ratio <= 1.10
+                              else ('tempo:near' if ratio <= 1.22 else 'tempo:far'))
+            ga, gb = seed_features.get('genre'), candidate_features.get('genre')
+            if ga and gb and ga != 'music' and gb != 'music':
+                traits.append('genre:same' if ga == gb or ga in gb or gb in ga
+                              else 'genre:change')
+        return traits
+
+    def _transition_fit_score(self, guild_id: int, traits: list[str]) -> tuple[float, list[str]]:
+        records = self._transition_feedback.get(str(guild_id), {})
+        now = time.time()
+        score = 0.0
+        reasons = []
+        half_life = AUTOPLAY_TRANSITION_HALF_LIFE_DAYS * 86400
+        for trait in traits:
+            entry = records.get(trait) or {}
+            age = max(0.0, now - float(entry.get('updated_at') or now))
+            decay = 0.5 ** (age / half_life)
+            good = float(entry.get('good') or 0) * decay
+            bad = float(entry.get('bad') or 0) * decay
+            evidence = good + bad
+            if evidence:
+                contribution = 22.0 * (good - bad) / (evidence + 3.0)
+                score += contribution
+                if abs(contribution) >= 3:
+                    reasons.append(f'{trait} {contribution:+.0f}')
+        return max(-40.0, min(40.0, score)), reasons
+
+    async def record_autoplay_transition(self, player: MusicPlayer, reason: str):
+        """Learn transition fit, never a permanent dislike of the second song."""
+        current = player.current
+        history = list(player.history)
+        if not current or not current.autoplay or len(history) < 2 or history[0] is not current:
+            return
+        previous = history[1]
+        duration = parse_duration_to_seconds(current.duration) or 0
+        listened = player.get_playback_position_seconds()
+        ratio = listened / duration if duration else 0.0
+        if reason == 'finished' or ratio >= 0.75:
+            field, weight = 'good', 1.0
+        elif reason == 'skip' and ratio <= 0.45:
+            field, weight = 'bad', max(0.35, 1.0 - ratio)
+        else:
+            return
+
+        def profiles_and_traits():
+            if current.autoplay_traits:
+                return list(current.autoplay_traits)
+            previous_path = player._resolve_local_file(previous)
+            current_path = player._resolve_local_file(current)
+            previous_features = self.get_local_features(previous_path) if previous_path else None
+            current_features = self.get_local_features(current_path) if current_path else None
+            return self._transition_traits(
+                self._song_artist(previous) or '', self._song_artist(current) or '',
+                previous_features, current_features)
+
+        traits = await self.bot.loop.run_in_executor(None, profiles_and_traits)
+        guild_records = self._transition_feedback.setdefault(str(player.guild.id), {})
+        for trait in traits:
+            entry = guild_records.setdefault(trait, {'good': 0.0, 'bad': 0.0})
+            entry[field] = round(float(entry.get(field) or 0) + weight, 3)
+            entry['updated_at'] = time.time()
+        state_store.save('autoplay_transition_feedback', self._transition_feedback)
+        save_json(self.TRANSITIONS_FILE, self._transition_feedback, logger)
+        logger.info(
+            f"🧠 Autoplay transition feedback {field} ({ratio:.0%} heard): "
+            f"{', '.join(traits)}")
+
+    @staticmethod
+    def _weighted_candidate_order(candidates: list[dict]) -> list[dict]:
+        """Softmax sampling without replacement: strong picks lead, discovery survives."""
+        remaining = list(candidates)
+        ordered = []
+        while remaining:
+            peak = max(item['score'] for item in remaining)
+            weights = [math.exp((item['score'] - peak) / AUTOPLAY_SCORE_TEMPERATURE)
+                       for item in remaining]
+            chosen = random.choices(remaining, weights=weights, k=1)[0]
+            ordered.append(chosen)
+            remaining.remove(chosen)
+        return ordered
+
+    async def _resolve_autoplay_match(self, item: dict, requester) -> Optional[Song]:
+        """Resolve and validate a catalogue candidate instead of trusting result #1."""
+        query = f"{item['artist']} - {item['title']} official audio"
+        try:
+            data = await self.bot.loop.run_in_executor(
+                None, lambda: ytdl_search.extract_info(f'ytsearch8:{query}', download=False))
+        except Exception:
+            return None
+        entries = [entry for entry in (data or {}).get('entries', []) if entry]
+        wanted_title = self._normalized_words(item.get('title') or '')
+        wanted_artist = self._normalized_words(item.get('artist') or '')
+        wanted_duration = int(item.get('duration') or 0)
+        unwanted = {'karaoke', 'cover', 'tribute', 'slowed', 'reverb', 'nightcore', 'instrumental'}
+        intended_words = wanted_title | wanted_artist
+
+        ranked = []
+        for entry in entries:
+            title = entry.get('title') or ''
+            artist = entry.get('artist') or entry.get('uploader') or entry.get('channel') or ''
+            title_words = self._normalized_words(title)
+            artist_words = self._normalized_words(artist)
+            overlap = len(wanted_title & title_words) / max(1, len(wanted_title))
+            sequence = difflib.SequenceMatcher(
+                None, ' '.join(sorted(wanted_title)), ' '.join(sorted(title_words))).ratio()
+            artist_overlap = len(wanted_artist & (artist_words | title_words)) / max(1, len(wanted_artist))
+            score = 55 * overlap + 25 * sequence + 25 * artist_overlap
+            unexpected = (title_words & unwanted) - intended_words
+            score -= 35 * bool(unexpected)
+            duration = int(entry.get('duration') or 0)
+            if wanted_duration and duration:
+                difference = abs(duration - wanted_duration)
+                score += 15 if difference <= 8 else (5 if difference <= 20 else -20)
+            ranked.append((score, entry))
+        if not ranked:
+            return None
+        match_score, entry = max(ranked, key=lambda pair: pair[0])
+        if match_score < 48:
+            logger.info(f"Autoplay rejected weak YouTube match for {query!r}: {match_score:.0f}")
+            return None
+        raw_genres = entry.get('genres') or entry.get('categories') or []
+        if isinstance(raw_genres, str):
+            raw_genres = [raw_genres]
+        song = Song(
+            title=entry.get('title') or item['title'],
+            url=entry.get('webpage_url') or entry.get('original_url') or entry.get('url'),
+            duration=self.format_duration(entry.get('duration') or item.get('duration') or 0),
+            requester=requester, source_type='youtube', thumbnail=entry.get('thumbnail'),
+            artist=item.get('artist'), album=item.get('album'),
+            genres=tuple(str(value) for value in raw_genres[:8]), autoplay=True,
+        )
+        return song
+
     async def pick_autoplay_recommendation(self, player: MusicPlayer) -> Optional[Song]:
-        """Choose the next track by artist/album affinity instead of at random."""
+        """Rank local and catalogue candidates in one explainable pool."""
         seed = player.current or (player.history[0] if player.history else None)
         artist = self._song_artist(seed)
         if not artist:
             return None
-
         station = await self._autoplay_station(artist)
         seed_key = self._artist_key(artist)
         related_keys = {self._artist_key(item.get('artist')) for item in station}
         recent_urls = {song.url for song in player.history}
-        recent_titles = {
-            re.sub(r'\W+', '', (song.title or '').lower()) for song in player.history
-        }
+        recent_titles = {self._feedback_title_key(song.title, self._song_artist(song))
+                         for song in player.history}
+        listener_ids = self._listener_user_ids(player)
+        guild_id = player.guild.id
+        hard_dis_urls, hard_dis_titles, listener_dis_artists = self._dislike_index(
+            guild_id, listener_ids)
+        _guild_dis_urls, _guild_dis_titles, guild_dis_artists = self._dislike_index(guild_id)
+        listener_fav_urls, listener_fav_titles, listener_fav_artists = \
+            self._favorite_index(guild_id, listener_ids)
+        guild_fav_urls, guild_fav_titles, guild_fav_artists = self._favorite_index(guild_id)
+        album_key = self._artist_key(seed.album) if seed and seed.album else ''
+        legacy_mode = not player.vibe_match
 
-        # After a few songs in a row from the same artist, steer to a related
-        # one so the radio doesn't just march through a discography.
         streak = 0
-        for prev in player.history:
-            if self._artist_key(self._song_artist(prev) or '') == seed_key:
+        for previous in player.history:
+            if self._artist_key(self._song_artist(previous) or '') == seed_key:
                 streak += 1
             else:
                 break
-        # /settings vibe_match: off = the classic artist/album radio with no
-        # energy/genre matching or like-weighting. Dislikes are an explicit
-        # "never again" and are honored either way.
-        legacy_mode = not player.vibe_match
-
         avoid_seed_artist = player.artist_diversity and streak >= 3
 
-        album_key = self._artist_key(seed.album) if seed and seed.album else ''
-
-        # Feedback signals: everyone's likes lift a song, dislikes bury it
-        dis_urls, dis_titles, dis_artist_counts = self._dislike_index()
-        fav_urls, fav_titles, fav_artist_keys = self._favorite_index()
-
-        seed_path = player._resolve_local_file(seed) if not legacy_mode else None
-        seed_genres = [g.lower() for g in (seed.genres or ())] if seed else []
-
-        # Reuse relevant downloads first: same artist/album wins, followed by
-        # artists from the related-artist station. Unrelated library tracks are
-        # intentionally not candidates here.
-        def scan_local_candidates():
-            # The seed's vibe: audio features of its local file, plus any
-            # genre YouTube reported for it
-            seed_profile = dict(self.get_local_features(seed_path) or {}) if seed_path else {}
-            if not seed_profile.get('genre'):
-                for genre in seed_genres:
-                    if genre and genre != 'music':
-                        seed_profile['genre'] = genre
-                        break
-            if legacy_mode:
-                seed_profile = {}
+        def local_and_session_profiles():
+            weighted = []
+            seen_paths = set()
+            session_songs = [seed] + [song for song in player.history if song is not seed][:4]
+            for index, session_song in enumerate(session_songs):
+                path = player._resolve_local_file(session_song)
+                if not path or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                features = self.get_local_features(path)
+                if features:
+                    weighted.append((1.0 / (index + 1), features))
+            session_profile = {}
+            if weighted and not legacy_mode:
+                total_weight = sum(weight for weight, _features in weighted)
+                for field in ('energy', 'dynamics', 'bpm'):
+                    values = [(weight, features.get(field)) for weight, features in weighted
+                              if features.get(field) is not None]
+                    if values:
+                        session_profile[field] = sum(weight * value for weight, value in values) / \
+                            sum(weight for weight, _value in values)
+                genres = [features.get('genre') for _weight, features in weighted
+                          if features.get('genre') not in (None, 'music')]
+                if genres:
+                    session_profile['genre'] = max(set(genres), key=genres.count)
+            if not session_profile.get('genre') and seed:
+                session_profile['genre'] = next(
+                    (genre.lower() for genre in seed.genres if genre.lower() != 'music'), None)
 
             candidates = []
+            analyzed = 0
             for path in list_library_files():
-                if path in recent_urls or path in dis_urls:
+                if path in recent_urls or path in hard_dis_urls:
                     continue
                 title, local_artist = parse_local_song_name(path)
-                title_key = re.sub(r'\W+', '', title.lower())
-                if title_key in recent_titles or title_key in dis_titles:
+                title_key = self._feedback_title_key(title, local_artist)
+                if title_key in recent_titles or title_key in hard_dis_titles:
                     continue
                 candidate_key = self._artist_key(local_artist or '')
-                if dis_artist_counts.get(candidate_key, 0) >= 3:
-                    continue  # the room clearly doesn't want this artist
-                score = 0
-                if candidate_key and candidate_key == seed_key:
+                components = []
+                if candidate_key == seed_key:
+                    score = 100.0
+                    components.append('same artist +100')
                     if avoid_seed_artist:
-                        continue
-                    score = 100
-                elif candidate_key and candidate_key in related_keys:
-                    score = 65
-                # Short album names ("Live", "One") match half the library;
-                # only trust reasonably distinctive ones.
-                if album_key and len(album_key) >= 5 and album_key in self._artist_key(path):
-                    score += 35
-                if not score:
+                        score -= 75
+                        components.append('artist streak -75')
+                elif candidate_key in related_keys:
+                    score = 68.0
+                    components.append('related artist +68')
+                else:
                     continue
+                if album_key and len(album_key) >= 5 and album_key in self._artist_key(path):
+                    score += 30
+                    components.append('same album +30')
                 if not legacy_mode:
-                    if path in fav_urls or title_key in fav_titles:
-                        score += 30
-                    elif candidate_key in fav_artist_keys:
-                        score += 10
-                    score -= 30 * dis_artist_counts.get(candidate_key, 0)
-                candidates.append((score, path, title, local_artist))
+                    if path in listener_fav_urls or title_key in listener_fav_titles:
+                        score += 38
+                        components.append('listener favorite +38')
+                    elif candidate_key in listener_fav_artists:
+                        score += 18
+                        components.append('listener-loved artist +18')
+                    elif path in guild_fav_urls or title_key in guild_fav_titles:
+                        score += 15
+                        components.append('guild favorite +15')
+                    elif candidate_key in guild_fav_artists:
+                        score += 7
+                        components.append('guild-loved artist +7')
+                    dislike_penalty = min(36, guild_dis_artists.get(candidate_key, 0) * 8)
+                    dislike_penalty += min(24, listener_dis_artists.get(candidate_key, 0) * 12)
+                    score -= dislike_penalty
+                    if dislike_penalty:
+                        components.append(f'artist feedback -{dislike_penalty}')
+                known_features = path in self._audio_features
+                features = None
+                if not legacy_mode and (known_features or analyzed < 6):
+                    features = self.get_local_features(path)
+                    if not known_features:
+                        analyzed += 1
+                if session_profile and features:
+                    affinity = self._feature_affinity(session_profile, features)
+                    score += affinity
+                    if affinity:
+                        components.append(f'session vibe {affinity:+d}')
+                traits = self._transition_traits(
+                    artist, local_artist or '', session_profile, features, related_keys)
+                fit, learned = self._transition_fit_score(guild_id, traits)
+                if not legacy_mode:
+                    score += fit
+                    components.extend(learned)
+                candidates.append({
+                    'kind': 'local', 'score': score, 'path': path, 'title': title,
+                    'artist': local_artist, 'components': components, 'traits': traits,
+                })
+            return sorted(candidates, key=lambda value: value['score'], reverse=True)[:16], session_profile
 
-            # Vibe continuity on the shortlist: energetic pop follows
-            # energetic pop. Features are cached per file; allow a few
-            # fresh ffmpeg analyses per pick so the cache fills over time.
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            shortlist = candidates[:12]
-            if seed_profile and shortlist:
-                analyzed = 0
-                rescored = []
-                for score, path, title, local_artist in shortlist:
-                    known = path in self._audio_features
-                    if known or analyzed < 4:
-                        feats = self.get_local_features(path)
-                        if not known:
-                            analyzed += 1
-                        score += self._feature_affinity(seed_profile, feats)
-                    rescored.append((score, path, title, local_artist))
-                shortlist = sorted(rescored, key=lambda item: item[0], reverse=True)
-            return shortlist
+        local_candidates, session_profile = await self.bot.loop.run_in_executor(
+            None, local_and_session_profiles)
+        candidates = list(local_candidates)
+        for item in station:
+            title_key = self._feedback_title_key(item.get('title') or '', item.get('artist'))
+            candidate_key = self._artist_key(item.get('artist'))
+            if title_key in recent_titles or title_key in hard_dis_titles:
+                continue
+            same_artist = candidate_key == seed_key
+            score = 100.0 if same_artist else 68.0
+            components = ['same artist +100' if same_artist else 'related artist +68']
+            if same_artist and avoid_seed_artist:
+                score -= 75
+                components.append('artist streak -75')
+            if album_key and self._artist_key(item.get('album')) == album_key:
+                score += 30
+                components.append('same album +30')
+            traits = self._transition_traits(
+                artist, item.get('artist') or '', session_profile, None, related_keys)
+            if not legacy_mode:
+                if candidate_key in listener_fav_artists:
+                    score += 18
+                    components.append('listener-loved artist +18')
+                elif candidate_key in guild_fav_artists:
+                    score += 7
+                    components.append('guild-loved artist +7')
+                penalty = min(36, guild_dis_artists.get(candidate_key, 0) * 8)
+                penalty += min(24, listener_dis_artists.get(candidate_key, 0) * 12)
+                score -= penalty
+                if penalty:
+                    components.append(f'artist feedback -{penalty}')
+                fit, learned = self._transition_fit_score(guild_id, traits)
+                score += fit
+                components.extend(learned)
+            score += 8  # a modest discovery lift; relevance still dominates
+            components.append('new discovery +8')
+            candidates.append(dict(
+                item, kind='station', score=score, components=components, traits=traits))
 
-        local_candidates = await self.bot.loop.run_in_executor(None, scan_local_candidates)
+        for candidate in self._weighted_candidate_order(candidates)[:8]:
+            if candidate['kind'] == 'local':
+                duration = await self.bot.loop.run_in_executor(
+                    None, _probe_duration_seconds, candidate['path'])
+                song = Song(
+                    title=candidate['title'], url=candidate['path'],
+                    duration=self.format_duration(duration) if duration else 'Unknown',
+                    requester=player.guild.me, source_type='local',
+                    artist=candidate.get('artist'), autoplay=True)
+            else:
+                song = await self._resolve_autoplay_match(candidate, player.guild.me)
+                if not song or not song.url or song.url in recent_urls:
+                    continue
+            song.autoplay_score = round(candidate['score'], 1)
+            song.autoplay_reason = '; '.join(candidate['components'][:8])
+            song.autoplay_traits = tuple(candidate.get('traits') or ())
+            logger.info(
+                f"🎯 Autoplay score {song.autoplay_score}: {song.artist} - {song.title} "
+                f"[{song.autoplay_reason}]")
+            return song
 
-        # Local matches usually win (instant, no network), but sometimes let
-        # the online station through so the radio still discovers new songs.
-        # Legacy mode keeps the original local-always-wins behavior.
-        if local_candidates and (legacy_mode or random.random() < 0.70):
-            pick_from = local_candidates[:10] if legacy_mode else local_candidates[:5]
-            score, path, title, local_artist = random.choice(pick_from)
-            duration_seconds = await self.bot.loop.run_in_executor(None, _probe_duration_seconds, path)
-            logger.info(f"🎶 Autoplay local affinity {score}: {local_artist} - {title}")
-            return Song(title=title, url=path,
-                        duration=self.format_duration(duration_seconds) if duration_seconds else 'Unknown',
-                        requester=player.guild.me, source_type='local', artist=local_artist)
-
-        def _station_ok(item):
-            title_key = re.sub(r'\W+', '', item['title'].lower())
-            if title_key in recent_titles or title_key in dis_titles:
-                return False
-            return dis_artist_counts.get(self._artist_key(item.get('artist')), 0) < 3
-
-        fresh = [item for item in station if _station_ok(item)]
-        if not fresh:
-            # Catalogue outages still get a same-artist fallback; never jump
-            # to a random artist just because related-artist lookup failed.
-            for suffix in ('official audio', 'deep cut official audio'):
-                song = await self.process_youtube(f"{artist} {suffix}", player.guild.me)
-                if song and song.url not in recent_urls:
-                    song.artist = artist
-                    return song
-            return None
-        # 60/40 current-vs-related keeps an artist radio coherent without
-        # getting stuck playing an entire discography.
-        same_artist = [item for item in fresh if self._artist_key(item.get('artist')) == seed_key]
-        related = [item for item in fresh if self._artist_key(item.get('artist')) != seed_key]
-        same_album = [item for item in fresh
-                      if album_key and self._artist_key(item.get('album')) == album_key]
-        if avoid_seed_artist and related:
-            pool = related
-        elif same_album and random.random() < 0.35:
-            pool = same_album
-        else:
-            pool = same_artist if same_artist and (not related or random.random() < 0.60) else related
-        pool = pool or fresh
-        # Half the time, favor artists someone in the room has ❤️'d
-        if not legacy_mode:
-            loved = [item for item in pool
-                     if self._artist_key(item.get('artist')) in fav_artist_keys]
-            if loved and random.random() < 0.5:
-                pool = loved
-        pick = random.choice(pool)
-        song = await self.process_youtube(
-            f"{pick['artist']} - {pick['title']} official audio", player.guild.me
-        )
-        if song:
-            song.artist = pick['artist']
-            song.album = pick.get('album')
-            logger.info(f"🎶 Autoplay radio: {pick['artist']} - {pick['title']}")
-        return song
+        # Retry several relevant searches rather than letting one unavailable
+        # candidate stop the radio. These remain anchored to the seed artist.
+        for suffix in ('official audio', 'deep cut official audio', 'radio mix'):
+            song = await self.process_youtube(f"{artist} {suffix}", player.guild.me)
+            if song and song.url not in recent_urls:
+                song.artist = song.artist or artist
+                song.autoplay = True
+                song.autoplay_reason = 'artist fallback after candidate resolution failures'
+                song.autoplay_traits = ('artist:same',)
+                return song
+        genre = session_profile.get('genre') if session_profile else None
+        if genre:
+            song = await self.process_youtube(
+                f"{genre} music discovery official audio", player.guild.me)
+            if song and song.url not in recent_urls:
+                song.autoplay = True
+                song.autoplay_reason = f'{genre} session fallback after related tracks failed'
+                song.autoplay_traits = ('artist:change', f'genre:{genre}')
+                return song
+        return None
 
     def _get_invite_channel(self, guild: discord.Guild):
         bot_member = guild.get_member(self.bot.user.id) if self.bot.user else None
@@ -4569,6 +4990,12 @@ class MusicCog(commands.Cog):
             description=description,
             color=source_color
         )
+        if song.autoplay and song.autoplay_reason:
+            score = f" · score {song.autoplay_score:g}" \
+                if song.autoplay_score is not None else ''
+            embed.add_field(
+                name=f"🧭 Why autoplay chose this{score}",
+                value=song.autoplay_reason[:1024], inline=False)
         if player:
             self._add_progress_field(embed, song, player)
             loop_status = "Song" if player.loop else ("Queue" if player.loop_queue else "Off")
@@ -4798,6 +5225,7 @@ class MusicCog(commands.Cog):
         await interaction.response.defer()
         
         # Stop current song (this will trigger play_next)
+        player._end_reason = 'skip'
         interaction.guild.voice_client.stop()
         
         # Wait a moment for the next song to start playing
@@ -4825,6 +5253,7 @@ class MusicCog(commands.Cog):
         self._stop_lyricsnow_task(interaction.guild.id)
         
         if interaction.guild.voice_client:
+            player._end_reason = 'stop'
             interaction.guild.voice_client.stop()
         
         await interaction.response.send_message("⏹️ Stopped and cleared queue!")
@@ -5756,6 +6185,7 @@ class MusicCog(commands.Cog):
     FAVORITES_FILE = os.path.join(BOT_DIR, 'favorites.json')
     DISLIKES_FILE = os.path.join(BOT_DIR, 'dislikes.json')
     FEATURES_FILE = os.path.join(BOT_DIR, 'audio_features.json')
+    TRANSITIONS_FILE = os.path.join(BOT_DIR, 'autoplay_transitions.json')
 
     # ---------- audio features (Spotify-style content profile) ----------
 
@@ -5801,6 +6231,8 @@ class MusicCog(commands.Cog):
             ratio = max(ta, tb) / max(1e-6, min(ta, tb))
             while ratio >= 1.5:  # half/double-time is the same groove
                 ratio /= 2
+            if ratio < 1:
+                ratio = 1 / ratio
             if ratio <= 1.08:
                 bonus += 15
             elif ratio <= 1.20:
@@ -5820,13 +6252,16 @@ class MusicCog(commands.Cog):
     def _write_dislikes(self, data: dict):
         save_json(self.DISLIKES_FILE, data, logger)
 
-    def toggle_dislike(self, user_id: int, song: Song) -> tuple[bool, str]:
+    def toggle_dislike(self, user_id: int, song: Song,
+                       guild_id: Optional[int] = None) -> tuple[bool, str]:
         """Add or remove a song from a user's dislikes. Returns (added, title)."""
         data = self._read_dislikes()
         dislikes = data.setdefault(str(user_id), [])
 
         for i, entry in enumerate(dislikes):
-            if entry.get('url') == song.url:
+            same_guild = guild_id is None or entry.get('guild_id') in (
+                None, guild_id, str(guild_id))
+            if entry.get('url') == song.url and same_guild:
                 dislikes.pop(i)
                 self._write_dislikes(data)
                 return False, song.title
@@ -5838,19 +6273,29 @@ class MusicCog(commands.Cog):
             'title': song.title,
             'url': song.url,
             'artist': artist,
+            'guild_id': guild_id,
         })
         self._write_dislikes(data)
         return True, song.title
 
-    def _dislike_index(self) -> tuple[set, set, dict]:
+    def _dislike_index(self, guild_id: Optional[int] = None,
+                       user_ids: Optional[set[int]] = None) -> tuple[set, set, dict]:
         """(urls, squashed titles, artist-key -> distinct dislike count)
         aggregated over every user - autoplay serves the whole room."""
         urls, titles, artist_counts = set(), set(), {}
-        for entries in self._read_dislikes().values():
+        for raw_user_id, entries in self._read_dislikes().items():
+            if user_ids is not None and int(raw_user_id) not in user_ids:
+                continue
             for entry in entries:
+                entry_guild = entry.get('guild_id')
+                if guild_id is not None and entry_guild not in (None, guild_id, str(guild_id)):
+                    continue
+                if guild_id is not None and entry_guild is None and user_ids is None:
+                    continue  # do not leak legacy preferences into every guild
                 if entry.get('url'):
                     urls.add(entry['url'])
-                title_key = re.sub(r'\W+', '', (entry.get('title') or '').lower())
+                title_key = self._feedback_title_key(
+                    entry.get('title') or '', entry.get('artist'))
                 if title_key:
                     titles.add(title_key)
                 artist_key = self._artist_key(entry.get('artist') or '')
@@ -5858,19 +6303,29 @@ class MusicCog(commands.Cog):
                     artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
         return urls, titles, artist_counts
 
-    def _favorite_index(self) -> tuple[set, set, set]:
+    def _favorite_index(self, guild_id: Optional[int] = None,
+                        user_ids: Optional[set[int]] = None) -> tuple[set, set, set]:
         """(urls, squashed titles, artist keys) across everyone's likes."""
         urls, titles, artist_keys = set(), set(), set()
-        for entries in self._read_favorites().values():
+        for raw_user_id, entries in self._read_favorites().items():
+            if user_ids is not None and int(raw_user_id) not in user_ids:
+                continue
             for entry in entries:
+                entry_guild = entry.get('guild_id')
+                if guild_id is not None and entry_guild not in (None, guild_id, str(guild_id)):
+                    continue
+                if guild_id is not None and entry_guild is None and user_ids is None:
+                    continue
                 url = entry.get('url')
                 if url:
                     urls.add(url)
                 title = entry.get('title') or ''
-                title_key = re.sub(r'\W+', '', title.lower())
+                title_key = self._feedback_title_key(title, entry.get('artist'))
                 if title_key:
                     titles.add(title_key)
-                if entry.get('source_type') == 'local' and url:
+                if entry.get('artist'):
+                    artist = entry.get('artist')
+                elif entry.get('source_type') == 'local' and url:
                     _, artist = parse_local_song_name(url)
                 else:
                     parts = re.split(r'\s+[-–—|]\s+', title, maxsplit=1)
@@ -5890,13 +6345,16 @@ class MusicCog(commands.Cog):
     def _write_favorites(self, data: dict):
         save_json(self.FAVORITES_FILE, data, logger)
 
-    def toggle_favorite(self, user_id: int, song: Song) -> tuple[bool, str]:
+    def toggle_favorite(self, user_id: int, song: Song,
+                        guild_id: Optional[int] = None) -> tuple[bool, str]:
         """Add or remove a song from a user's favorites. Returns (added, title)."""
         data = self._read_favorites()
         favorites = data.setdefault(str(user_id), [])
 
         for i, entry in enumerate(favorites):
-            if entry.get('url') == song.url:
+            same_guild = guild_id is None or entry.get('guild_id') in (
+                None, guild_id, str(guild_id))
+            if entry.get('url') == song.url and same_guild:
                 favorites.pop(i)
                 self._write_favorites(data)
                 return False, song.title
@@ -5907,6 +6365,8 @@ class MusicCog(commands.Cog):
             'duration': song.duration,
             'source_type': song.source_type,
             'thumbnail': song.thumbnail,
+            'artist': song.artist,
+            'guild_id': guild_id,
         })
         self._write_favorites(data)
         return True, song.title
@@ -5917,10 +6377,20 @@ class MusicCog(commands.Cog):
             return os.path.exists(entry.get('url', ''))
         return True
 
-    def pick_random_favorite(self, guild: discord.Guild, exclude_urls: Optional[set] = None) -> Optional[Song]:
+    def pick_random_favorite(self, guild: discord.Guild, exclude_urls: Optional[set] = None,
+                             user_ids: Optional[set[int]] = None) -> Optional[Song]:
         """Random song from anyone's favorites, used to bias autoplay."""
         data = self._read_favorites()
-        entries = [e for favs in data.values() for e in favs if self._playable_favorite(e)]
+        entries = []
+        for raw_user_id, favorites in data.items():
+            if user_ids is not None and int(raw_user_id) not in user_ids:
+                continue
+            for entry in favorites:
+                entry_guild = entry.get('guild_id')
+                if entry_guild not in (None, guild.id, str(guild.id)):
+                    continue
+                if self._playable_favorite(entry):
+                    entries.append(entry)
         if exclude_urls:
             fresh = [e for e in entries if e.get('url') not in exclude_urls]
             entries = fresh or entries
@@ -5944,7 +6414,8 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
             return
 
-        added, title = self.toggle_dislike(interaction.user.id, player.current)
+        added, title = self.toggle_dislike(
+            interaction.user.id, player.current, interaction.guild.id)
         if not added:
             await interaction.response.send_message(f"👍 Removed **{title}** from your dislikes.", ephemeral=True)
             return
@@ -5954,6 +6425,7 @@ class MusicCog(commands.Cog):
         vc = interaction.guild.voice_client
         if getattr(requester, 'bot', False) and vc and (vc.is_playing() or vc.is_paused()):
             player.loop = False
+            player._end_reason = 'skip'
             vc.stop()
             msg += " Skipping!"
         await interaction.response.send_message(msg)
@@ -5967,7 +6439,8 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
             return
 
-        added, title = self.toggle_favorite(interaction.user.id, player.current)
+        added, title = self.toggle_favorite(
+            interaction.user.id, player.current, interaction.guild.id)
         if added:
             await interaction.response.send_message(f"❤️ Added **{title}** to your favorites!", ephemeral=True)
         else:
@@ -6266,6 +6739,10 @@ class MusicCog(commands.Cog):
             'album': song.album,
             'genres': list(song.genres),
             'played_at': song.played_at,
+            'autoplay': song.autoplay,
+            'autoplay_score': song.autoplay_score,
+            'autoplay_reason': song.autoplay_reason,
+            'autoplay_traits': list(song.autoplay_traits),
             'requester_id': getattr(song.requester, 'id', None),
         }
 
@@ -6282,6 +6759,10 @@ class MusicCog(commands.Cog):
             album=entry.get('album'),
             genres=tuple(entry.get('genres') or ()),
             played_at=entry.get('played_at'),
+            autoplay=bool(entry.get('autoplay', False)),
+            autoplay_score=entry.get('autoplay_score'),
+            autoplay_reason=entry.get('autoplay_reason'),
+            autoplay_traits=tuple(entry.get('autoplay_traits') or ()),
         )
 
     def snapshot_player_state(self) -> dict:
@@ -6644,6 +7125,7 @@ class MusicCog(commands.Cog):
         target = player.queue[0]
 
         await interaction.response.send_message(f"⏭️ Skipping to **{target.title}** (skipped {position} song{'s' if position != 1 else ''})")
+        player._end_reason = 'manual'
         vc.stop()  # after_playing advances to the new queue head
 
     @app_commands.command(name="move", description="Move a song to another position in the queue")
@@ -7295,6 +7777,7 @@ class MusicCog(commands.Cog):
         
         # Stop playback
         if interaction.guild.voice_client:
+            player._end_reason = 'stop'
             interaction.guild.voice_client.stop()
         
         await interaction.response.send_message("⏹️ 24/7 mode stopped!")

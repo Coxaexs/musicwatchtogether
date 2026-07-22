@@ -51,6 +51,7 @@ playlist_meta.json
 playlist_covers/
 stats.jsonl
 audio_features.json
+autoplay_transitions.json
 musicbot.sqlite3*
 .cache
 
