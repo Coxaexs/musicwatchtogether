@@ -60,6 +60,34 @@ class PersistenceTests(unittest.TestCase):
             self.assertTrue(storage.save_json(path, {"ok": [1, 2, 3]}))
             self.assertEqual(storage.load_json(path, {}), {"ok": [1, 2, 3]})
 
+    def test_sqlite_store_migrates_json_and_survives_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = Path(directory) / "legacy.json"
+            database = Path(directory) / "state.sqlite3"
+            storage.save_json(legacy, {"rooms": ["one"]})
+            store = storage.SQLiteDocumentStore(database)
+            self.assertEqual(store.load("rooms", {}, legacy), {"rooms": ["one"]})
+            storage.save_json(legacy, {"rooms": ["changed"]})
+            reopened = storage.SQLiteDocumentStore(database)
+            self.assertEqual(reopened.load("rooms", {}, legacy), {"rooms": ["one"]})
+            self.assertTrue(reopened.healthy())
+
+    def test_atomic_binary_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cover.png"
+            self.assertTrue(storage.save_bytes_atomic(path, b"image-data"))
+            self.assertEqual(path.read_bytes(), b"image-data")
+
+
+class ImageSafetyTests(unittest.TestCase):
+    def test_png_dimensions_are_read_without_decoding(self):
+        image = b"\x89PNG\r\n\x1a\n" + b"\0" * 8 + (640).to_bytes(4, "big") \
+            + (480).to_bytes(4, "big")
+        self.assertEqual(webui._image_dimensions(image, "png"), (640, 480))
+
+    def test_truncated_image_is_rejected(self):
+        self.assertIsNone(webui._image_dimensions(b"\x89PNG", "png"))
+
 
 class AuthorizationTests(unittest.TestCase):
     def test_expired_dashboard_token_is_rejected_and_removed(self):
@@ -87,7 +115,7 @@ class AuthorizationTests(unittest.TestCase):
     def test_invitation_links_keep_credentials_out_of_query_string(self):
         room_id = "w987654321"
         try:
-            with mock.patch.object(watchtogether, "_save_json"):
+            with mock.patch.object(watchtogether, "_save_tokens"):
                 link = watchtogether.get_room_link(987654321, "Test", "watch")
             self.assertIn(f"?room={room_id}#token=", link)
             self.assertNotIn("&token=", link)

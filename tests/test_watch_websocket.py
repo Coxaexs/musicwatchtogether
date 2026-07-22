@@ -1,6 +1,7 @@
 import asyncio
 import json
 import unittest
+from unittest import mock
 
 from aiohttp import ClientSession, CookieJar, web
 from aiohttp.test_utils import TestServer
@@ -11,6 +12,9 @@ import watchtogether
 class WatchWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.room_id = "w-integration-room"
+        self.original_settings = watchtogether.room_settings.pop(self.room_id, None)
+        self.settings_patcher = mock.patch.object(watchtogether, "_save_room_settings")
+        self.settings_patcher.start()
         self.token = "integration-token"
         watchtogether.tokens[self.token] = {
             "room": self.room_id,
@@ -42,6 +46,10 @@ class WatchWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
         watchtogether.tokens.pop(self.token, None)
+        watchtogether.room_settings.pop(self.room_id, None)
+        if self.original_settings is not None:
+            watchtogether.room_settings[self.room_id] = self.original_settings
+        self.settings_patcher.stop()
         if getattr(self, "server", None):
             await self.server.close()
 
@@ -115,6 +123,49 @@ class WatchWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
             lambda value: value.get("t") == "sync" and value.get("action") == "play",
         )
         self.assertEqual(sync["by"], "Viewer")
+
+    async def test_vote_skip_and_everyone_reorder_policy(self):
+        host_socket, _host_id, _ = await self.join("Host")
+        viewer_one, _viewer_one_id, _ = await self.join("Viewer one")
+        viewer_two, _viewer_two_id, _ = await self.join("Viewer two")
+        room = watchtogether.rooms[self.room_id]
+        room.queue = [
+            {"uid": "one", "title": "One", "status": "ready"},
+            {"uid": "two", "title": "Two", "status": "ready"},
+            {"uid": "three", "title": "Three", "status": "ready"},
+        ]
+        room.index = 0
+        room.set_position(0, playing=True)
+
+        await viewer_one.send_json({"t": "skip"})
+        first_vote = await self.receive_until(
+            viewer_one,
+            lambda value: value.get("t") == "state" and value.get("skip_votes") == 1,
+        )
+        self.assertEqual(first_vote["index"], 0)
+
+        await viewer_two.send_json({"t": "skip"})
+        skipped = await self.receive_until(
+            host_socket,
+            lambda value: value.get("t") == "state" and value.get("index") == 1,
+        )
+        self.assertEqual(skipped["skip_votes"], 0)
+
+        await host_socket.send_json({"t": "settings", "control_policy": "everyone"})
+        await self.receive_until(
+            viewer_one,
+            lambda value: value.get("t") == "state"
+            and value.get("settings", {}).get("control_policy") == "everyone",
+        )
+        await viewer_one.send_json({"t": "reorder", "from": 2, "to": 0})
+        reordered = await self.receive_until(
+            host_socket,
+            lambda value: value.get("t") == "state"
+            and value.get("queue", [{}])[0].get("uid") == "three",
+        )
+        self.assertEqual([item["uid"] for item in reordered["queue"]],
+                         ["three", "one", "two"])
+        self.assertEqual(reordered["index"], 2)
 
 
 if __name__ == "__main__":

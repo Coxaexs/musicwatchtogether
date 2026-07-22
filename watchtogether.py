@@ -22,8 +22,10 @@ WatchTogether and ReelsTogether share a hard 10-file downloaded-video cache.
 
 import asyncio
 import glob
+import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -40,7 +42,7 @@ from security import (
     validate_public_url,
 )
 from runtime import TaskRegistry, increment, prometheus
-from storage import load_json, save_json
+from storage import SQLiteDocumentStore, load_json, save_json
 
 try:
     import cobrowser
@@ -76,7 +78,11 @@ HLS_MIN_DURATION = 8 * 60      # longer than this -> stream while downloading
 
 SETTINGS_FILE = os.path.join(BASE_DIR, 'room_settings.json')
 ROOM_PLAYLISTS_FILE = os.path.join(BASE_DIR, 'room_playlists.json')
-DEFAULT_SETTINGS = {'adblock': True, 'sponsorblock': True, 'quality': 720}
+state_store = SQLiteDocumentStore(os.path.join(BASE_DIR, 'musicbot.sqlite3'), logger)
+DEFAULT_SETTINGS = {
+    'adblock': True, 'sponsorblock': True, 'quality': 720,
+    'control_policy': 'moderators', 'skip_policy': 'vote', 'vote_threshold': 0.5,
+}
 SB_CATEGORIES = ['sponsor', 'selfpromo', 'interaction']
 
 DEFAULT_TOPICS = [
@@ -158,10 +164,30 @@ def _save_json(path, data):
     return save_json(path, data, logger)
 
 
-tokens = _load_json(TOKENS_FILE, {})
-profiles = _load_json(PROFILES_FILE, {})
-room_settings = _load_json(SETTINGS_FILE, {})
-room_playlists = _load_json(ROOM_PLAYLISTS_FILE, {})
+tokens = state_store.load('watch_tokens', {}, TOKENS_FILE)
+profiles = state_store.load('reels_profiles', {}, PROFILES_FILE)
+room_settings = state_store.load('room_settings', {}, SETTINGS_FILE)
+room_playlists = state_store.load('room_playlists', {}, ROOM_PLAYLISTS_FILE)
+
+
+def _save_tokens():
+    state_store.save('watch_tokens', tokens)
+    _save_json(TOKENS_FILE, tokens)
+
+
+def _save_profiles():
+    state_store.save('reels_profiles', profiles)
+    _save_json(PROFILES_FILE, profiles)
+
+
+def _save_room_settings():
+    state_store.save('room_settings', room_settings)
+    _save_json(SETTINGS_FILE, room_settings)
+
+
+def _save_room_playlists():
+    state_store.save('room_playlists', room_playlists)
+    _save_json(ROOM_PLAYLISTS_FILE, room_playlists)
 
 
 def get_settings(room_id):
@@ -170,7 +196,8 @@ def get_settings(room_id):
     return s
 
 
-def update_settings(room_id, *, adblock=None, sponsorblock=None, quality=None):
+def update_settings(room_id, *, adblock=None, sponsorblock=None, quality=None,
+                    control_policy=None, skip_policy=None, vote_threshold=None):
     """Persist validated room settings for Discord and web control surfaces."""
     cfg = get_settings(room_id)
     if adblock is not None:
@@ -185,8 +212,18 @@ def update_settings(room_id, *, adblock=None, sponsorblock=None, quality=None):
         if quality not in (360, 480, 720, 1080):
             raise ValueError('quality must be 360, 480, 720, or 1080')
         cfg['quality'] = quality
+    if control_policy is not None:
+        if control_policy not in ('host', 'moderators', 'everyone'):
+            raise ValueError('invalid control policy')
+        cfg['control_policy'] = control_policy
+    if skip_policy is not None:
+        if skip_policy not in ('moderators', 'vote', 'everyone'):
+            raise ValueError('invalid skip policy')
+        cfg['skip_policy'] = skip_policy
+    if vote_threshold is not None:
+        cfg['vote_threshold'] = max(0.25, min(1.0, float(vote_threshold)))
     room_settings[room_id] = cfg
-    _save_json(SETTINGS_FILE, room_settings)
+    _save_room_settings()
     return cfg
 
 
@@ -209,7 +246,7 @@ def get_room_link(channel_id, channel_name, mode):
     if not token:
         token = secrets.token_urlsafe(12)
         tokens[token] = {'room': room_id, 'name': channel_name, 'created_at': now}
-        _save_json(TOKENS_FILE, tokens)
+        _save_tokens()
     base = getattr(config, 'WEB_SERVER_URL', 'https://deeppixel.online').rstrip('/')
     path = '/watch/' if mode == 'watch' else '/watch/reels'
     return f"{base}{path}?room={room_id}#token={token}"
@@ -221,7 +258,7 @@ def _token_room(token):
         return None
     if time.time() - info.get('created_at', 0) > TOKEN_TTL:
         tokens.pop(token, None)
-        _save_json(TOKENS_FILE, tokens)
+        _save_tokens()
         return None
     return info
 
@@ -249,6 +286,9 @@ class Room:
         self._advanced_past = -1   # 'ended' debounce
         self.last_query = None     # avoid back-to-back identical feed searches
         self._topup_busy = False   # topup is not reentrant-safe
+        self.skip_votes = set()
+        # Created lazily in the websocket loop for Python 3.9 compatibility.
+        self.playlist_lock = None
         self.last_activity = time.monotonic()
         # reels profile
         prof = profiles.get(self.id, {})
@@ -282,7 +322,7 @@ class Room:
             'interests': self.interests,
             'seen': list(self.seen)[-500:],
         }
-        _save_json(PROFILES_FILE, profiles)
+        _save_profiles()
 
     def join(self, ws, member_session, name):
         self._join_sequence += 1
@@ -303,6 +343,7 @@ class Room:
             'name': name,
             'role': self.roles[member_session],
             'order': self._join_sequence,
+            'muted_until': 0,
         }
         self.sockets[ws] = member
         return member
@@ -423,6 +464,15 @@ def _is_host(member):
     return bool(member and member.get('role') == 'host')
 
 
+def _can_control(room, member):
+    policy = get_settings(room.id).get('control_policy', 'moderators')
+    if policy == 'everyone':
+        return bool(member)
+    if policy == 'host':
+        return _is_host(member)
+    return _can_moderate(member)
+
+
 def _playlist_summaries(room_id):
     playlists = room_playlists.get(room_id, {})
     return [
@@ -431,9 +481,28 @@ def _playlist_summaries(room_id):
             'count': len(value.get('items') or []),
             'updated_by': value.get('updated_by'),
             'updated_at': value.get('updated_at'),
+            'owner': value.get('owner_name') or value.get('updated_by'),
+            'editors': value.get('editor_names') or [],
+            'revisions': len(value.get('revisions') or []),
         }
         for name, value in sorted(playlists.items(), key=lambda pair: pair[0].lower())
     ]
+
+
+def _member_owner_key(member):
+    return hashlib.sha256(member['session'].encode()).hexdigest()
+
+
+def _room_playlist_lock(room):
+    if room.playlist_lock is None:
+        room.playlist_lock = asyncio.Lock()
+    return room.playlist_lock
+
+
+def _can_edit_room_playlist(playlist, member):
+    owner_key = _member_owner_key(member)
+    return _can_moderate(member) or playlist.get('owner_key') == owner_key or \
+        owner_key in (playlist.get('editor_keys') or [])
 
 
 def _item_public(item):
@@ -482,6 +551,9 @@ def _room_state(room):
             for member in sorted(room.sockets.values(), key=lambda value: value['order'])
         ],
         'playlists': _playlist_summaries(room.id),
+        'skip_votes': len(room.skip_votes),
+        'skip_needed': max(1, math.ceil(
+            len(room.sockets) * get_settings(room.id).get('vote_threshold', 0.5))),
         'chat': list(room.chat)[-50:],
         'need_seed': room.mode == 'reels' and not room.interests and not room.queue,
         'browser': (cobrowser.get(room.id).public_state()
@@ -1244,6 +1316,10 @@ async def _save_room_playlist(room, name, member):
     if name not in playlists and len(playlists) >= MAX_ROOM_PLAYLISTS:
         await _notice(room, f'❌ Playlist limit reached ({MAX_ROOM_PLAYLISTS})')
         return
+    existing = playlists.get(name)
+    if existing and not _can_edit_room_playlist(existing, member):
+        await _notice(room, f'🔒 {member["name"]}, only the owner or a moderator can update “{name}”')
+        return
     items = []
     for item in room.queue[:MAX_PLAYLIST_ITEMS]:
         url = str(item.get('url') or '')
@@ -1259,12 +1335,21 @@ async def _save_room_playlist(room, name, member):
     if not items:
         await _notice(room, '❌ There are no reusable URLs in the queue')
         return
+    revisions = list((existing or {}).get('revisions') or [])[-9:]
+    if existing and existing.get('items'):
+        revisions.append({'items': existing['items'], 'updated_at': existing.get('updated_at'),
+                          'updated_by': existing.get('updated_by')})
     playlists[name] = {
         'items': items,
+        'owner_key': (existing or {}).get('owner_key') or _member_owner_key(member),
+        'owner_name': (existing or {}).get('owner_name') or member['name'],
+        'editor_keys': list((existing or {}).get('editor_keys') or []),
+        'editor_names': list((existing or {}).get('editor_names') or []),
+        'revisions': revisions,
         'updated_by': member['name'],
         'updated_at': time.time(),
     }
-    _save_json(ROOM_PLAYLISTS_FILE, room_playlists)
+    _save_room_playlists()
     increment('playlists_saved_total')
     await _notice(room, f'💾 {member["name"]} saved “{name}” ({len(items)} items)')
     await _broadcast_state(room)
@@ -1294,12 +1379,116 @@ async def _delete_room_playlist(room, name, member):
     if name not in playlists:
         await _notice(room, '❌ Playlist not found')
         return
+    if not _can_edit_room_playlist(playlists[name], member):
+        await _notice(room, f'🔒 Only the owner or a moderator can delete “{name}”')
+        return
     playlists.pop(name, None)
     if not playlists:
         room_playlists.pop(room.id, None)
-    _save_json(ROOM_PLAYLISTS_FILE, room_playlists)
+    _save_room_playlists()
     increment('playlists_deleted_total')
     await _notice(room, f'🗑️ {member["name"]} deleted “{name}”')
+    await _broadcast_state(room)
+
+
+async def _playlist_manage(room, member, data, ws):
+    action = str(data.get('action') or '')
+    name = _clean_playlist_name(data.get('name'))
+    playlists = room_playlists.setdefault(room.id, {})
+    playlist = playlists.get(name)
+    if action == 'import':
+        new_name = name or 'Imported playlist'
+        if len(playlists) >= MAX_ROOM_PLAYLISTS:
+            await _notice(room, f'❌ Playlist limit reached ({MAX_ROOM_PLAYLISTS})')
+            return
+        if new_name in playlists:
+            await _notice(room, '❌ A playlist with that name already exists')
+            return
+        raw_items = list(data.get('items') or [])[:MAX_PLAYLIST_ITEMS]
+        items = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            url = str(raw.get('url') or '').strip()[:1000]
+            if URL_RE.match(url):
+                items.append({'url': url, 'title': str(raw.get('title') or url)[:200],
+                              'duration': raw.get('duration'),
+                              'thumbnail': raw.get('thumbnail'), 'uploader': raw.get('uploader')})
+        if not items:
+            await _notice(room, '❌ Import contains no valid media URLs')
+            return
+        playlists[new_name] = {'items': items, 'owner_key': _member_owner_key(member),
+            'owner_name': member['name'], 'revisions': [], 'updated_by': member['name'],
+            'updated_at': time.time()}
+        _save_room_playlists()
+        await _notice(room, f'📥 {member["name"]} imported “{new_name}”')
+    elif not playlist:
+        await _notice(room, '❌ Playlist not found')
+        return
+    elif action == 'export':
+        await ws.send_str(json.dumps({'t': 'playlist_export', 'name': name,
+            'items': playlist.get('items') or []}))
+        return
+    elif not _can_edit_room_playlist(playlist, member):
+        await _notice(room, '🔒 Only the owner or a moderator can edit that playlist')
+        return
+    elif action in ('editor_add', 'editor_remove'):
+        if playlist.get('owner_key') != _member_owner_key(member) and not _can_moderate(member):
+            await _notice(room, '🔒 Only the owner or a moderator can manage editors')
+            return
+        target_id = re.sub(r'[^A-Za-z0-9_-]', '', str(data.get('id') or ''))[:64]
+        target = next((value for value in room.sockets.values()
+                       if value['id'] == target_id), None)
+        if not target:
+            await _notice(room, '❌ That participant is no longer connected')
+            return
+        target_key = _member_owner_key(target)
+        editor_keys = playlist.setdefault('editor_keys', [])
+        editor_names = playlist.setdefault('editor_names', [])
+        if action == 'editor_add':
+            if target_key not in editor_keys:
+                editor_keys.append(target_key)
+            if target['name'] not in editor_names:
+                editor_names.append(target['name'])
+            await _notice(room, f'🤝 {target["name"]} can now edit “{name}”')
+        else:
+            if target_key in editor_keys:
+                editor_keys.remove(target_key)
+            if target['name'] in editor_names:
+                editor_names.remove(target['name'])
+            await _notice(room, f'🔒 {target["name"]} can no longer edit “{name}”')
+        playlist['updated_at'] = time.time()
+        _save_room_playlists()
+    elif action == 'rename':
+        new_name = _clean_playlist_name(data.get('new_name'))
+        if not new_name or new_name in playlists:
+            await _notice(room, '❌ Choose a new, unused playlist name')
+            return
+        playlists[new_name] = playlists.pop(name)
+        name = new_name
+        _save_room_playlists()
+        await _notice(room, f'✏️ Playlist renamed to “{name}”')
+    elif action == 'duplicate':
+        new_name = _clean_playlist_name(data.get('new_name')) or f'{name} copy'
+        if new_name in playlists or len(playlists) >= MAX_ROOM_PLAYLISTS:
+            await _notice(room, '❌ Choose a new, unused playlist name')
+            return
+        playlists[new_name] = {'items': list(playlist.get('items') or []),
+            'owner_key': _member_owner_key(member), 'owner_name': member['name'],
+            'revisions': [], 'updated_by': member['name'], 'updated_at': time.time()}
+        _save_room_playlists()
+        await _notice(room, f'📋 Duplicated as “{new_name}”')
+    elif action == 'undo':
+        revisions = playlist.get('revisions') or []
+        if not revisions:
+            await _notice(room, '❌ There is no earlier revision')
+            return
+        previous = revisions.pop()
+        playlist['items'] = previous.get('items') or []
+        playlist['updated_by'] = member['name']
+        playlist['updated_at'] = time.time()
+        _save_room_playlists()
+        await _notice(room, f'↩️ Restored the previous version of “{name}”')
     await _broadcast_state(room)
 
 
@@ -1354,6 +1543,10 @@ async def _handle_browser_message(room, ws, member, data):
         await _broadcast_state(room)
 
     elif event == 'settings':
+        if not _can_moderate(member):
+            await _notice(room, f'🔒 {name}, room settings require a moderator')
+            increment('role_denials_total')
+            return True
         cfg = get_settings(room.id)
         changed = []
         for key in ('adblock', 'sponsorblock'):
@@ -1367,9 +1560,27 @@ async def _handle_browser_message(room, ws, member, data):
         if quality in (360, 480, 720, 1080) and quality != cfg['quality']:
             cfg['quality'] = quality
             changed.append(f'quality {quality}p')
+        if _is_host(member):
+            control_policy = str(data.get('control_policy') or '')
+            skip_policy = str(data.get('skip_policy') or '')
+            if control_policy in ('host', 'moderators', 'everyone') \
+                    and control_policy != cfg['control_policy']:
+                cfg['control_policy'] = control_policy
+                changed.append(f'controls: {control_policy}')
+            if skip_policy in ('moderators', 'vote', 'everyone') \
+                    and skip_policy != cfg['skip_policy']:
+                cfg['skip_policy'] = skip_policy
+                room.skip_votes.clear()
+                changed.append(f'skipping: {skip_policy}')
+            if 'vote_threshold' in data:
+                threshold = max(0.25, min(1.0, _safe_float(
+                    data.get('vote_threshold'), cfg['vote_threshold'], 0.25, 1.0)))
+                if threshold != cfg['vote_threshold']:
+                    cfg['vote_threshold'] = threshold
+                    changed.append(f'vote threshold: {round(threshold * 100)}%')
         if changed:
             room_settings[room.id] = cfg
-            _save_json(SETTINGS_FILE, room_settings)
+            _save_room_settings()
             await _notice(room, f'⚙️ {name} set ' + ', '.join(changed))
             await _broadcast_state(room)
 
@@ -1528,15 +1739,18 @@ async def ws_handler(request):
             if not joined:
                 continue
 
-            if room.mode == 'watch' and t in {'play', 'pause', 'seek', 'jump', 'skip'} and \
-                    not _can_moderate(member):
-                await _notice(room, f'🔒 {name}, playback controls require a moderator')
+            if room.mode == 'watch' and t in {'play', 'pause', 'seek', 'jump'} and \
+                    not _can_control(room, member):
+                await _notice(room, f'🔒 {name}, playback controls require a moderator under this room policy')
                 increment('role_denials_total')
                 continue
 
             if t == 'chat':
                 text = str(data.get('text') or '')[:500].strip()
-                if text:
+                if member.get('muted_until', 0) > time.time():
+                    await ws.send_str(json.dumps({'t': 'chat', 'name': None,
+                        'text': '🔇 You are temporarily muted.', 'ts': time.time()}))
+                elif text:
                     entry = {'name': name, 'text': text, 'ts': time.time()}
                     room.chat.append(entry)
                     await _broadcast(room, dict(entry, t='chat'))
@@ -1580,12 +1794,28 @@ async def ws_handler(request):
                     sess = cobrowser.get(room.id) if cobrowser else None
                     if sess:
                         await sess.stop()
+                    room.skip_votes.clear()
                     room.index = idx
                     room._advanced_past = idx - 1
                     room.set_position(0, playing=True)
                     await _broadcast_state(room)
 
             elif t == 'skip':
+                skip_policy = get_settings(room.id).get('skip_policy', 'vote')
+                immediate = _can_moderate(member) or skip_policy == 'everyone'
+                if not immediate and skip_policy == 'moderators':
+                    await _notice(room, f'🔒 {name}, skipping requires a moderator')
+                    continue
+                if not immediate:
+                    room.skip_votes.add(member['session'])
+                    needed = max(1, math.ceil(
+                        len(room.sockets) * get_settings(room.id)['vote_threshold']))
+                    if len(room.skip_votes) < needed:
+                        await _notice(room, f'🗳️ {name} voted to skip ({len(room.skip_votes)}/{needed})')
+                        await _broadcast_state(room)
+                        continue
+                    await _notice(room, f'🗳️ Skip vote passed ({len(room.skip_votes)}/{needed})')
+                room.skip_votes.clear()
                 if room.index + 1 < len(room.queue):
                     room.index += 1
                     room.set_position(0, playing=True)
@@ -1594,6 +1824,21 @@ async def ws_handler(request):
                 room._advanced_past = room.index - 1
                 await _notice(room, f'⏭ {name} skipped')
                 await _broadcast_state(room)
+
+            elif t == 'reorder':
+                if not _can_control(room, member):
+                    await _notice(room, f'🔒 {name}, reordering is not allowed by the room policy')
+                    continue
+                source = _safe_int(data.get('from'))
+                target = _safe_int(data.get('to'))
+                if 0 <= source < len(room.queue) and 0 <= target < len(room.queue) \
+                        and source != room.index and target != room.index:
+                    current = room.current()
+                    item = room.queue.pop(source)
+                    room.queue.insert(target, item)
+                    if current in room.queue:
+                        room.index = room.queue.index(current)
+                    await _broadcast_state(room)
 
             elif t == 'remove':
                 if not _can_moderate(member):
@@ -1614,6 +1859,7 @@ async def ws_handler(request):
                     continue
                 # drop the item being watched (e.g. a dead/unpickable one)
                 if 0 <= room.index < len(room.queue):
+                    room.skip_votes.clear()
                     room.queue.pop(room.index)
                     if room.index >= len(room.queue):
                         room.index = len(room.queue) - 1
@@ -1625,6 +1871,7 @@ async def ws_handler(request):
             elif t == 'ended':
                 idx = _safe_int(data.get('index'))
                 if idx == room.index and idx > room._advanced_past:
+                    room.skip_votes.clear()
                     room._advanced_past = idx
                     if room.mode == 'watch':
                         if room.index + 1 < len(room.queue):
@@ -1704,7 +1951,8 @@ async def ws_handler(request):
                                             'likes': cur['likes']})
 
             elif t == 'playlist_save':
-                await _save_room_playlist(room, data.get('name'), member)
+                async with _room_playlist_lock(room):
+                    await _save_room_playlist(room, data.get('name'), member)
 
             elif t == 'playlist_load':
                 playlist_name = _clean_playlist_name(data.get('name'))
@@ -1712,11 +1960,12 @@ async def ws_handler(request):
                        f'playlist:{room.id}:{playlist_name}')
 
             elif t == 'playlist_delete':
-                if not _can_moderate(member):
-                    await _notice(room, f'🔒 {name}, deleting playlists requires a moderator')
-                    increment('role_denials_total')
-                    continue
-                await _delete_room_playlist(room, data.get('name'), member)
+                async with _room_playlist_lock(room):
+                    await _delete_room_playlist(room, data.get('name'), member)
+
+            elif t == 'playlist_manage':
+                async with _room_playlist_lock(room):
+                    await _playlist_manage(room, member, data, ws)
 
             elif t == 'role_set':
                 if not _is_host(member):
@@ -1742,10 +1991,41 @@ async def ws_handler(request):
                 await _notice(room, f'🛡️ {target["name"]} is now {role}')
                 await _broadcast_state(room)
 
+            elif t == 'participant_action':
+                if not _is_host(member):
+                    await _notice(room, f'🔒 {name}, only the host can manage participants')
+                    continue
+                target_id = re.sub(r'[^A-Za-z0-9_-]', '', str(data.get('id') or ''))[:64]
+                pair = next(((socket, value) for socket, value in room.sockets.items()
+                             if value['id'] == target_id), None)
+                if not pair or pair[1]['id'] == member['id']:
+                    continue
+                target_socket, target = pair
+                action = str(data.get('action') or '')
+                if action in ('viewer', 'moderator', 'host'):
+                    if action == 'host':
+                        member['role'] = 'moderator'
+                        room.roles[member['session']] = 'moderator'
+                    target['role'] = action
+                    room.roles[target['session']] = action
+                    await _notice(room, f'🛡️ {target["name"]} is now {action}')
+                elif action == 'mute':
+                    target['muted_until'] = time.time() + 300
+                    await _notice(room, f'🔇 {target["name"]} was muted for 5 minutes')
+                elif action == 'unmute':
+                    target['muted_until'] = 0
+                    await _notice(room, f'🔊 {target["name"]} was unmuted')
+                elif action == 'kick':
+                    await _notice(room, f'👋 {target["name"]} was removed by the host')
+                    await target_socket.close(code=4003, message=b'removed by host')
+                await _broadcast_state(room)
+
             elif await _handle_browser_message(room, ws, member, data):
                 pass
     finally:
         room.sockets.pop(ws, None)
+        if member:
+            room.skip_votes.discard(member.get('session'))
         room.last_activity = time.monotonic()
         message_limiter.discard((room.id, id(ws)))
         if joined:
@@ -1821,7 +2101,7 @@ async def api_create(request):
     if len(tokens) >= MAX_ROOM_TOKENS:
         return web.json_response({'error': 'server room limit reached'}, status=503)
     tokens[token] = {'room': room_id, 'name': name, 'created_at': now}
-    _save_json(TOKENS_FILE, tokens)
+    _save_tokens()
     base = getattr(config, 'WEB_SERVER_URL', 'https://deeppixel.online').rstrip('/')
     path = '/watch/' if mode == 'watch' else '/watch/reels'
     return web.json_response({'url': f'{base}{path}?room={room_id}#token={token}'})
@@ -1919,8 +2199,8 @@ async def shutdown(_app=None):
         except Exception:
             logger.exception('Shared browsers did not all stop cleanly')
     await task_registry.cancel_all()
-    _save_json(PROFILES_FILE, profiles)
-    _save_json(ROOM_PLAYLISTS_FILE, room_playlists)
+    _save_profiles()
+    _save_room_playlists()
     rooms.clear()
     increment('graceful_shutdowns_total')
 
@@ -2029,9 +2309,19 @@ WATCH_HTML = r"""<!DOCTYPE html>
   .qitem .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
   .qitem .s{color:var(--muted);font-size:12px;white-space:nowrap}
   .qitem .x{color:var(--danger);cursor:pointer;padding:2px 6px}
+  .queue-move{padding:4px 7px;font-size:12px}
+  .qitem[draggable=true]{cursor:grab}.qitem.dragging{opacity:.45}.qitem.drag-over{box-shadow:inset 0 2px var(--accent)}
+  .chip.host{color:#ffd166}.chip.moderator{color:#71d7ff}
+  button:focus-visible,input:focus-visible,select:focus-visible,.chip:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+  @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
   .chatbox{background:var(--panel);border-radius:var(--radius);display:flex;flex-direction:column;
            height:calc(100vh - 120px);min-height:420px;position:sticky;top:12px}
-  @media(max-width:900px){.chatbox{height:380px;position:static}}
+  @media(max-width:900px){
+    .chatbox{height:380px;position:static}
+    .top{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(18px)}
+    .playlistbar input,.playlistbar select{flex:1 1 160px}
+    .qitem{gap:6px}.qitem img{width:44px;height:28px}.qitem .s:last-of-type{display:none}
+  }
   .chatbox h2{font-size:14px;margin:0;padding:12px 14px;color:var(--muted);border-bottom:1px solid #2a2a40}
   .msgs{flex:1;overflow-y:auto;padding:10px 14px;display:flex;flex-direction:column;gap:6px}
   .m{font-size:14px;line-height:1.35;word-break:break-word}
@@ -2103,7 +2393,7 @@ WATCH_HTML = r"""<!DOCTYPE html>
                onkeydown="if(event.key==='Enter')addVid(false)">
         <button class="primary" onclick="addVid(false)">Add</button>
         <button onclick="addVid(true)">Play next</button>
-        <button onclick="send({t:'skip'})">⏭</button>
+        <button id="skipBtn" onclick="send({t:'skip'})">⏭</button>
         <button title="Shared browser" onclick="startBrowser()">🌐</button>
       </div>
     </div>
@@ -2115,6 +2405,12 @@ WATCH_HTML = r"""<!DOCTYPE html>
         <button id="deletePlaylistBtn" onclick="deletePlaylist()">Delete</button>
         <input id="playlistName" maxlength="50" placeholder="New playlist name">
         <button class="primary" onclick="savePlaylist()">Save queue</button>
+        <button onclick="managePlaylist('rename')">Rename</button><button onclick="managePlaylist('duplicate')">Duplicate</button>
+        <button onclick="managePlaylist('undo')">↩ Undo</button><button onclick="managePlaylist('export')">⇩ Export</button>
+        <select id="playlistEditor" aria-label="Playlist editor"><option value="">Choose editor…</option></select>
+        <button onclick="managePlaylistEditor('editor_add')">Grant edit</button>
+        <button onclick="managePlaylistEditor('editor_remove')">Revoke</button>
+        <label class="chip" style="cursor:pointer">⇧ Import<input type="file" accept="application/json" hidden onchange="importRoomPlaylist(this.files[0]);this.value=''"></label>
       </div>
       <div id="queue"><div class="empty">Nothing queued — add something!</div></div>
     </div>
@@ -2147,10 +2443,24 @@ WATCH_HTML = r"""<!DOCTYPE html>
       <option value="360">360p</option><option value="480">480p</option>
       <option value="720">720p</option><option value="1080">1080p</option>
     </select></label>
+  <label class="setrow"><span>🎮 Playback controls<small>who may play, pause, seek, and reorder</small></span>
+    <select id="setControlPolicy"><option value="host">Host only</option><option value="moderators">Host &amp; moderators</option><option value="everyone">Everyone</option></select></label>
+  <label class="setrow"><span>⏭ Skip policy<small>moderators, voting, or everyone</small></span>
+    <select id="setSkipPolicy"><option value="moderators">Moderators only</option><option value="vote">Vote to skip</option><option value="everyone">Everyone</option></select></label>
+  <label class="setrow"><span>🗳 Vote threshold<small>percentage of connected participants</small></span>
+    <select id="setVoteThreshold"><option value="0.25">25%</option><option value="0.5">50%</option><option value="0.67">67%</option><option value="1">100%</option></select></label>
   <div style="color:var(--muted);font-size:12px;margin:6px 0 12px">
     Adblock applies the next time the browser starts. Quality &amp; SponsorBlock apply to newly added videos.</div>
   <button class="primary" style="width:100%" onclick="saveSettings()">Save for this room</button>
   <button style="width:100%;margin-top:8px" onclick="document.getElementById('settingsModal').classList.add('hidden')">Cancel</button>
+</div></div>
+<div class="modal hidden" id="roleModal"><div class="box" role="dialog" aria-modal="true" aria-labelledby="roleTitle">
+  <b id="roleTitle">Manage participant</b><div id="roleTarget" style="margin:10px;color:var(--muted)"></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <button onclick="participantAction('viewer')">👤 Viewer</button><button onclick="participantAction('moderator')">🛡️ Moderator</button>
+    <button onclick="participantAction('host')">👑 Transfer host</button><button onclick="participantAction('mute')">🔇 Mute 5 min</button>
+    <button onclick="participantAction('unmute')">🔊 Unmute</button><button class="danger" onclick="participantAction('kick')">✕ Remove</button>
+  </div><button style="width:100%;margin-top:10px" onclick="closeRoleModal()">Cancel</button>
 </div></div>
 <div class="modal hidden" id="landing"><div class="box">
   <div style="font-size:44px">🍿</div>
@@ -2168,6 +2478,7 @@ const ROOM = P.get('room') || '';
 const LINK_TOKEN = new URLSearchParams(location.hash.slice(1)).get('token') || '';
 let CLIENT_ID='';
 let ws = null, st = null, myName = localStorage.getItem('wt_name') || '';
+let roomDragFrom=-1;
 let sup = {play:0, pause:0, seek:0};  // suppress echoing remote-triggered events
 let needGesture = true, syncAt = 0, endedSent = -1;
 const v = document.getElementById('v');
@@ -2211,6 +2522,7 @@ function connect(){
     else if(d.t==='progress') updateProgress(d);
     else if(d.t==='bcursor') showCursor(d);
     else if(d.t==='bmedia') showMedia(d);
+    else if(d.t==='playlist_export') downloadRoomPlaylist(d);
   };
 }
 
@@ -2221,30 +2533,44 @@ function curItem(){
 }
 function me(){return st&&st.participants.find(p=>p.id===CLIENT_ID)}
 function canModerate(){const m=me();return m&&(m.role==='host'||m.role==='moderator')}
+function canControl(){const m=me(),p=st&&st.settings&&st.settings.control_policy;if(!m)return false;return p==='everyone'||(p==='host'?m.role==='host':canModerate())}
 function requireControl(){
-  if(canModerate())return true;
-  toast('🔒 Ask the host for moderator access');
+  if(canControl())return true;
+  toast('🔒 The room policy does not allow that control');
   if(st)applySync(st);
   return false;
 }
 function roleIcon(role){return role==='host'?'👑':role==='moderator'?'🛡️':'👤'}
+let roleTargetId=null;
 function manageRole(id,role){
   const m=me(); if(!m||m.role!=='host'||id===CLIENT_ID)return;
-  const next=prompt('Set role: viewer, moderator, or host',role);
-  if(next&&['viewer','moderator','host'].includes(next.toLowerCase()))
-    send({t:'role_set',id,role:next.toLowerCase()});
+  roleTargetId=id;
+  const target=st.participants.find(p=>p.id===id);
+  document.getElementById('roleTarget').textContent=(target?target.name:'Participant')+' · '+role;
+  document.getElementById('roleModal').classList.remove('hidden');
 }
+function closeRoleModal(){roleTargetId=null;document.getElementById('roleModal').classList.add('hidden')}
+function participantAction(action){if(roleTargetId)send({t:'participant_action',id:roleTargetId,action});closeRoleModal()}
 function renderPlaylists(){
   const sel=document.getElementById('roomPlaylist'), current=sel.value;
   sel.innerHTML='<option value="">Shared playlists…</option>'+((st&&st.playlists)||[]).map(p=>
-    `<option value="${encodeURIComponent(p.name)}">${esc(p.name)} (${p.count})</option>`).join('');
+    `<option value="${encodeURIComponent(p.name)}">${esc(p.name)} (${p.count}) · ${esc(p.owner||'shared')}</option>`).join('');
   if([...sel.options].some(o=>o.value===current))sel.value=current;
-  document.getElementById('deletePlaylistBtn').disabled=!canModerate();
+  const editors=document.getElementById('playlistEditor'), editorCurrent=editors.value;
+  editors.innerHTML='<option value="">Choose editor…</option>'+((st&&st.participants)||[]).filter(p=>p.id!==CLIENT_ID).map(p=>
+    `<option value="${esc(p.id)}">${esc(p.name)} · ${esc(p.role)}</option>`).join('');
+  if([...editors.options].some(o=>o.value===editorCurrent))editors.value=editorCurrent;
+  document.getElementById('deletePlaylistBtn').disabled=!sel.value;
   document.getElementById('settingsBtn').disabled=!canModerate();
 }
 function savePlaylist(){const n=document.getElementById('playlistName').value.trim();if(n){send({t:'playlist_save',name:n});document.getElementById('playlistName').value=''}}
 function loadPlaylist(){const v=document.getElementById('roomPlaylist').value;if(v)send({t:'playlist_load',name:decodeURIComponent(v)})}
 function deletePlaylist(){const v=document.getElementById('roomPlaylist').value,n=v?decodeURIComponent(v):'';if(n&&confirm('Delete “'+n+'”?'))send({t:'playlist_delete',name:n})}
+function selectedPlaylist(){const v=document.getElementById('roomPlaylist').value;return v?decodeURIComponent(v):''}
+function managePlaylist(action){const name=selectedPlaylist();if(!name)return toast('Choose a playlist first');const newName=document.getElementById('playlistName').value.trim();if(['rename','duplicate'].includes(action)&&!newName)return toast('Type the new name first');send({t:'playlist_manage',action,name,new_name:newName})}
+function managePlaylistEditor(action){const name=selectedPlaylist(),id=document.getElementById('playlistEditor').value;if(!name||!id)return toast('Choose a playlist and participant');send({t:'playlist_manage',action,name,id})}
+function downloadRoomPlaylist(data){const blob=new Blob([JSON.stringify({name:data.name,items:data.items},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=data.name.replace(/[^a-z0-9_-]+/gi,'_')+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+async function importRoomPlaylist(file){if(!file)return;try{const data=JSON.parse(await file.text());const name=document.getElementById('playlistName').value.trim()||data.name||'Imported playlist';send({t:'playlist_manage',action:'import',name,items:data.items});}catch(_){toast('❌ Invalid playlist JSON')}}
 
 function applyState(d){
   const prev = st ? curItem() : null;
@@ -2253,11 +2579,13 @@ function applyState(d){
   document.getElementById('roomName').textContent = d.name;
   document.title = d.name + ' — Watch Together';
   document.getElementById('who').innerHTML = d.participants.map(p=>
-    `<span class="chip ${p.id===CLIENT_ID?'me':''}" title="${esc(p.role)}" onclick='manageRole(${JSON.stringify(p.id)},${JSON.stringify(p.role)})'>${roleIcon(p.role)} ${esc(p.name)}</span>`).join('');
+    `<button class="chip ${p.role} ${p.id===CLIENT_ID?'me':''}" title="${esc(p.role)}" onclick='manageRole(${JSON.stringify(p.id)},${JSON.stringify(p.role)})'>${roleIcon(p.role)} ${esc(p.name)}</button>`).join('');
   if(d.chat && !document.getElementById('msgs').childElementCount)
     d.chat.forEach(addMsg);
   renderQueue();
   renderPlaylists();
+  const skipBtn=document.getElementById('skipBtn');
+  if(skipBtn)skipBtn.textContent=(d.settings.skip_policy==='vote'&&d.skip_votes)?`🗳️ ${d.skip_votes}/${d.skip_needed}`:'⏭';
   updateBrowserView();
   const cur = curItem();
   const failOvl = document.getElementById('failOvl');
@@ -2346,13 +2674,21 @@ function openSettings(){
   document.getElementById('setAdblock').checked = !!st.settings.adblock;
   document.getElementById('setSponsor').checked = !!st.settings.sponsorblock;
   document.getElementById('setQuality').value = String(st.settings.quality||720);
+  document.getElementById('setControlPolicy').value=st.settings.control_policy||'moderators';
+  document.getElementById('setSkipPolicy').value=st.settings.skip_policy||'vote';
+  document.getElementById('setVoteThreshold').value=String(st.settings.vote_threshold||0.5);
+  const host=me()&&me().role==='host';
+  ['setControlPolicy','setSkipPolicy','setVoteThreshold'].forEach(id=>document.getElementById(id).disabled=!host);
   document.getElementById('settingsModal').classList.remove('hidden');
 }
 function saveSettings(){
   send({t:'settings',
     adblock: document.getElementById('setAdblock').checked,
     sponsorblock: document.getElementById('setSponsor').checked,
-    quality: +document.getElementById('setQuality').value});
+    quality: +document.getElementById('setQuality').value,
+    control_policy:document.getElementById('setControlPolicy').value,
+    skip_policy:document.getElementById('setSkipPolicy').value,
+    vote_threshold:+document.getElementById('setVoteThreshold').value});
   document.getElementById('settingsModal').classList.add('hidden');
 }
 
@@ -2539,15 +2875,20 @@ function renderQueue(){
     else if(it.status==='embed') status='🌐';
     else if(it.live_dl) status='▶️⬇ '+(it.progress||0)+'%';
     else status = fmt(it.duration);
-    return `<div class="qitem ${now?'now':''}" data-uid="${it.uid}">`+
+    return `<div class="qitem ${now?'now':''}" draggable="${!now&&canControl()}" data-uid="${it.uid}" ondragstart="roomQueueDragStart(event,${gi})" ondragover="roomQueueDragOver(event)" ondragleave="this.classList.remove('drag-over')" ondrop="roomQueueDrop(event,${gi})" ondragend="roomQueueDragEnd()">`+
       (it.thumbnail?`<img src="${esc(it.thumbnail)}" loading="lazy">`:'<img>')+
       `<span class="t" onclick="if(requireControl())send({t:'jump',index:${gi}})" title="${esc(it.title)}">${now?'▶ ':''}${esc(it.title)}</span>`+
       `<span class="s" data-status>${status}</span>`+
       `<span class="s">${esc(it.added_by||'')}</span>`+
+      (!now&&canControl()?`<button class="queue-move" aria-label="Move up" onclick="send({t:'reorder',from:${gi},to:${Math.max(0,gi-1)}})">↑</button><button class="queue-move" aria-label="Move down" onclick="send({t:'reorder',from:${gi},to:${Math.min(st.total-1,gi+1)}})">↓</button>`:'')+
       (now||!canModerate()?'':`<span class="x" onclick="send({t:'remove',index:${gi}})">✖</span>`)+
       `</div>`;
   }).join('');
 }
+function roomQueueDragStart(event,index){roomDragFrom=index;event.currentTarget.classList.add('dragging');event.dataTransfer.effectAllowed='move'}
+function roomQueueDragOver(event){if(roomDragFrom<0)return;event.preventDefault();event.currentTarget.classList.add('drag-over')}
+function roomQueueDragEnd(){document.querySelectorAll('.qitem').forEach(el=>el.classList.remove('dragging','drag-over'));roomDragFrom=-1}
+function roomQueueDrop(event,index){event.preventDefault();if(roomDragFrom>=0&&roomDragFrom!==index)send({t:'reorder',from:roomDragFrom,to:index});roomQueueDragEnd()}
 function updateProgress(d){
   if(!st)return;
   const it = st.queue.find(x=>x.uid===d.uid);

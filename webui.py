@@ -17,14 +17,16 @@ import logging
 import os
 import re
 import secrets
+import shutil
+import struct
 import time
 
 from aiohttp import web
 
 import config
-from music import Song, get_autocomplete_suggestions
+from music import Song, get_autocomplete_suggestions, state_store
 from security import SlidingWindowLimiter, client_identity
-from storage import load_json, save_json
+from storage import save_bytes_atomic, save_json
 
 logger = logging.getLogger('MusicBot.WebUI')
 
@@ -38,10 +40,11 @@ LOGIN_LIMITER = SlidingWindowLimiter(10, 5 * 60)
 
 
 def _save_tokens():
+    state_store.save('web_tokens', temp_tokens)
     save_json(TOKENS_FILE, temp_tokens, logger)
 
 
-temp_tokens = load_json(TOKENS_FILE, {}, logger)
+temp_tokens = state_store.load('web_tokens', {}, TOKENS_FILE)
 
 
 def _valid_token_info(token):
@@ -104,10 +107,55 @@ def _song_json(song):
     }
 
 
+def _image_dimensions(image, extension):
+    """Read dimensions without decoding untrusted image pixels."""
+    try:
+        if extension == 'png' and len(image) >= 24:
+            return struct.unpack('>II', image[16:24])
+        if extension == 'jpg':
+            offset = 2
+            while offset + 9 < len(image):
+                if image[offset] != 0xff:
+                    offset += 1
+                    continue
+                marker = image[offset + 1]
+                offset += 2
+                if marker in (0xd8, 0xd9) or 0xd0 <= marker <= 0xd7:
+                    continue
+                size = struct.unpack('>H', image[offset:offset + 2])[0]
+                if marker in range(0xc0, 0xc4) or marker in range(0xc5, 0xc8) or \
+                        marker in range(0xc9, 0xcc) or marker in range(0xcd, 0xd0):
+                    height, width = struct.unpack('>HH', image[offset + 3:offset + 7])
+                    return width, height
+                offset += max(2, size)
+        if extension == 'webp' and len(image) >= 30:
+            chunk = image[12:16]
+            if chunk == b'VP8X':
+                return (1 + int.from_bytes(image[24:27], 'little'),
+                        1 + int.from_bytes(image[27:30], 'little'))
+            if chunk == b'VP8L' and image[20] == 0x2f:
+                bits = int.from_bytes(image[21:25], 'little')
+                return (bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1
+            if chunk == b'VP8 ':
+                marker = image.find(b'\x9d\x01\x2a', 20, 40)
+                if marker >= 0:
+                    return (int.from_bytes(image[marker + 3:marker + 5], 'little') & 0x3fff,
+                            int.from_bytes(image[marker + 5:marker + 7], 'little') & 0x3fff)
+    except (IndexError, struct.error):
+        pass
+    return None
+
+
 class WebUI:
     def __init__(self, bot):
         self.bot = bot
         self.lyrics_cache = {}
+        self.playlist_lock = None
+
+    def _playlist_lock(self):
+        if self.playlist_lock is None:
+            self.playlist_lock = asyncio.Lock()
+        return self.playlist_lock
 
     @property
     def cog(self):
@@ -277,9 +325,17 @@ class WebUI:
             watch = watchtogether.runtime_stats()
         except Exception:
             watch = {}
+        checks = {
+            'discord': bool(self.bot and self.bot.is_ready()),
+            'database': state_store.healthy(),
+            'storage_writable': os.access(os.path.dirname(TOKENS_FILE), os.W_OK),
+            'ffmpeg': bool(shutil.which('ffmpeg')),
+        }
+        ready = all(checks.values())
         return web.json_response({
-            'status': 'ok',
-            'ready': bool(self.bot and self.bot.is_ready()),
+            'status': 'ok' if ready else 'degraded',
+            'ready': ready,
+            'checks': checks,
             'watch': watch,
         }, headers={'Cache-Control': 'no-store'})
 
@@ -319,6 +375,42 @@ class WebUI:
     async def api_guild_state(self, request):
         guild, player = self._get_guild_and_player(request)
         return web.json_response(self._guild_state(guild, player))
+
+    async def api_live(self, request):
+        """Push changed player state to the dashboard without HTTP polling."""
+        try:
+            guild_id = int(request.query.get('guild_id', ''))
+        except ValueError:
+            raise web.HTTPBadRequest(text='bad guild id')
+        allowed = self._get_allowed_guild_id(request)
+        if allowed is not None and allowed != guild_id:
+            raise web.HTTPForbidden(text='forbidden')
+        guild = self.bot.get_guild(guild_id)
+        if not guild or not self.cog:
+            raise web.HTTPNotFound(text='guild not found')
+        player = self.cog.get_player(guild)
+        socket = web.WebSocketResponse(heartbeat=25)
+        await socket.prepare(request)
+        previous = None
+        try:
+            while not socket.closed:
+                payload = self._guild_state(guild, player)
+                encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+                if encoded != previous:
+                    await socket.send_str(encoded)
+                    previous = encoded
+                try:
+                    message = await socket.receive(timeout=0.8)
+                    if message.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED,
+                                        web.WSMsgType.ERROR):
+                        break
+                except asyncio.TimeoutError:
+                    pass
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            await socket.close()
+        return socket
 
     async def api_action(self, request):
         guild, player = self._get_guild_and_player(request)
@@ -493,6 +585,17 @@ class WebUI:
                     from collections import deque
                     player.queue = deque(queue_list)
                     player.clear_preloads()
+            elif action == 'reorder':
+                from collections import deque
+                source = int(body.get('from', -1))
+                target = int(body.get('to', -1))
+                queue_list = list(player.queue)
+                if not (0 <= source < len(queue_list) and 0 <= target < len(queue_list)):
+                    return web.json_response({'error': 'That queue position no longer exists.'}, status=409)
+                song = queue_list.pop(source)
+                queue_list.insert(target, song)
+                player.queue = deque(queue_list)
+                player.clear_preloads()
             elif action == 'skipto':
                 index = int(body.get('index', -1))
                 if 0 <= index < len(player.queue) and vc:
@@ -668,6 +771,10 @@ class WebUI:
         return web.json_response({'playlists': self._playlist_json(guild.id, user_id)})
 
     async def api_playlist_action(self, request):
+        async with self._playlist_lock():
+            return await self._api_playlist_action(request)
+
+    async def _api_playlist_action(self, request):
         guild, player = self._get_guild_and_player(request)
         try:
             body = await request.json()
@@ -870,6 +977,10 @@ class WebUI:
         })
 
     async def api_playlist_cover(self, request):
+        async with self._playlist_lock():
+            return await self._api_playlist_cover(request)
+
+    async def _api_playlist_cover(self, request):
         guild, _player = self._get_guild_and_player(request)
         reader = await request.multipart()
         name = ''
@@ -896,10 +1007,15 @@ class WebUI:
         extension = next((ext for ext, matches in signatures.items() if matches), None)
         if not extension or not content_type.startswith('image/'):
             return web.json_response({'error': 'Use a PNG, JPEG, or WebP image.'}, status=400)
+        dimensions = _image_dimensions(image, extension)
+        if not dimensions:
+            return web.json_response({'error': 'That image appears to be damaged.'}, status=400)
+        if not all(1 <= value <= 4096 for value in dimensions):
+            return web.json_response({'error': 'Cover dimensions must be 4096×4096 or smaller.'}, status=400)
         os.makedirs(PLAYLIST_COVERS_DIR, exist_ok=True)
         filename = hashlib.sha256(f'{guild.id}:{found_owner}:{name}'.encode()).hexdigest()[:28] + '.' + extension
-        with open(os.path.join(PLAYLIST_COVERS_DIR, filename), 'wb') as file:
-            file.write(image)
+        if not save_bytes_atomic(os.path.join(PLAYLIST_COVERS_DIR, filename), image, logger):
+            return web.json_response({'error': 'Could not safely store that cover.'}, status=503)
         meta_data = cog._read_playlist_meta()
         guild_meta = cog._bucket_for(meta_data.setdefault(str(guild.id), {}), found_owner, create=True)
         old_cover = guild_meta.get(name)
@@ -932,6 +1048,7 @@ async def start_web_server(bot):
     app.router.add_get('/api/metrics', ui.api_metrics)
     app.router.add_get('/api/guilds', ui.api_guilds)
     app.router.add_get('/api/guilds/{guild_id}', ui.api_guild_state)
+    app.router.add_get('/api/live', ui.api_live)
     app.router.add_post('/api/guilds/{guild_id}/action', ui.api_action)
     app.router.add_post('/api/guilds/{guild_id}/play', ui.api_play)
     app.router.add_get('/api/guilds/{guild_id}/lyrics', ui.api_lyrics)
@@ -1317,9 +1434,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
     background:repeating-radial-gradient(circle,transparent 0 5px,rgba(255,255,255,.055) 6px,rgba(0,0,0,.10) 7px),
                radial-gradient(circle,transparent 0 13%,rgba(0,0,0,.28) 13.5% 16%,transparent 16.5%),
                conic-gradient(from 12deg,rgba(255,255,255,.14),transparent 14%,transparent 48%,rgba(255,255,255,.09),transparent 68%); }
+  .connection-banner { position:sticky; top:8px; z-index:80; margin:0 auto 10px; width:max-content;
+    max-width:calc(100% - 24px); padding:8px 14px; border-radius:999px; background:#6b3c13;
+    color:#fff3df; box-shadow:0 8px 28px rgba(0,0,0,.3); font-size:13px; }
+  .qitem[draggable="true"] { cursor:grab; }
+  .qitem.dragging { opacity:.42; border:1px dashed var(--accent); }
+  .qitem.drag-over { box-shadow:inset 0 2px 0 var(--accent); }
+  button:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible {
+    outline:3px solid var(--accent); outline-offset:2px; }
+  @media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation-duration:.01ms!important;
+    animation-iteration-count:1!important; transition-duration:.01ms!important; scroll-behavior:auto!important; } }
 </style>
 </head>
 <body>
+<div id="connectionBanner" class="connection-banner" hidden role="status">Reconnecting to live updates…</div>
 <div class="wrap">
   <h1><span class="dot" id="statusDot"></span>🎵 Kivi Yeşili
     <select id="themeSel" onchange="applyTheme(this.value)" title="Theme">
@@ -1360,6 +1488,7 @@ if (urlGuild) {
 
 let guilds = [], selected = sessionStorage.getItem('mb_guild') || localStorage.getItem('mb_guild') || null;
 let state = null, lastStateAt = 0, playlists = [], playlistsGuild = null;
+let liveSocket = null, liveGuild = null, liveRetry = null, queueDragFrom = -1;
 let activeView = localStorage.getItem('mb_view') || 'player', openPlaylistName = null;
 let lyricsData = null, lastLyricsTitle = null, lyricsVisible = localStorage.getItem('mb_lyrics_hidden') !== '1';
 let settingsOpen = false; // intentionally closed on every fresh page load
@@ -1678,7 +1807,35 @@ function renderTabs() {
       (g.playing ? ' <span class="live">● live</span>' : '') + `</div>`).join('');
   }
 }
-function pick(id) { selected = id; playlists = []; playlistsGuild = null; localStorage.setItem('mb_guild', id); renderTabs(); refreshState(); }
+function pick(id) { selected = id; playlists = []; playlistsGuild = null; localStorage.setItem('mb_guild', id); renderTabs(); refreshState(); connectLive(); }
+
+function setConnectionProblem(problem) {
+  const banner=document.getElementById('connectionBanner');
+  if(banner)banner.hidden=!problem;
+  const dot=document.getElementById('statusDot');
+  if(dot)dot.classList.toggle('on',!problem&&!!state);
+}
+function connectLive() {
+  if(!selected||(liveSocket&&liveGuild===selected&&liveSocket.readyState<2))return;
+  if(liveSocket)liveSocket.close();
+  clearTimeout(liveRetry);liveGuild=selected;
+  const target=new URL(basePath+'api/live',location.href);
+  target.protocol=location.protocol==='https:'?'wss:':'ws:';
+  target.searchParams.set('guild_id',selected);
+  liveSocket=new WebSocket(target);
+  liveSocket.onopen=()=>setConnectionProblem(false);
+  liveSocket.onmessage=event=>{
+    if(liveGuild!==selected)return;
+    try{state=JSON.parse(event.data);lastStateAt=Date.now();render();setConnectionProblem(false)}catch(_){ }
+  };
+  liveSocket.onerror=()=>setConnectionProblem(true);
+  liveSocket.onclose=()=>{setConnectionProblem(true);if(liveGuild===selected)liveRetry=setTimeout(connectLive,2000)};
+}
+function queueDragStart(event,index){queueDragFrom=index;event.currentTarget.classList.add('dragging');event.dataTransfer.effectAllowed='move'}
+function queueDragOver(event){event.preventDefault();event.currentTarget.classList.add('drag-over');event.dataTransfer.dropEffect='move'}
+function queueDragEnd(){document.querySelectorAll('.qitem').forEach(el=>el.classList.remove('dragging','drag-over'));queueDragFrom=-1}
+function queueDrop(event,index){event.preventDefault();if(queueDragFrom>=0&&queueDragFrom!==index)act('reorder',{from:queueDragFrom,to:index});queueDragEnd()}
+function moveQueue(source,target){if(state&&target>=0&&target<state.queue_length)act('reorder',{from:source,to:target})}
 
 async function refreshPlaylists() {
   if (!selected) return;
@@ -1882,10 +2039,11 @@ function render() {
   let queueHtml = `<div class="card"><div class="qhead"><h2>📜 Queue (${s.queue_length})</h2>${sectionActions('queue', queueButtons)}</div>`;
   if (!queueCollapsed && s.queue.length) {
     queueHtml += s.queue.map((q, i) =>
-      `<div class="qitem"><span class="n">${i + 1}.</span><span class="t">${esc(q.title)}</span>` +
+      `<div class="qitem" draggable="true" data-queue-index="${i}" ondragstart="queueDragStart(event,${i})" ondragover="queueDragOver(event)" ondragleave="this.classList.remove('drag-over')" ondrop="queueDrop(event,${i})" ondragend="queueDragEnd()"><span class="n" title="Drag to reorder">☷ ${i + 1}.</span><span class="t">${esc(q.title)}</span>` +
       `<span class="d">${esc(q.duration)}</span><span class="btns">` +
       `<button title="Play now" onclick="act('skipto',{index:${i}})">▶</button>` +
-      `<button title="Move to top" onclick="act('top',{index:${i}})">⬆</button>` +
+      `<button title="Move up" aria-label="Move ${esc(q.title)} up" onclick="moveQueue(${i},${i-1})">↑</button>` +
+      `<button title="Move down" aria-label="Move ${esc(q.title)} down" onclick="moveQueue(${i},${i+1})">↓</button>` +
       `<button title="Remove" onclick="act('remove',{index:${i}})">✖</button></span></div>`).join('');
     if (s.queue_length > s.queue.length) html += `<div class="empty">…and ${s.queue_length - s.queue.length} more</div>`;
   } else if (!queueCollapsed) {
@@ -2244,9 +2402,9 @@ function deckFrame(ts) {
 requestAnimationFrame(deckFrame);
 
 setInterval(refreshGuilds, 10000);
-setInterval(refreshState, 3000);
+setInterval(()=>{if(!liveSocket||liveSocket.readyState!==1)refreshState()},15000);
 setInterval(tickProgress, 500);
-exchangeLinkToken().then(ok=>{if(ok)refreshGuilds()});
+exchangeLinkToken().then(async ok=>{if(ok){await refreshGuilds();connectLive()}});
 </script>
 </body>
 </html>

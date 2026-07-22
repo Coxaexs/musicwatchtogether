@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import config
-from storage import load_json, save_json
+from storage import SQLiteDocumentStore, load_json, save_json
 
 # Setup musics folder for downloaded songs
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +44,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('MusicBot')
+STATE_DB_FILE = os.path.join(BOT_DIR, 'musicbot.sqlite3')
+state_store = SQLiteDocumentStore(STATE_DB_FILE, logger)
 
 try:
     os.makedirs(MUSICS_FOLDER, exist_ok=True)
@@ -5567,19 +5569,21 @@ class MusicCog(commands.Cog):
 
     def _read_playlists(self) -> dict:
         return self._migrate_guild_buckets(
-            load_json(self.PLAYLISTS_FILE, {}, logger)
+            state_store.load('music_playlists', {}, self.PLAYLISTS_FILE)
         )
 
     def _write_playlists(self, data: dict):
+        state_store.save('music_playlists', data)
         save_json(self.PLAYLISTS_FILE, data, logger)
 
     def _read_playlist_meta(self) -> dict:
         """Per-playlist metadata (currently custom cover URLs), same bucket layout."""
         return self._migrate_guild_buckets(
-            load_json(self.PLAYLIST_META_FILE, {}, logger)
+            state_store.load('music_playlist_meta', {}, self.PLAYLIST_META_FILE)
         )
 
     def _write_playlist_meta(self, data: dict):
+        state_store.save('music_playlist_meta', data)
         save_json(self.PLAYLIST_META_FILE, data, logger)
 
     @staticmethod

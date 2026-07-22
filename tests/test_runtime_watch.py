@@ -54,7 +54,8 @@ class PlaylistTests(unittest.IsolatedAsyncioTestCase):
             {"url": "not-a-url", "title": "Ignored"},
         ]
 
-        with mock.patch.object(watchtogether, "_save_json") as save:
+        with mock.patch.object(watchtogether, "_save_json") as save, \
+                mock.patch.object(watchtogether.state_store, "save"):
             await watchtogether._save_room_playlist(room, " Road Trip ", member)
 
         saved = watchtogether.room_playlists[room.id]["Road Trip"]
@@ -78,6 +79,30 @@ class PlaylistTests(unittest.IsolatedAsyncioTestCase):
             [call.args[1] for call in add.await_args_list],
             ["https://example.com/1", "https://example.com/2"],
         )
+
+    async def test_owner_can_grant_playlist_editor_access(self):
+        room = watchtogether.Room("w-playlist-unit", "Playlists")
+        owner_socket, editor_socket = FakeSocket(), FakeSocket()
+        owner = room.join(owner_socket, "private-owner", "Owner")
+        editor = room.join(editor_socket, "private-editor", "Editor")
+        watchtogether.room_playlists[room.id] = {
+            "Mix": {
+                "items": [{"url": "https://example.com/one"}],
+                "owner_key": watchtogether._member_owner_key(owner),
+                "owner_name": owner["name"],
+            }
+        }
+
+        with mock.patch.object(watchtogether, "_save_room_playlists"):
+            await watchtogether._playlist_manage(
+                room, owner,
+                {"action": "editor_add", "name": "Mix", "id": editor["id"]},
+                owner_socket,
+            )
+
+        playlist = watchtogether.room_playlists[room.id]["Mix"]
+        self.assertIn(watchtogether._member_owner_key(editor), playlist["editor_keys"])
+        self.assertTrue(watchtogether._can_edit_room_playlist(playlist, editor))
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
