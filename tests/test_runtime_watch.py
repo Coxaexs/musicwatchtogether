@@ -131,6 +131,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rooms", payload["watch"])
         self.assertIn("musicwatch_process_uptime_seconds", watchtogether.metrics_text())
 
+    async def test_dashboard_shell_is_not_cached(self):
+        response = await webui.WebUI(mock.Mock()).index(None)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
 
 class ReelsFeedTests(unittest.IsolatedAsyncioTestCase):
     async def test_topup_prefetches_four_and_penalizes_repeat_creators(self):

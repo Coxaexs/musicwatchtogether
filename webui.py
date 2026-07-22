@@ -289,7 +289,12 @@ class WebUI:
     # ---------- routes ----------
 
     async def index(self, request):
-        return web.Response(text=INDEX_HTML, content_type='text/html')
+        # The dashboard contains its live-connection client inline. Never let
+        # a browser keep an older reconnect implementation after a deploy.
+        return web.Response(
+            text=INDEX_HTML, content_type='text/html',
+            headers={'Cache-Control': 'no-store'},
+        )
 
     async def api_session(self, request):
         peer = client_identity(request)
