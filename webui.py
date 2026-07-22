@@ -194,6 +194,12 @@ class WebUI:
             
         return False
 
+    def _authorized_admin(self, request):
+        """Only a master-password session may use the cross-product admin API."""
+        info = _valid_token_info(self._supplied_token(request))
+        return bool(info and info.get('kind') == 'session'
+                    and info.get('guild_id') is None)
+
 
     def _get_allowed_guild_id(self, request):
         supplied = self._supplied_token(request)
@@ -218,6 +224,8 @@ class WebUI:
     async def auth_middleware(self, request, handler):
         if request.path == '/api/session':
             return await handler(request)
+        if request.path.startswith('/api/admin/') and not self._authorized_admin(request):
+            return web.json_response({'error': 'admin password required'}, status=401)
         if request.path.startswith('/api/') and not self._authorized(request):
             return web.json_response({'error': 'unauthorized'}, status=401)
         return await handler(request)
@@ -354,6 +362,92 @@ class WebUI:
             charset='utf-8',
             headers={'Cache-Control': 'no-store'},
         )
+
+    async def admin_index(self, request):
+        return web.Response(
+            text=ADMIN_HTML, content_type='text/html',
+            headers={'Cache-Control': 'no-store'},
+        )
+
+    def _admin_music_state(self):
+        items = []
+        if not self.cog:
+            return items
+        for guild in sorted(self.bot.guilds, key=lambda value: value.name.lower()):
+            player = self.cog.get_player(guild)
+            vc = guild.voice_client
+            items.append({
+                'id': str(guild.id), 'name': guild.name,
+                'connected': bool(vc and vc.is_connected()),
+                'channel': vc.channel.name if vc and vc.channel else None,
+                'current': player.current.title if player.current else None,
+                'queue': len(player.queue), 'volume': round(player.volume * 100),
+                'autoplay': player.autoplay,
+                'artist_diversity': player.artist_diversity,
+                'vibe_match': player.vibe_match,
+                'automix': player.automix_enabled,
+                'automix_blend_seconds': player.automix_blend_seconds,
+                'karaoke': player.karaoke_mode,
+            })
+        return items
+
+    async def api_admin_state(self, request):
+        import watchtogether
+        return web.json_response({
+            'ready': bool(self.bot and self.bot.is_ready()),
+            'music': self._admin_music_state(),
+            'rooms': watchtogether.admin_snapshot(),
+            'runtime': watchtogether.runtime_stats(),
+        }, headers={'Cache-Control': 'no-store'})
+
+    async def api_admin_update(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        target = body.get('target')
+        if target == 'music':
+            try:
+                guild_id = int(body.get('guild_id'))
+            except (TypeError, ValueError):
+                raise web.HTTPBadRequest(text='bad guild id')
+            guild = self.bot.get_guild(guild_id)
+            if not guild or not self.cog:
+                raise web.HTTPNotFound(text='guild not found')
+            player = self.cog.get_player(guild)
+            if 'volume' in body:
+                player.volume = max(0, min(100, int(body['volume']))) / 100
+                if guild.voice_client and guild.voice_client.source:
+                    guild.voice_client.source.volume = player.volume
+            autoplay_changed = 'autoplay' in body
+            for field in ('autoplay', 'artist_diversity', 'vibe_match'):
+                if field in body:
+                    setattr(player, field, bool(body[field]))
+            if 'automix' in body:
+                player.automix_enabled = bool(body['automix'])
+                player.clear_preloads()
+                if player.automix_enabled:
+                    player.schedule_automix()
+                else:
+                    player.cancel_automix()
+            if 'automix_blend_seconds' in body:
+                player.automix_blend_seconds = max(
+                    4, min(15, int(body['automix_blend_seconds'])))
+            if autoplay_changed:
+                if player.autoplay:
+                    player.schedule_autoplay_prefetch()
+                else:
+                    player.cancel_autoplay_prefetch()
+            self.cog.save_player_settings(player)
+        elif target == 'room':
+            import watchtogether
+            try:
+                watchtogether.admin_update_room(str(body.get('room_id') or ''), body)
+            except ValueError as exc:
+                return web.json_response({'error': str(exc)}, status=400)
+        else:
+            return web.json_response({'error': 'unknown admin target'}, status=400)
+        return await self.api_admin_state(request)
 
     async def api_guilds(self, request):
         guilds = []
@@ -1052,9 +1146,12 @@ async def start_web_server(bot):
     ui = WebUI(bot)
     app = web.Application(middlewares=[ui.auth_middleware], client_max_size=6 * 1024 ** 2)
     app.router.add_get('/', ui.index)
+    app.router.add_get('/admin/', ui.admin_index)
     app.router.add_get('/healthz', ui.health)
     app.router.add_post('/api/session', ui.api_session)
     app.router.add_get('/api/metrics', ui.api_metrics)
+    app.router.add_get('/api/admin/state', ui.api_admin_state)
+    app.router.add_post('/api/admin/update', ui.api_admin_update)
     app.router.add_get('/api/guilds', ui.api_guilds)
     app.router.add_get('/api/guilds/{guild_id}', ui.api_guild_state)
     app.router.add_get('/api/live', ui.api_live)
@@ -1081,6 +1178,34 @@ async def start_web_server(bot):
     protected = "password-protected" if config.WEB_UI_PASSWORD else "no password set"
     logger.info(f"🌐 Web UI running on http://{config.WEB_UI_HOST}:{config.WEB_UI_PORT} ({protected})")
     return runner
+
+
+ADMIN_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MusicWatch Admin</title><style>
+:root{color-scheme:dark;--bg:#090b11;--card:#151925;--line:#283044;--text:#f4f6fb;--muted:#9aa6ba;--accent:#8b7cff;--ok:#58d6a9}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 550px at 10% -10%,#382b6844,transparent),var(--bg);color:var(--text);font:14px system-ui,sans-serif}.wrap{max-width:1180px;margin:auto;padding:24px}.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.top h1{margin-right:auto}.pill,.nav a{border:1px solid var(--line);background:#111622;color:var(--text);border-radius:999px;padding:9px 13px;text-decoration:none}.pill.ok{color:var(--ok)}.nav{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 22px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.card{background:#151925e8;border:1px solid var(--line);border-radius:17px;padding:16px;box-shadow:0 12px 40px #0004}.card h2,.card h3{margin:0 0 10px}.muted{color:var(--muted)}.row{display:flex;align-items:center;justify-content:space-between;gap:14px;border-top:1px solid #ffffff0d;padding:9px 0}.row:first-of-type{border-top:0}input,select,button{background:#0f1420;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:8px}input[type=range]{width:120px}button{cursor:pointer;background:var(--accent);border:0;font-weight:700}.login{position:fixed;inset:0;background:#070910ee;display:grid;place-items:center;z-index:5}.login.hidden{display:none}.login .card{width:min(360px,calc(100% - 32px))}.login input{width:100%;margin:12px 0}.empty{padding:20px;color:var(--muted);text-align:center}
+</style></head><body><div class="wrap">
+<div class="top"><h1>🛠️ MusicWatch Admin</h1><span id="health" class="pill">Connecting…</span></div>
+<div class="nav"><a id="dashboardLink">🎵 MusicBot dashboard</a><a href="/watch/">🎬 WatchTogether</a><a href="/watch/reels">📱 ReelsTogether</a></div>
+<div id="summary" class="grid"></div><h2>MusicBot servers</h2><div id="music" class="grid"></div>
+<h2>WatchTogether &amp; ReelsTogether rooms</h2><div id="rooms" class="grid"></div></div>
+<div id="login" class="login"><div class="card"><h2>Admin password</h2><div class="muted">Use the MusicBot admin password to manage every surface.</div><input id="password" type="password" placeholder="Password" onkeydown="if(event.key==='Enter')signIn()"><button style="width:100%" onclick="signIn()">Open admin</button><div id="error" class="muted" style="margin-top:10px"></div></div></div>
+<script>
+const basePath=location.pathname.replace(/admin\/?$/,'');
+document.getElementById('dashboardLink').href=basePath;
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function request(path,opts={}){const r=await fetch(basePath+path,{credentials:'same-origin',headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});if(r.status===401)throw new Error('auth');const d=await r.json();if(!r.ok)throw new Error(d.error||'Request failed');return d}
+async function signIn(){const password=document.getElementById('password').value;const r=await fetch(basePath+'api/session',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});if(!r.ok){document.getElementById('error').textContent='Wrong password';return}document.getElementById('login').classList.add('hidden');load()}
+function checked(v){return v?'checked':''}
+function musicCard(g){return `<div class="card"><h3>${esc(g.name)}</h3><div class="muted">${g.connected?'🔊 '+esc(g.channel||'Connected'):'Disconnected'} · ${g.current?esc(g.current):'Nothing playing'} · ${g.queue} queued</div><div class="row"><span>Volume <b>${g.volume}%</b></span><input type="range" min="0" max="100" value="${g.volume}" onchange="updateMusic('${g.id}',{volume:+this.value})"></div><div class="row"><span>Smart autoplay</span><input type="checkbox" ${checked(g.autoplay)} onchange="updateMusic('${g.id}',{autoplay:this.checked})"></div><div class="row"><span>Avoid artist streaks</span><input type="checkbox" ${checked(g.artist_diversity)} onchange="updateMusic('${g.id}',{artist_diversity:this.checked})"></div><div class="row"><span>Vibe matching</span><input type="checkbox" ${checked(g.vibe_match)} onchange="updateMusic('${g.id}',{vibe_match:this.checked})"></div><div class="row"><span>AutoMix</span><input type="checkbox" ${checked(g.automix)} onchange="updateMusic('${g.id}',{automix:this.checked})"></div><div class="row"><span>AutoMix blend</span><select onchange="updateMusic('${g.id}',{automix_blend_seconds:+this.value})">${[4,6,8,10,12,15].map(n=>`<option ${n===g.automix_blend_seconds?'selected':''}>${n}</option>`).join('')}</select></div></div>`}
+function roomCard(r){const s=r.settings||{};return `<div class="card"><h3>${r.mode==='reels'?'📱':'🎬'} ${esc(r.name)}</h3><div class="muted">${esc(r.id)} · ${r.active?r.participants+' online · '+r.queued+' queued':'saved settings'}</div><div class="row"><span>Controls</span><select onchange="updateRoom('${esc(r.id)}',{control_policy:this.value})">${['host','moderators','everyone'].map(v=>`<option ${v===s.control_policy?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Skipping</span><select onchange="updateRoom('${esc(r.id)}',{skip_policy:this.value})">${['moderators','vote','everyone'].map(v=>`<option ${v===s.skip_policy?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Vote threshold</span><select onchange="updateRoom('${esc(r.id)}',{vote_threshold:+this.value})">${[.25,.5,.67,1].map(v=>`<option value="${v}" ${v===s.vote_threshold?'selected':''}>${Math.round(v*100)}%</option>`).join('')}</select></div><div class="row"><span>Quality</span><select onchange="updateRoom('${esc(r.id)}',{quality:+this.value})">${[360,480,720,1080].map(v=>`<option ${v===s.quality?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Adblock</span><input type="checkbox" ${checked(s.adblock)} onchange="updateRoom('${esc(r.id)}',{adblock:this.checked})"></div><div class="row"><span>SponsorBlock</span><input type="checkbox" ${checked(s.sponsorblock)} onchange="updateRoom('${esc(r.id)}',{sponsorblock:this.checked})"></div></div>`}
+function render(d){document.getElementById('health').textContent=d.ready?'● Bot healthy':'● Bot not ready';document.getElementById('health').classList.toggle('ok',d.ready);document.getElementById('summary').innerHTML=`<div class="card"><h3>Runtime</h3><div class="row"><span>Active rooms</span><b>${d.runtime.rooms}</b></div><div class="row"><span>Participants</span><b>${d.runtime.participants}</b></div><div class="row"><span>Background tasks</span><b>${d.runtime.background_tasks}</b></div></div>`;document.getElementById('music').innerHTML=d.music.length?d.music.map(musicCard).join(''):'<div class="card empty">No Discord servers</div>';document.getElementById('rooms').innerHTML=d.rooms.length?d.rooms.map(roomCard).join(''):'<div class="card empty">No WatchTogether or ReelsTogether rooms have been created yet.</div>'}
+async function load(){try{render(await request('api/admin/state'));document.getElementById('login').classList.add('hidden')}catch(e){if(e.message==='auth')document.getElementById('login').classList.remove('hidden')}}
+async function updateMusic(id,changes){render(await request('api/admin/update',{method:'POST',body:JSON.stringify({target:'music',guild_id:id,...changes})}))}
+async function updateRoom(id,changes){render(await request('api/admin/update',{method:'POST',body:JSON.stringify({target:'room',room_id:id,...changes})}))}
+load();setInterval(load,10000);
+</script></body></html>"""
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -1470,6 +1595,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </select>
     <button id="settingsBtn" class="settings-toggle" onclick="toggleSettings()"
             aria-expanded="false" aria-controls="settingsPanel">⚙️ Settings</button>
+    <button class="settings-toggle" onclick="location.href=basePath+'admin/'">🛠️ Admin</button>
   </h1>
   <div class="tabs" id="tabs"></div>
   <nav class="view-nav" aria-label="Main views">

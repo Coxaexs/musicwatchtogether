@@ -124,6 +124,18 @@ AUTOMIX_BPM_MIN_CONFIDENCE = 0.30  # normalized autocorrelation peak to trust a 
 AUTOMIX_MIN_ONSET_FLUX = 0.025     # mean log-energy rise; below this there is no beat to find
 AUTOMIX_OVERLAP_GAIN = 0.82        # leave headroom while two normalized tracks overlap
 
+
+def _automix_end_is_credible(end_at: float, declared_duration: Optional[int],
+                             blend_seconds: float) -> bool:
+    """Reject partial/corrupt cache analysis that would jump far too early."""
+    if not declared_duration:
+        return True
+    minimum = min(
+        declared_duration - blend_seconds,
+        max(AUTOMIX_MIN_TRACK_SECONDS, declared_duration * 0.75),
+    )
+    return end_at >= minimum
+
 # Give up on loading a song after this long so one giant/slow download can't
 # freeze the whole player (the queue just moves on to the next song)
 SONG_LOAD_TIMEOUT_SECONDS = 300
@@ -2336,6 +2348,17 @@ class MusicPlayer:
             end_at = out_info['end_at']
             if end_at - self._automix_file_offset < AUTOMIX_MIN_TRACK_SECONDS:
                 return  # too short to be worth blending out of
+            declared_duration = parse_duration_to_seconds(song.duration)
+            if declared_duration:
+                # A corrupt/partial cache analysis once reported a full song's
+                # outro around 30 seconds and AutoMix jumped immediately. Never
+                # trust an analyzed ending that contradicts known metadata.
+                if not _automix_end_is_credible(
+                        end_at, declared_duration, effective_blend):
+                    logger.warning(
+                        "AutoMix ignored implausible ending for %s: %.1fs vs declared %ss",
+                        song.title, end_at, declared_duration)
+                    return
             def transition_trigger():
                 desired = end_at - effective_blend * speed - 0.2
                 bpm = out_info.get('bpm_tail')
@@ -2768,8 +2791,11 @@ class MusicPlayer:
             has_artist_context = bool(cog._song_artist(self.current))
             try:
                 recommendation = await cog.pick_autoplay_recommendation(self)
-                if recommendation:
+                if recommendation and not cog._autoplay_song_is_recent(
+                        recommendation, self.history):
                     return recommendation
+                if recommendation:
+                    logger.info("Autoplay rejected recent repeat: %s", recommendation.title)
             except Exception as e:
                 logger.debug(f"Smart autoplay recommendation failed: {e}")
             # If we know the artist, silence is preferable to an unrelated
@@ -2788,13 +2814,17 @@ class MusicPlayer:
                 favorite = cog.pick_random_favorite(
                     self.guild, exclude_urls={s.url for s in self.history},
                     user_ids=cog._listener_user_ids(self))
-                if favorite:
+                if favorite and not cog._autoplay_song_is_recent(favorite, self.history):
                     favorite.autoplay = True
                     logger.info(f"🎲 Autoplay picked a favorite: {favorite.title}")
                     return favorite
 
             # Avoid repeating what was just played when the library is big enough
             recent_urls = {song.url for song in self.history}
+            recent_title_keys = {
+                cog._feedback_title_key(song.title, cog._song_artist(song))
+                for song in self.history
+            } if cog else set()
 
             def scan_and_pick():
                 # Library scan + ffprobe are disk-bound; keep them off the event loop
@@ -2807,11 +2837,15 @@ class MusicPlayer:
                 for f in files:
                     if f in recent_urls or f in dis_urls:
                         continue
-                    t, _a = parse_local_song_name(f)
+                    t, local_artist = parse_local_song_name(f)
+                    if cog and cog._feedback_title_key(t, local_artist) in recent_title_keys:
+                        continue
                     if re.sub(r'\W+', '', t.lower()) in dis_titles:
                         continue
                     fresh.append(f)
-                chosen = random.choice(fresh or files)
+                if not fresh:
+                    return None, None
+                chosen = random.choice(fresh)
                 return chosen, _probe_duration_seconds(chosen)
 
             path, duration_seconds = await self.bot.loop.run_in_executor(None, scan_and_pick)
@@ -3246,6 +3280,25 @@ class MusicCog(commands.Cog):
         words = cls._normalized_words(title) - cls._normalized_words(artist or '') - noise
         return ''.join(sorted(words))
 
+    def _autoplay_song_is_recent(self, candidate: Optional[Song], history) -> bool:
+        """Match recent plays by URL/video ID and normalized musical identity."""
+        if not candidate:
+            return False
+        candidate_id = extract_youtube_video_id(candidate.url)
+        candidate_key = self._feedback_title_key(
+            candidate.title, self._song_artist(candidate))
+        for previous in history:
+            if candidate.url and candidate.url == previous.url:
+                return True
+            previous_id = extract_youtube_video_id(previous.url)
+            if candidate_id and previous_id and candidate_id == previous_id:
+                return True
+            previous_key = self._feedback_title_key(
+                previous.title, self._song_artist(previous))
+            if candidate_key and candidate_key == previous_key:
+                return True
+        return False
+
     @staticmethod
     def _transition_traits(seed_artist: str, candidate_artist: str,
                            seed_features: Optional[dict], candidate_features: Optional[dict],
@@ -3582,7 +3635,8 @@ class MusicCog(commands.Cog):
                     artist=candidate.get('artist'), autoplay=True)
             else:
                 song = await self._resolve_autoplay_match(candidate, player.guild.me)
-                if not song or not song.url or song.url in recent_urls:
+                if (not song or not song.url
+                        or self._autoplay_song_is_recent(song, player.history)):
                     continue
             song.autoplay_score = round(candidate['score'], 1)
             song.autoplay_reason = '; '.join(candidate['components'][:8])
@@ -3596,7 +3650,7 @@ class MusicCog(commands.Cog):
         # candidate stop the radio. These remain anchored to the seed artist.
         for suffix in ('official audio', 'deep cut official audio', 'radio mix'):
             song = await self.process_youtube(f"{artist} {suffix}", player.guild.me)
-            if song and song.url not in recent_urls:
+            if song and not self._autoplay_song_is_recent(song, player.history):
                 song.artist = song.artist or artist
                 song.autoplay = True
                 song.autoplay_reason = 'artist fallback after candidate resolution failures'
@@ -3606,7 +3660,7 @@ class MusicCog(commands.Cog):
         if genre:
             song = await self.process_youtube(
                 f"{genre} music discovery official audio", player.guild.me)
-            if song and song.url not in recent_urls:
+            if song and not self._autoplay_song_is_recent(song, player.history):
                 song.autoplay = True
                 song.autoplay_reason = f'{genre} session fallback after related tracks failed'
                 song.autoplay_traits = ('artist:change', f'genre:{genre}')

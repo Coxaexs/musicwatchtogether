@@ -24,6 +24,10 @@ class FakeSource:
 
 
 class AutoMixTests(unittest.TestCase):
+    def test_partial_cache_analysis_cannot_trigger_thirty_second_jump(self):
+        self.assertFalse(music._automix_end_is_credible(35, 240, 8))
+        self.assertTrue(music._automix_end_is_credible(232, 240, 8))
+
     def test_tempo_estimator_exposes_beat_phase(self):
         rate = music.AUTOMIX_ANALYSIS_RATE
         samples = array('h', [0] * (rate * 12))
@@ -58,6 +62,18 @@ class AutoMixTests(unittest.TestCase):
 
 
 class AutoplayScoringTests(unittest.IsolatedAsyncioTestCase):
+    def test_recent_identity_rejects_same_track_from_different_upload(self):
+        cog = object.__new__(music.MusicCog)
+        previous = music.Song(
+            'mor ve ötesi - Festus (Official Audio)',
+            'https://youtu.be/previous000', '4:00', None, 'youtube',
+            artist='mor ve ötesi')
+        candidate = music.Song(
+            'Festus [Lyrics]', 'https://youtu.be/different00', '4:01',
+            None, 'youtube', artist='Mor ve Ötesi', autoplay=True)
+
+        self.assertTrue(cog._autoplay_song_is_recent(candidate, [previous]))
+
     async def test_prepared_candidate_does_not_displace_human_queue(self):
         guild = SimpleNamespace(id=7, voice_client=None)
         bot = SimpleNamespace(loop=asyncio.get_running_loop(), get_cog=lambda _name: None)

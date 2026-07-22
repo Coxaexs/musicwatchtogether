@@ -135,6 +135,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         response = await webui.WebUI(mock.Mock()).index(None)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
+    async def test_admin_shell_and_room_snapshot(self):
+        response = await webui.WebUI(mock.Mock()).admin_index(None)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertIn("MusicWatch Admin", response.text)
+
+        room = watchtogether.Room("w-admin-unit", "Admin Room")
+        watchtogether.rooms[room.id] = room
+        try:
+            snapshot = watchtogether.admin_snapshot()
+            item = next(value for value in snapshot if value["id"] == room.id)
+            self.assertEqual(item["mode"], "watch")
+            self.assertTrue(item["active"])
+            self.assertIn("control_policy", item["settings"])
+        finally:
+            watchtogether.rooms.pop(room.id, None)
+
 
 class ReelsFeedTests(unittest.IsolatedAsyncioTestCase):
     async def test_topup_prefetches_four_and_penalizes_repeat_creators(self):

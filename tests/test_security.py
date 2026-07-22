@@ -90,6 +90,22 @@ class ImageSafetyTests(unittest.TestCase):
 
 
 class AuthorizationTests(unittest.TestCase):
+    def test_admin_api_accepts_master_session_but_not_guild_invitation(self):
+        ui = webui.WebUI(None)
+        now = webui.time.time()
+        webui.temp_tokens["admin-test"] = {
+            "guild_id": None, "kind": "session", "created_at": now}
+        webui.temp_tokens["invite-test"] = {
+            "guild_id": 42, "user_id": 7, "created_at": now}
+        try:
+            self.assertTrue(ui._authorized_admin(
+                mock.Mock(cookies={"mb_session": "admin-test"})))
+            self.assertFalse(ui._authorized_admin(
+                mock.Mock(cookies={"mb_session": "invite-test"})))
+        finally:
+            webui.temp_tokens.pop("admin-test", None)
+            webui.temp_tokens.pop("invite-test", None)
+
     def test_expired_dashboard_token_is_rejected_and_removed(self):
         token = "expired-test-token"
         webui.temp_tokens[token] = {

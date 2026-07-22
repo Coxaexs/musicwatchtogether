@@ -228,6 +228,54 @@ def update_settings(room_id, *, adblock=None, sponsorblock=None, quality=None,
     return cfg
 
 
+def admin_snapshot():
+    """Password-admin view of persisted and currently active room settings."""
+    token_names = {}
+    for info in tokens.values():
+        room_id = info.get('room')
+        if room_id and room_id not in token_names:
+            token_names[room_id] = info.get('name')
+    room_ids = set(room_settings) | set(rooms) | set(token_names)
+    result = []
+    for room_id in sorted(room_ids):
+        room = rooms.get(room_id)
+        result.append({
+            'id': room_id,
+            'mode': 'reels' if room_id.startswith('r') else 'watch',
+            'name': (room.name if room else token_names.get(room_id)) or room_id,
+            'active': bool(room),
+            'participants': len(room.sockets) if room else 0,
+            'queued': len(room.queue) if room else 0,
+            'settings': get_settings(room_id),
+        })
+    return result
+
+
+def admin_update_room(room_id, data):
+    """Validated room update used only by the password-protected admin API."""
+    if not re.fullmatch(r'[wr][A-Za-z0-9_-]{1,80}', str(room_id or '')):
+        raise ValueError('invalid room id')
+    cfg = update_settings(
+        room_id,
+        adblock=data.get('adblock') if 'adblock' in data else None,
+        sponsorblock=data.get('sponsorblock') if 'sponsorblock' in data else None,
+        quality=data.get('quality') if 'quality' in data else None,
+        control_policy=data.get('control_policy') if 'control_policy' in data else None,
+        skip_policy=data.get('skip_policy') if 'skip_policy' in data else None,
+        vote_threshold=data.get('vote_threshold') if 'vote_threshold' in data else None,
+    )
+    room_name = re.sub(r'\s+', ' ', str(data.get('name') or '').strip())[:50]
+    if room_name:
+        room = rooms.get(room_id)
+        if room:
+            room.name = room_name
+        for info in tokens.values():
+            if info.get('room') == room_id:
+                info['name'] = room_name
+        _save_tokens()
+    return cfg
+
+
 def get_room_link(channel_id, channel_name, mode):
     """Used by the /watch and /reels slash commands in music.py."""
     room_id = ('w' if mode == 'watch' else 'r') + str(channel_id)
