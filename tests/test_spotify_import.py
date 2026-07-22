@@ -73,6 +73,31 @@ class SpotifyCollectionTests(unittest.TestCase):
         self.assertEqual(result["tracks"][0]["search_query"], "First Artist A")
         self.assertEqual(spotify.next_calls, 1)
 
+    def test_playlist_artist_credits_are_deduplicated_case_insensitively(self):
+        spotify = FakeSpotify()
+        duplicate_track = spotify.track("Bir Derdim Var", "unused", 250000)
+        duplicate_track["artists"] = [
+            {"name": "mor ve ötesi"}, {"name": "mor ve ötesi"},
+            {"name": "Mor ve Ötesi"}, {"name": "Mor ve Ötesi"},
+            {"name": "Tarkan Gözübüyük"},
+        ]
+        spotify.playlist = mock.Mock(return_value={
+            "name": "Turkish Rock", "images": [],
+            "tracks": {"total": 1, "next": None,
+                       "items": [{"track": duplicate_track}]},
+        })
+        with mock.patch.object(music, "SPOTIFY_AVAILABLE", True), \
+                mock.patch.object(music, "sp", spotify):
+            result = music.MusicCog._blocking_spotify_collection(
+                "https://open.spotify.com/playlist/abc123")
+
+        track = result["tracks"][0]
+        self.assertEqual(track["artists"], ["mor ve ötesi", "Tarkan Gözübüyük"])
+        self.assertEqual(track["title"],
+                         "Bir Derdim Var — mor ve ötesi, Tarkan Gözübüyük")
+        self.assertEqual(track["search_query"],
+                         "Bir Derdim Var mor ve ötesi, Tarkan Gözübüyük")
+
     def test_album_import_uses_collection_cover_as_fallback(self):
         with mock.patch.object(music, "SPOTIFY_AVAILABLE", True), \
                 mock.patch.object(music, "sp", FakeSpotify()):

@@ -705,33 +705,24 @@ class WebUI:
             
         cog = self.cog
         song_title = player.current.title
-        song_artist = cog._lyrics_artist_for_song(player.current) \
-            if hasattr(cog, '_lyrics_artist_for_song') else player.current.artist
-        cache_key = f'{song_artist or ""}|{song_title}'
+        song_artists = cog._lyrics_artist_candidates_for_song(player.current) \
+            if hasattr(cog, '_lyrics_artist_candidates_for_song') else [player.current.artist]
+        song_artists = [artist for artist in song_artists if artist]
+        cache_key = f'{"|".join(artist.casefold() for artist in song_artists)}|{song_title}'
         
         # Check cache
         if cache_key in self.lyrics_cache:
             return web.json_response(self.lyrics_cache[cache_key])
             
         # Fetch synced lyrics
-        search_query = song_title
-        cleaned_query = cog._clean_lyrics_query(search_query) if hasattr(cog, '_clean_lyrics_query') else search_query
-        candidates = [search_query]
-        if cleaned_query and cleaned_query.lower() != search_query.lower():
-            candidates.append(cleaned_query)
-            
-        lyrics_data = None
-        for candidate in candidates:
-            if hasattr(cog, '_fetch_synced_lyrics'):
-                lyrics_data = await cog._fetch_synced_lyrics(
-                    candidate, song_artist, _duration_to_seconds(player.current.duration))
-                if lyrics_data:
-                    break
+        lyrics_data = await cog._fetch_synced_lyrics_for_song(player.current) \
+            if hasattr(cog, '_fetch_synced_lyrics_for_song') else None
                     
         if not lyrics_data:
             # Store empty result in cache to avoid spamming lrclib for unfound tracks
             self.lyrics_cache[cache_key] = {
-                'track': song_title, 'artist': song_artist or 'Unknown', 'lines': []}
+                'track': song_title,
+                'artist': ', '.join(song_artists) or 'Unknown', 'lines': []}
             return web.json_response(self.lyrics_cache[cache_key])
             
         # Cache and return

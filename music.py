@@ -1610,10 +1610,7 @@ class MusicControlView(View):
             return
 
         await interaction.response.defer(ephemeral=True)
-        query = cog._clean_lyrics_query(player.current.title)
-        lyrics_data = await cog._fetch_synced_lyrics(
-            query, cog._lyrics_artist_for_song(player.current),
-            parse_duration_to_seconds(player.current.duration))
+        lyrics_data = await cog._fetch_synced_lyrics_for_song(player.current)
         if not lyrics_data or not lyrics_data.get('lines'):
             await interaction.followup.send(
                 f"🎤 No synced lyrics found for **{player.current.title}**.", ephemeral=True
@@ -2238,7 +2235,9 @@ class MusicPlayer:
                         next_song.title = yt_song.title
                         next_song.duration = yt_song.duration
                         next_song.thumbnail = yt_song.thumbnail
-                        next_song.artist = yt_song.artist or next_song.artist
+                        # Keep Spotify's ordered credits; the YouTube uploader
+                        # is often a label and can discard featured artists.
+                        next_song.artist = next_song.artist or yt_song.artist
                         next_song.album = yt_song.album or next_song.album
                         next_song.genres = yt_song.genres or next_song.genres
                 
@@ -2559,9 +2558,8 @@ class MusicPlayer:
             if self.current:
                 cog = self.bot.get_cog('MusicCog')
                 if cog:
-                    asyncio.create_task(cog._fetch_synced_lyrics(
-                        self.current.title, cog._lyrics_artist_for_song(self.current),
-                        parse_duration_to_seconds(self.current.duration)))
+                    asyncio.create_task(
+                        cog._fetch_synced_lyrics_for_song(self.current))
 
             logger.info(f"Playing from queue: {self.current.title} (type: {self.current.source_type})")
 
@@ -2637,7 +2635,7 @@ class MusicPlayer:
                             self.current.title = yt_song.title
                             self.current.duration = yt_song.duration
                             self.current.thumbnail = yt_song.thumbnail
-                            self.current.artist = yt_song.artist or self.current.artist
+                            self.current.artist = self.current.artist or yt_song.artist
                             self.current.album = yt_song.album or self.current.album
                             self.current.genres = yt_song.genres or self.current.genres
 
@@ -4285,10 +4283,10 @@ class MusicCog(commands.Cog):
         normalized = []
         collection_cover = images[0].get('url') if images else None
         for track in tracks[:limit]:
-            artists = ', '.join(
+            artist_names = MusicCog._dedupe_artist_names(
                 artist.get('name', '') for artist in (track.get('artists') or [])
-                if artist.get('name')
-            )
+                if artist.get('name'))
+            artists = ', '.join(artist_names)
             title = str(track.get('name') or '').strip()
             if not title:
                 continue
@@ -4296,6 +4294,7 @@ class MusicCog(commands.Cog):
             normalized.append({
                 'title': f'{title} — {artists}' if artists else title,
                 'search_query': f'{title} {artists}'.strip(),
+                'artists': artist_names,
                 'duration_ms': track.get('duration_ms'),
                 'thumbnail': (album_images[0].get('url')
                               if album_images else collection_cover),
@@ -4325,6 +4324,7 @@ class MusicCog(commands.Cog):
                 requester=requester,
                 source_type='spotify',
                 thumbnail=track.get('thumbnail'),
+                artist=', '.join(track.get('artists') or []) or None,
             ))
         return payload, songs
 
@@ -4728,6 +4728,21 @@ class MusicCog(commands.Cog):
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned
 
+    @staticmethod
+    def _dedupe_artist_names(artists) -> list[str]:
+        """Deduplicate artist names case-insensitively, preserving first order."""
+        if isinstance(artists, str):
+            artists = artists.split(',')
+        unique = []
+        seen = set()
+        for value in artists or ():
+            name = re.sub(r'\s+', ' ', str(value or '').strip())
+            key = name.casefold()
+            if name and key not in seen:
+                seen.add(key)
+                unique.append(name)
+        return unique
+
     def _lyrics_search_context(self, query: str, artist: Optional[str] = None) -> tuple[str, Optional[str]]:
         """Return a clean LRCLIB track/artist pair without duplicating artist."""
         track = self._clean_lyrics_query(query or '')
@@ -4748,18 +4763,58 @@ class MusicCog(commands.Cog):
             return False
         return wanted_key in actual_key or actual_key in wanted_key
 
-    def _lyrics_artist_for_song(self, song: Optional[Song]) -> Optional[str]:
-        """Prefer an explicit ``Artist - Track`` prefix over upload channel."""
+    def _lyrics_artist_candidates_for_song(self, song: Optional[Song]) -> list[str]:
+        """Ordered, unique artists to try independently for one song."""
         if not song:
-            return None
+            return []
+        candidates = []
         parts = re.split(r'\s+[-–—|]\s+', song.title or '', maxsplit=1)
         if len(parts) == 2:
-            candidate = parts[0].strip()
-            if 1 < len(candidate) <= 80 and not re.search(
-                    r'\b(official|lyrics?|audio|video|records?|music)\b',
-                    candidate, flags=re.IGNORECASE):
-                return candidate
-        return self._song_artist(song)
+            # Lazy Spotify titles are "Track — Artist, Artist"; ordinary
+            # YouTube music titles are usually "Artist - Track".
+            explicit = parts[1] if str(song.url).startswith('spotify:search:') else parts[0]
+            if 1 < len(explicit.strip()) <= 160 and not re.search(
+                    r'\b(official|lyrics?|audio|video|records?)\b',
+                    explicit, flags=re.IGNORECASE):
+                candidates.extend(self._dedupe_artist_names(explicit))
+        candidates.extend(self._dedupe_artist_names(song.artist or ''))
+        return self._dedupe_artist_names(candidates)
+
+    def _lyrics_artist_for_song(self, song: Optional[Song]) -> Optional[str]:
+        """Compatibility helper returning the first artist search candidate."""
+        artists = self._lyrics_artist_candidates_for_song(song)
+        return artists[0] if artists else None
+
+    async def _fetch_synced_lyrics_for_song(self, song: Song,
+                                            query: Optional[str] = None) -> Optional[dict]:
+        """Try each unique artist in order, never one comma-joined mega-query."""
+        search_query = query or song.title
+        if query is None and str(song.url).startswith('spotify:search:'):
+            search_query = re.split(
+                r'\s+[-–—|]\s+', search_query, maxsplit=1)[0].strip()
+        cleaned = self._clean_lyrics_query(search_query)
+        candidate = cleaned or search_query
+        artists = self._lyrics_artist_candidates_for_song(song) or [None]
+        duration = parse_duration_to_seconds(song.duration)
+        for artist in artists:
+            result = await self._fetch_synced_lyrics(candidate, artist, duration)
+            if result:
+                return result
+        return None
+
+    async def _fetch_plain_lyrics_for_song(self, song: Song,
+                                           query: Optional[str] = None) -> Optional[dict]:
+        search_query = query or song.title
+        if query is None and str(song.url).startswith('spotify:search:'):
+            search_query = re.split(
+                r'\s+[-–—|]\s+', search_query, maxsplit=1)[0].strip()
+        cleaned = self._clean_lyrics_query(search_query)
+        candidate = cleaned or search_query
+        for artist in self._lyrics_artist_candidates_for_song(song) or [None]:
+            result = await self._fetch_lyrics(candidate, artist)
+            if result:
+                return result
+        return None
 
     async def _fetch_lyrics(self, query: str, artist: Optional[str] = None) -> Optional[dict]:
         """Fetch lyrics from lrclib using free public search API."""
@@ -5076,10 +5131,13 @@ class MusicCog(commands.Cog):
 
             # Read cached live lyrics if available
             try:
-                track, artist = self._lyrics_search_context(
-                    song.title, self._lyrics_artist_for_song(song))
-                cache_path = self._get_lyrics_cache_path(track, artist)
-                lyrics_data = self._read_cached_lyrics(cache_path)
+                lyrics_data = None
+                for artist in self._lyrics_artist_candidates_for_song(song) or [None]:
+                    track, artist = self._lyrics_search_context(song.title, artist)
+                    lyrics_data = self._read_cached_lyrics(
+                        self._get_lyrics_cache_path(track, artist))
+                    if lyrics_data:
+                        break
                 if lyrics_data and lyrics_data.get('lines'):
                     lines = lyrics_data['lines']
                     current_second = player.get_playback_position_seconds()
@@ -5176,10 +5234,7 @@ class MusicCog(commands.Cog):
         embed = self.create_now_playing_embed(song, player)
 
         try:
-            search_query = self._clean_lyrics_query(song.title)
-            lyrics_data = await self._fetch_synced_lyrics(
-                search_query, self._lyrics_artist_for_song(song),
-                parse_duration_to_seconds(song.duration))
+            lyrics_data = await self._fetch_synced_lyrics_for_song(song)
             if lyrics_data and lyrics_data.get('lines'):
                 preview_lines = [text for _, text in lyrics_data['lines'][:3] if text.strip()]
                 if preview_lines:
@@ -7085,14 +7140,7 @@ class MusicCog(commands.Cog):
         if cleaned_query and cleaned_query.lower() != search_query.lower():
             candidates.append(cleaned_query)
 
-        artist = self._lyrics_artist_for_song(player.current)
-        duration_seconds = parse_duration_to_seconds(player.current.duration)
-        lyrics_data = None
-        for candidate in candidates:
-            lyrics_data = await self._fetch_synced_lyrics(
-                candidate, artist, duration_seconds)
-            if lyrics_data:
-                break
+        lyrics_data = await self._fetch_synced_lyrics_for_song(player.current)
 
         try:
             if not lyrics_data:
@@ -7259,12 +7307,14 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer()
 
-        artist = self._lyrics_artist_for_song(player.current) if not query and player.current else None
-        result = None
-        for candidate in candidates:
-            result = await self._fetch_lyrics(candidate, artist)
-            if result:
-                break
+        if not query and player.current:
+            result = await self._fetch_plain_lyrics_for_song(player.current)
+        else:
+            result = None
+            for candidate in candidates:
+                result = await self._fetch_lyrics(candidate)
+                if result:
+                    break
 
         if not result:
             await interaction.followup.send(f"❌ Lyrics not found for: **{search_query}**")
@@ -7306,14 +7356,7 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer()
 
-        artist = self._lyrics_artist_for_song(player.current)
-        duration_seconds = parse_duration_to_seconds(player.current.duration)
-        lyrics_data = None
-        for candidate in candidates:
-            lyrics_data = await self._fetch_synced_lyrics(
-                candidate, artist, duration_seconds)
-            if lyrics_data:
-                break
+        lyrics_data = await self._fetch_synced_lyrics_for_song(player.current)
 
         if not lyrics_data:
             await interaction.followup.send(f"❌ Synced lyrics not found for: **{search_query}**")
