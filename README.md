@@ -18,6 +18,9 @@ A Discord music bot (`music.py`) with a browser-based control dashboard and a
 - 📚 **Collaborative room playlists** — participants can save the current
   queue as a persistent shared playlist and load it together later. Moderators
   can remove obsolete room playlists.
+- 🎧 **Spotify playlist import** — paste a Spotify playlist or album link in
+  the dashboard library to create a personal playlist with up to 200 tracks,
+  Spotify artwork, durations, and automatic duplicate-name handling.
 - 📱 **ReelsTogether** — a synced, swipeable short-form feed with backward
   navigation through recent reels and a per-room taste algorithm. Watch and
   Reels rooms share a hard 10-video download cache.

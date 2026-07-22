@@ -676,7 +676,7 @@ class WebUI:
 
         action = body.get('action')
         name = (body.get('name') or '').strip()[:50]
-        if not name:
+        if action != 'import_spotify' and not name:
             return web.json_response({'error': 'Give the playlist a name.'}, status=400)
 
         cog = self.cog
@@ -689,8 +689,56 @@ class WebUI:
         own_lists = cog._bucket_for(guild_data, owner_key, create=True)
         found_owner = cog.resolve_playlist_owner(data, guild.id, user_id, name)
         found_lists = cog._bucket_for(guild_data, found_owner) if found_owner else None
+        imported_name = None
 
-        if action == 'create':
+        if action == 'import_spotify':
+            url = str(body.get('url') or '').strip()[:500]
+            try:
+                payload, songs = await cog.spotify_collection(
+                    url, self._acting_member(request, guild), limit=200
+                )
+            except ValueError as error:
+                return web.json_response({'error': str(error)}, status=400)
+            except RuntimeError as error:
+                return web.json_response({'error': str(error)}, status=503)
+            except Exception as error:
+                logger.error('Spotify playlist import failed', exc_info=True)
+                return web.json_response(
+                    {'error': 'Spotify could not load that playlist. It may be private or unavailable.'},
+                    status=502,
+                )
+            if not songs:
+                return web.json_response({'error': 'Spotify returned no playable tracks.'}, status=404)
+
+            base_name = re.sub(r'\s+', ' ', payload['name']).strip()[:50] or 'Spotify import'
+            imported_name = base_name
+            visible_names = set(guild_data.get('shared', {})) | set(own_lists)
+            suffix = 2
+            while imported_name in visible_names:
+                ending = f' ({suffix})'
+                imported_name = base_name[:50 - len(ending)].rstrip() + ending
+                suffix += 1
+            own_lists[imported_name] = [{
+                'title': song.title,
+                'url': song.url,
+                'duration': song.duration,
+                'source_type': song.source_type,
+                'thumbnail': song.thumbnail,
+            } for song in songs]
+            cog._write_playlists(data)
+            if payload.get('cover'):
+                meta_data = cog._read_playlist_meta()
+                guild_meta = cog._bucket_for(
+                    meta_data.setdefault(str(guild.id), {}), owner_key, create=True
+                )
+                guild_meta[imported_name] = payload['cover']
+                cog._write_playlist_meta(meta_data)
+            imported = len(songs)
+            message = f'Imported {imported} track' + ('' if imported == 1 else 's')
+            if payload['total'] > imported:
+                message += f' of {payload["total"]}'
+            message += f' from Spotify as {imported_name}.'
+        elif action == 'create':
             if found_owner:
                 return web.json_response({'error': f'A playlist named {name} already exists.'}, status=409)
             own_lists[name] = []
@@ -721,7 +769,7 @@ class WebUI:
             meta_data = cog._read_playlist_meta()
             guild_meta = cog._bucket_for(meta_data.setdefault(str(guild.id), {}), found_owner)
             cover_url = guild_meta.pop(name, None)
-            if cover_url:
+            if cover_url and cover_url.startswith('/playlist-covers/'):
                 try:
                     os.remove(os.path.join(PLAYLIST_COVERS_DIR, os.path.basename(cover_url)))
                 except FileNotFoundError:
@@ -816,6 +864,7 @@ class WebUI:
 
         return web.json_response({
             'message': message,
+            'imported_name': imported_name,
             'playlists': self._playlist_json(guild.id, user_id),
             'state': self._guild_state(guild, player),
         })
@@ -856,7 +905,8 @@ class WebUI:
         old_cover = guild_meta.get(name)
         guild_meta[name] = '/playlist-covers/' + filename
         cog._write_playlist_meta(meta_data)
-        if old_cover and old_cover != guild_meta[name]:
+        if old_cover and old_cover.startswith('/playlist-covers/') \
+                and old_cover != guild_meta[name]:
             try:
                 os.remove(os.path.join(PLAYLIST_COVERS_DIR, os.path.basename(old_cover)))
             except FileNotFoundError:
@@ -1086,7 +1136,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .library-head h2 { font-size:30px; margin:0 0 4px; }
   .library-head p { color:var(--muted); margin:0; }
   .library-create { display:flex; gap:8px; width:min(420px,100%); }
-  .library-create input, .playlist-add input { flex:1; min-width:0; background:var(--panel2); color:var(--text);
+  .library-tools { display:grid; gap:8px; width:min(520px,100%); }
+  .spotify-import { display:flex; gap:8px; }
+  .spotify-import button { background:#1ed760; color:#07130a; font-weight:750; white-space:nowrap; }
+  .library-create input, .spotify-import input, .playlist-add input { flex:1; min-width:0; background:var(--panel2); color:var(--text);
     border:1px solid var(--border); border-radius:999px; padding:11px 16px; }
   .playlist-card { cursor:pointer; }
   .playlist-card .playlist-actions { opacity:0; transition:opacity .18s; }
@@ -1445,15 +1498,20 @@ function playlistCardsHTML() {
 function renderPlaylistPage() {
   const content = document.getElementById('content');
   const oldSearch = document.getElementById('playlistSongSearch');
+  const oldSpotify = document.getElementById('spotifyImportUrl');
   const oldValue = oldSearch ? oldSearch.value : '';
+  const oldSpotifyValue = oldSpotify ? oldSpotify.value : '';
   const wasFocused = document.activeElement === oldSearch;
+  const spotifyWasFocused = document.activeElement === oldSpotify;
   const playlist = playlists.find(item => item.name === openPlaylistName);
   let html = '';
   if (!playlist) {
     openPlaylistName = null;
-    html = `<section class="card"><div class="library-head"><div><h2>Your library</h2><p>Create a playlist, then fill it one search at a time.</p></div>
-      <div class="library-create"><input id="playlistName" maxlength="50" placeholder="New playlist name" onkeydown="if(event.key==='Enter')createPlaylist()">
-      <button class="primary" onclick="createPlaylist()">＋ Create</button></div></div>
+    html = `<section class="card"><div class="library-head"><div><h2>Your library</h2><p>Create your own collection or bring one over from Spotify.</p></div>
+      <div class="library-tools"><div class="library-create"><input id="playlistName" maxlength="50" placeholder="New playlist name" onkeydown="if(event.key==='Enter')createPlaylist()">
+      <button class="primary" onclick="createPlaylist()">＋ Create</button></div>
+      <div class="spotify-import"><input id="spotifyImportUrl" placeholder="Spotify playlist or album link" aria-label="Spotify playlist or album link" onkeydown="if(event.key==='Enter')importSpotifyPlaylist()">
+      <button id="spotifyImportBtn" onclick="importSpotifyPlaylist()">♫ Import Spotify</button></div></div></div>
       <div class="playlist-grid">${playlistCardsHTML()}</div></section>`;
   } else {
     const cover = playlist.cover ? `style="background-image:url('${cssUrl(mediaUrl(playlist.cover))}')"` : '';
@@ -1481,6 +1539,11 @@ function renderPlaylistPage() {
   content.innerHTML = html + playerControlsHTML(state);
   const restored = document.getElementById('playlistSongSearch');
   if (restored) { restored.value = oldValue; if (wasFocused) restored.focus(); }
+  const restoredSpotify = document.getElementById('spotifyImportUrl');
+  if (restoredSpotify) {
+    restoredSpotify.value = oldSpotifyValue;
+    if (spotifyWasFocused) restoredSpotify.focus();
+  }
   const lyricsCard = document.getElementById('lyricsCard');
   if (lyricsCard) lyricsCard.style.display = 'none';
   tickProgress();
@@ -1496,9 +1559,11 @@ async function playlistAction(action, name, extra) {
       const search = document.getElementById('playlistSongSearch');
       if (search) search.value = '';
     }
+    if (action === 'import_spotify' && res.imported_name) openPlaylistName = res.imported_name;
     toast((action === 'play' ? '▶ ' : '✓ ') + res.message);
     render();
-  } catch (e) { toast('❌ ' + e.message); }
+    return res;
+  } catch (e) { toast('❌ ' + e.message); return null; }
 }
 function playlistByIndex(action, index) {
   const playlist = playlists[index];
@@ -1514,6 +1579,24 @@ function createPlaylist() {
   if (!name) { toast('Name the playlist first.'); if (input) input.focus(); return; }
   openPlaylistName = name;
   playlistAction('create', name);
+}
+let spotifyImportBusy = false;
+async function importSpotifyPlaylist() {
+  const input = document.getElementById('spotifyImportUrl');
+  const button = document.getElementById('spotifyImportBtn');
+  const url = input ? input.value.trim() : '';
+  if (!/^(?:https?:\/\/open\.spotify\.com\/(?:playlist|album)\/|spotify:(?:playlist|album):)/i.test(url)) {
+    toast('❌ Paste a Spotify playlist or album link.');
+    if (input) input.focus();
+    return;
+  }
+  if (spotifyImportBusy) return;
+  spotifyImportBusy = true;
+  if (button) { button.disabled = true; button.textContent = '⏳ Importing…'; }
+  toast('⏳ Importing Spotify tracks…');
+  const result = await playlistAction('import_spotify', '', {url});
+  spotifyImportBusy = false;
+  if (!result && button) { button.disabled = false; button.textContent = '♫ Import Spotify'; }
 }
 function addSongToPlaylist() {
   const input = document.getElementById('playlistSongSearch');

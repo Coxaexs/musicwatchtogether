@@ -3816,72 +3816,101 @@ class MusicCog(commands.Cog):
 
         return songs, total_count
     
-    async def process_spotify_playlist_fast(self, url: str, requester: discord.Member) -> tuple[list[Song], int]:
-        """Add all Spotify playlist songs to queue with track names - search happens on-demand"""
+    @staticmethod
+    def _blocking_spotify_collection(url: str, limit: int = 200) -> dict:
+        """Fetch a Spotify playlist/album without blocking the asyncio loop."""
+        match = re.fullmatch(
+            r'(?:https://open\.spotify\.com/(playlist|album)/[A-Za-z0-9]+(?:\?.*)?'
+            r'|spotify:(playlist|album):[A-Za-z0-9]+)',
+            str(url or '').strip(),
+            re.IGNORECASE,
+        )
+        if not match:
+            raise ValueError('Paste a Spotify playlist or album link.')
+        if not SPOTIFY_AVAILABLE or sp is None:
+            raise RuntimeError(
+                'Spotify importing needs SPOTIFY_CLIENT_ID and '
+                'SPOTIFY_CLIENT_SECRET on the server.'
+            )
+
+        kind = (match.group(1) or match.group(2)).lower()
+        tracks = []
+        if kind == 'playlist':
+            collection = sp.playlist(url)
+            results = collection.get('tracks') or {}
+            total = int(results.get('total') or 0)
+            items = list(results.get('items') or [])
+            while results.get('next') and len(items) < limit:
+                results = sp.next(results)
+                items.extend(results.get('items') or [])
+            tracks = [item.get('track') for item in items if item.get('track')]
+            images = collection.get('images') or []
+        else:
+            collection = sp.album(url)
+            results = collection.get('tracks') or {}
+            total = int(collection.get('total_tracks') or results.get('total') or 0)
+            tracks = list(results.get('items') or [])
+            while results.get('next') and len(tracks) < limit:
+                results = sp.next(results)
+                tracks.extend(results.get('items') or [])
+            images = collection.get('images') or []
+
+        normalized = []
+        collection_cover = images[0].get('url') if images else None
+        for track in tracks[:limit]:
+            artists = ', '.join(
+                artist.get('name', '') for artist in (track.get('artists') or [])
+                if artist.get('name')
+            )
+            title = str(track.get('name') or '').strip()
+            if not title:
+                continue
+            album_images = (track.get('album') or {}).get('images') or []
+            normalized.append({
+                'title': f'{title} — {artists}' if artists else title,
+                'search_query': f'{title} {artists}'.strip(),
+                'duration_ms': track.get('duration_ms'),
+                'thumbnail': (album_images[0].get('url')
+                              if album_images else collection_cover),
+            })
+        return {
+            'kind': kind,
+            'name': str(collection.get('name') or 'Spotify import').strip(),
+            'cover': collection_cover,
+            'total': total or len(normalized),
+            'tracks': normalized,
+        }
+
+    async def spotify_collection(self, url: str, requester: discord.Member,
+                                 limit: int = 200) -> tuple[dict, list[Song]]:
+        loop = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(
+            None, lambda: self._blocking_spotify_collection(url, limit)
+        )
         songs = []
-        total_count = 0
-        
-        if not SPOTIFY_AVAILABLE:
-            return songs, 0
-        
+        for track in payload['tracks']:
+            duration_ms = track.get('duration_ms')
+            songs.append(Song(
+                title=track['title'],
+                url=f"spotify:search:{track['search_query']}",
+                duration=(self.format_duration(duration_ms / 1000)
+                          if duration_ms else 'Unknown'),
+                requester=requester,
+                source_type='spotify',
+                thumbnail=track.get('thumbnail'),
+            ))
+        return payload, songs
+
+    async def process_spotify_playlist_fast(self, url: str, requester: discord.Member) -> tuple[list[Song], int]:
+        """Resolve a Spotify collection to lazy YouTube-search queue entries."""
         try:
-            print(f"Loading Spotify playlist metadata: {url}")
-            
-            if 'playlist' in url:
-                playlist = sp.playlist(url)
-                total_count = playlist['tracks']['total']
-                results = playlist['tracks']
-                all_tracks = results['items']
-                
-                # Get all tracks
-                while results['next']:
-                    results = sp.next(results)
-                    all_tracks.extend(results['items'])
-                
-                print(f"  Playlist: {playlist['name']} ({total_count} tracks)")
-                
-                # Add all tracks to queue (metadata only, up to 50)
-                for item in all_tracks[:50]:
-                    track = item.get('track')
-                    if track and track.get('name'):
-                        # Create a special Song object that will be searched later
-                        search_query = f"{track['name']} {track['artists'][0]['name']}"
-                        song = Song(
-                            title=search_query,  # Store search query as title temporarily
-                            url=f"spotify:search:{search_query}",  # Special URL marker
-                            duration="Unknown",
-                            requester=requester,
-                            source_type='spotify',
-                            thumbnail=track.get('album', {}).get('images', [{}])[0].get('url') if track.get('album') else None
-                        )
-                        songs.append(song)
-            
-            elif 'album' in url:
-                album = sp.album(url)
-                total_count = album['total_tracks']
-                artist_name = album['artists'][0]['name']
-                
-                print(f"  Album: {album['name']} ({total_count} tracks)")
-                
-                # Add all tracks to queue (metadata only, up to 50)
-                for track in album['tracks']['items'][:50]:
-                    search_query = f"{track['name']} {artist_name}"
-                    song = Song(
-                        title=search_query,
-                        url=f"spotify:search:{search_query}",
-                        duration="Unknown",
-                        requester=requester,
-                        source_type='spotify',
-                        thumbnail=album.get('images', [{}])[0].get('url') if album.get('images') else None
-                    )
-                    songs.append(song)
-            
-            print(f"✅ Added {len(songs)} songs to queue (will search on-demand)")
-            
-        except Exception as e:
-            print(f"Spotify playlist processing error: {e}")
-        
-        return songs, total_count
+            payload, songs = await self.spotify_collection(url, requester, limit=50)
+            logger.info("Loaded Spotify %s %s (%s/%s tracks)",
+                        payload['kind'], payload['name'], len(songs), payload['total'])
+            return songs, payload['total']
+        except Exception as error:
+            logger.warning("Spotify collection processing failed: %s", error)
+            return [], 0
     
     async def process_youtube_playlist_initial(self, url: str, requester: discord.Member) -> tuple[list[Song], int, list]:
         """Process first song of YouTube playlist only, store rest for later"""
