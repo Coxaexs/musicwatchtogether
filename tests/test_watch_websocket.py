@@ -167,6 +167,28 @@ class WatchWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                          ["three", "one", "two"])
         self.assertEqual(reordered["index"], 2)
 
+    async def test_host_can_rename_room_and_viewer_cannot(self):
+        host_socket, _host_id, _ = await self.join("Host")
+        viewer_socket, _viewer_id, _ = await self.join("Viewer")
+
+        with mock.patch.object(watchtogether, "_save_tokens") as save_tokens:
+            await host_socket.send_json({"t": "settings", "room_name": "Friday Cinema"})
+            renamed = await self.receive_until(
+                viewer_socket,
+                lambda value: value.get("t") == "state"
+                and value.get("name") == "Friday Cinema",
+            )
+            self.assertEqual(watchtogether.tokens[self.token]["name"], "Friday Cinema")
+            save_tokens.assert_called_once()
+
+        await viewer_socket.send_json({"t": "settings", "room_name": "Hijacked"})
+        await self.receive_until(
+            viewer_socket,
+            lambda value: value.get("t") == "chat"
+            and "requires a moderator" in value.get("text", ""),
+        )
+        self.assertEqual(watchtogether.rooms[self.room_id].name, "Friday Cinema")
+
 
 if __name__ == "__main__":
     unittest.main()

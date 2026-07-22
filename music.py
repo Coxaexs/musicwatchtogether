@@ -1611,7 +1611,9 @@ class MusicControlView(View):
 
         await interaction.response.defer(ephemeral=True)
         query = cog._clean_lyrics_query(player.current.title)
-        lyrics_data = await cog._fetch_synced_lyrics(query)
+        lyrics_data = await cog._fetch_synced_lyrics(
+            query, cog._lyrics_artist_for_song(player.current),
+            parse_duration_to_seconds(player.current.duration))
         if not lyrics_data or not lyrics_data.get('lines'):
             await interaction.followup.send(
                 f"🎤 No synced lyrics found for **{player.current.title}**.", ephemeral=True
@@ -2557,7 +2559,9 @@ class MusicPlayer:
             if self.current:
                 cog = self.bot.get_cog('MusicCog')
                 if cog:
-                    asyncio.create_task(cog._fetch_synced_lyrics(self.current.title))
+                    asyncio.create_task(cog._fetch_synced_lyrics(
+                        self.current.title, cog._lyrics_artist_for_song(self.current),
+                        parse_duration_to_seconds(self.current.duration)))
 
             logger.info(f"Playing from queue: {self.current.title} (type: {self.current.source_type})")
 
@@ -4724,9 +4728,44 @@ class MusicCog(commands.Cog):
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned
 
-    async def _fetch_lyrics(self, query: str) -> Optional[dict]:
+    def _lyrics_search_context(self, query: str, artist: Optional[str] = None) -> tuple[str, Optional[str]]:
+        """Return a clean LRCLIB track/artist pair without duplicating artist."""
+        track = self._clean_lyrics_query(query or '')
+        artist = (artist or '').strip() or None
+        if artist:
+            track = re.sub(
+                rf'^\s*{re.escape(artist)}\s*[-–—|:]\s*', '', track,
+                flags=re.IGNORECASE,
+            ).strip() or track
+        return track, artist
+
+    def _lyrics_artist_matches(self, wanted: Optional[str], actual: str) -> bool:
+        if not wanted:
+            return True
+        wanted_key = self._artist_key(wanted)
+        actual_key = self._artist_key(actual)
+        if not wanted_key or not actual_key:
+            return False
+        return wanted_key in actual_key or actual_key in wanted_key
+
+    def _lyrics_artist_for_song(self, song: Optional[Song]) -> Optional[str]:
+        """Prefer an explicit ``Artist - Track`` prefix over upload channel."""
+        if not song:
+            return None
+        parts = re.split(r'\s+[-–—|]\s+', song.title or '', maxsplit=1)
+        if len(parts) == 2:
+            candidate = parts[0].strip()
+            if 1 < len(candidate) <= 80 and not re.search(
+                    r'\b(official|lyrics?|audio|video|records?|music)\b',
+                    candidate, flags=re.IGNORECASE):
+                return candidate
+        return self._song_artist(song)
+
+    async def _fetch_lyrics(self, query: str, artist: Optional[str] = None) -> Optional[dict]:
         """Fetch lyrics from lrclib using free public search API."""
-        url = f"https://lrclib.net/api/search?q={quote(query)}"
+        track_query, artist = self._lyrics_search_context(query, artist)
+        search_query = f'{artist} {track_query}' if artist else track_query
+        url = f"https://lrclib.net/api/search?q={quote(search_query)}"
         timeout = aiohttp.ClientTimeout(total=12)
 
         try:
@@ -4742,7 +4781,9 @@ class MusicCog(commands.Cog):
             return None
 
         for item in data:
-            if not self._is_query_match(query, item.get('trackName', '')):
+            if not self._is_query_match(track_query, item.get('trackName', '')):
+                continue
+            if not self._lyrics_artist_matches(artist, item.get('artistName', '')):
                 continue
             lyrics = item.get('plainLyrics') or item.get('syncedLyrics')
             if not lyrics:
@@ -4754,7 +4795,7 @@ class MusicCog(commands.Cog):
                 continue
 
             return {
-                'track': item.get('trackName') or query,
+                'track': item.get('trackName') or track_query,
                 'artist': item.get('artistName') or 'Unknown',
                 'lyrics': lyrics,
             }
@@ -4785,8 +4826,9 @@ class MusicCog(commands.Cog):
         parsed.sort(key=lambda item: item[0])
         return parsed
 
-    def _get_lyrics_cache_path(self, query: str) -> str:
-        sanitized = re.sub(r'[^a-zA-Z0-9_\-\s]', '', query)
+    def _get_lyrics_cache_path(self, query: str, artist: Optional[str] = None) -> str:
+        cache_key = f'{artist} - {query}' if artist else query
+        sanitized = re.sub(r'[^a-zA-Z0-9_\-\s]', '', cache_key)
         sanitized = re.sub(r'[\s_]+', '_', sanitized).strip('_')
         sanitized = sanitized[:100]
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -4812,9 +4854,11 @@ class MusicCog(commands.Cog):
         self._lyrics_file_cache[cache_path] = (mtime, data)
         return data
 
-    async def _fetch_synced_lyrics(self, query: str) -> Optional[dict]:
+    async def _fetch_synced_lyrics(self, query: str, artist: Optional[str] = None,
+                                   duration_seconds: Optional[int] = None) -> Optional[dict]:
+        track_query, artist = self._lyrics_search_context(query, artist)
         # Check local cache first
-        cache_path = self._get_lyrics_cache_path(query)
+        cache_path = self._get_lyrics_cache_path(track_query, artist)
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
@@ -4825,7 +4869,8 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 logger.error(f"Error reading lyrics cache for {query}: {e}")
 
-        url = f"https://lrclib.net/api/search?q={quote(query)}"
+        search_query = f'{artist} {track_query}' if artist else track_query
+        url = f"https://lrclib.net/api/search?q={quote(search_query)}"
         timeout = aiohttp.ClientTimeout(total=12)
 
         try:
@@ -4841,8 +4886,21 @@ class MusicCog(commands.Cog):
             return None
 
         result = None
-        for item in data:
-            if not self._is_query_match(query, item.get('trackName', '')):
+        def duration_distance(item):
+            try:
+                return abs(float(item.get('duration')) - duration_seconds) \
+                    if duration_seconds and item.get('duration') else 10_000
+            except (TypeError, ValueError):
+                return 10_000
+
+        ranked = sorted(data, key=lambda item: (
+            not self._lyrics_artist_matches(artist, item.get('artistName', '')),
+            duration_distance(item),
+        ))
+        for item in ranked:
+            if not self._is_query_match(track_query, item.get('trackName', '')):
+                continue
+            if not self._lyrics_artist_matches(artist, item.get('artistName', '')):
                 continue
             synced = item.get('syncedLyrics')
             if not synced:
@@ -4853,7 +4911,7 @@ class MusicCog(commands.Cog):
                 continue
 
             result = {
-                'track': item.get('trackName') or query,
+                'track': item.get('trackName') or track_query,
                 'artist': item.get('artistName') or 'Unknown',
                 'lines': parsed_lines,
             }
@@ -5018,7 +5076,9 @@ class MusicCog(commands.Cog):
 
             # Read cached live lyrics if available
             try:
-                cache_path = self._get_lyrics_cache_path(song.title)
+                track, artist = self._lyrics_search_context(
+                    song.title, self._lyrics_artist_for_song(song))
+                cache_path = self._get_lyrics_cache_path(track, artist)
                 lyrics_data = self._read_cached_lyrics(cache_path)
                 if lyrics_data and lyrics_data.get('lines'):
                     lines = lyrics_data['lines']
@@ -5117,7 +5177,9 @@ class MusicCog(commands.Cog):
 
         try:
             search_query = self._clean_lyrics_query(song.title)
-            lyrics_data = await self._fetch_synced_lyrics(search_query)
+            lyrics_data = await self._fetch_synced_lyrics(
+                search_query, self._lyrics_artist_for_song(song),
+                parse_duration_to_seconds(song.duration))
             if lyrics_data and lyrics_data.get('lines'):
                 preview_lines = [text for _, text in lyrics_data['lines'][:3] if text.strip()]
                 if preview_lines:
@@ -7023,9 +7085,12 @@ class MusicCog(commands.Cog):
         if cleaned_query and cleaned_query.lower() != search_query.lower():
             candidates.append(cleaned_query)
 
+        artist = self._lyrics_artist_for_song(player.current)
+        duration_seconds = parse_duration_to_seconds(player.current.duration)
         lyrics_data = None
         for candidate in candidates:
-            lyrics_data = await self._fetch_synced_lyrics(candidate)
+            lyrics_data = await self._fetch_synced_lyrics(
+                candidate, artist, duration_seconds)
             if lyrics_data:
                 break
 
@@ -7194,9 +7259,10 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer()
 
+        artist = self._lyrics_artist_for_song(player.current) if not query and player.current else None
         result = None
         for candidate in candidates:
-            result = await self._fetch_lyrics(candidate)
+            result = await self._fetch_lyrics(candidate, artist)
             if result:
                 break
 
@@ -7240,9 +7306,12 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer()
 
+        artist = self._lyrics_artist_for_song(player.current)
+        duration_seconds = parse_duration_to_seconds(player.current.duration)
         lyrics_data = None
         for candidate in candidates:
-            lyrics_data = await self._fetch_synced_lyrics(candidate)
+            lyrics_data = await self._fetch_synced_lyrics(
+                candidate, artist, duration_seconds)
             if lyrics_data:
                 break
 

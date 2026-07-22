@@ -132,5 +132,42 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("musicwatch_process_uptime_seconds", watchtogether.metrics_text())
 
 
+class ReelsFeedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_topup_prefetches_four_and_penalizes_repeat_creators(self):
+        room = watchtogether.Room("r-feed-unit", "Feed")
+        entries = [
+            {"id": f"video-{index}", "title": f"Cats clip {index}",
+             "url": f"https://example.com/{index}", "uploader": f"Creator {index}"}
+            for index in range(8)
+        ]
+
+        def extract(url):
+            index = int(url.rsplit('/', 1)[-1])
+            return dict(entries[index], duration=20, width=720, height=1280,
+                        webpage_url=url, thumbnail=None, tags=["cats"])
+
+        spawned = []
+
+        def discard_download(coroutine, _name):
+            spawned.append(coroutine)
+            coroutine.close()
+
+        with mock.patch.object(watchtogether, "_blocking_search", return_value=entries), \
+                mock.patch.object(watchtogether, "_blocking_extract", side_effect=extract), \
+                mock.patch.object(watchtogether, "_spawn", side_effect=discard_download), \
+                mock.patch.object(room, "save_profile"):
+            await watchtogether._reels_topup_inner(room)
+
+        self.assertEqual(watchtogether.REELS_READY_AHEAD, 4)
+        self.assertEqual(watchtogether.REELS_CACHE_LIMIT, 30)
+        self.assertEqual(len(room.queue), 4)
+        self.assertEqual(len(spawned), 4)
+
+        repeated = {"title": "Cats forever", "uploader": room.recent_uploaders[0]}
+        fresh = {"title": "Cats forever", "uploader": "New creator"}
+        self.assertLess(watchtogether._entry_score(room, repeated),
+                        watchtogether._entry_score(room, fresh))
+
+
 if __name__ == "__main__":
     unittest.main()

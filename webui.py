@@ -698,14 +698,17 @@ class WebUI:
         if not player.current:
             return web.json_response({'track': None, 'artist': None, 'lines': []})
             
+        cog = self.cog
         song_title = player.current.title
+        song_artist = cog._lyrics_artist_for_song(player.current) \
+            if hasattr(cog, '_lyrics_artist_for_song') else player.current.artist
+        cache_key = f'{song_artist or ""}|{song_title}'
         
         # Check cache
-        if song_title in self.lyrics_cache:
-            return web.json_response(self.lyrics_cache[song_title])
+        if cache_key in self.lyrics_cache:
+            return web.json_response(self.lyrics_cache[cache_key])
             
         # Fetch synced lyrics
-        cog = self.cog
         search_query = song_title
         cleaned_query = cog._clean_lyrics_query(search_query) if hasattr(cog, '_clean_lyrics_query') else search_query
         candidates = [search_query]
@@ -715,14 +718,16 @@ class WebUI:
         lyrics_data = None
         for candidate in candidates:
             if hasattr(cog, '_fetch_synced_lyrics'):
-                lyrics_data = await cog._fetch_synced_lyrics(candidate)
+                lyrics_data = await cog._fetch_synced_lyrics(
+                    candidate, song_artist, _duration_to_seconds(player.current.duration))
                 if lyrics_data:
                     break
                     
         if not lyrics_data:
             # Store empty result in cache to avoid spamming lrclib for unfound tracks
-            self.lyrics_cache[song_title] = {'track': song_title, 'artist': 'Unknown', 'lines': []}
-            return web.json_response(self.lyrics_cache[song_title])
+            self.lyrics_cache[cache_key] = {
+                'track': song_title, 'artist': song_artist or 'Unknown', 'lines': []}
+            return web.json_response(self.lyrics_cache[cache_key])
             
         # Cache and return
         res = {
@@ -730,7 +735,7 @@ class WebUI:
             'artist': lyrics_data.get('artist'),
             'lines': lyrics_data.get('lines') # list of [timestamp, text]
         }
-        self.lyrics_cache[song_title] = res
+        self.lyrics_cache[cache_key] = res
         return web.json_response(res)
 
     async def api_autocomplete(self, request):
@@ -1494,7 +1499,7 @@ if (urlGuild) {
 
 let guilds = [], selected = sessionStorage.getItem('mb_guild') || localStorage.getItem('mb_guild') || null;
 let state = null, lastStateAt = 0, playlists = [], playlistsGuild = null;
-let liveSocket = null, liveGuild = null, liveRetry = null, queueDragFrom = -1;
+let liveSocket = null, liveGuild = null, liveRetry = null, liveFailures = 0, queueDragFrom = -1;
 let activeView = localStorage.getItem('mb_view') || 'player', openPlaylistName = null;
 let lyricsData = null, lastLyricsTitle = null, lyricsVisible = localStorage.getItem('mb_lyrics_hidden') !== '1';
 let settingsOpen = false; // intentionally closed on every fresh page load
@@ -1825,17 +1830,27 @@ function connectLive() {
   if(!selected||(liveSocket&&liveGuild===selected&&liveSocket.readyState<2))return;
   if(liveSocket)liveSocket.close();
   clearTimeout(liveRetry);liveGuild=selected;
+  const guild=selected;
   const target=new URL(basePath+'api/live',location.href);
   target.protocol=location.protocol==='https:'?'wss:':'ws:';
   target.searchParams.set('guild_id',selected);
-  liveSocket=new WebSocket(target);
-  liveSocket.onopen=()=>setConnectionProblem(false);
-  liveSocket.onmessage=event=>{
-    if(liveGuild!==selected)return;
-    try{state=JSON.parse(event.data);lastStateAt=Date.now();render();setConnectionProblem(false)}catch(_){ }
+  const socket=new WebSocket(target);
+  liveSocket=socket;
+  socket.onopen=()=>{if(socket!==liveSocket)return;liveFailures=0;setConnectionProblem(false)};
+  socket.onmessage=event=>{
+    if(socket!==liveSocket||guild!==selected)return;
+    try{state=JSON.parse(event.data);lastStateAt=Date.now();liveFailures=0;render();setConnectionProblem(false)}catch(_){ }
   };
-  liveSocket.onerror=()=>setConnectionProblem(true);
-  liveSocket.onclose=()=>{setConnectionProblem(true);if(liveGuild===selected)liveRetry=setTimeout(connectLive,2000)};
+  socket.onerror=()=>{};
+  socket.onclose=()=>{
+    if(socket!==liveSocket||guild!==selected)return;
+    liveFailures++;
+    // HTTP polling remains fully functional, so only show the warning after
+    // repeated failures and hide it again as soon as a poll succeeds.
+    setConnectionProblem(liveFailures>=2);
+    const delay=Math.min(15000,1000*Math.pow(2,Math.min(liveFailures,4)));
+    liveRetry=setTimeout(connectLive,delay);
+  };
 }
 function queueDragStart(event,index){queueDragFrom=index;event.currentTarget.classList.add('dragging');event.dataTransfer.effectAllowed='move'}
 function queueDragOver(event){event.preventDefault();event.currentTarget.classList.add('drag-over');event.dataTransfer.dropEffect='move'}
@@ -1858,6 +1873,7 @@ async function refreshState() {
   try {
     state = await api(basePath + 'api/guilds/' + selected);
     lastStateAt = Date.now();
+    setConnectionProblem(false);
     render();
     if (playlistsGuild !== selected) refreshPlaylists();
     

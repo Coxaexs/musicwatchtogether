@@ -14,10 +14,10 @@ Videos are anything yt-dlp can resolve (YouTube, Shorts, Reels, TikTok,
 Twitter/X, ...). They are downloaded to a local cache and served from disk so
 every participant streams the exact same file.
 
-ReelsTogether keeps a tiny per-room taste profile: likes and full watches
-boost keywords from a clip's title/tags, fast skips decay them, and the next
-clips are found by searching YouTube Shorts with the highest-weighted terms.
-WatchTogether and ReelsTogether share a hard 10-file downloaded-video cache.
+ReelsTogether keeps a per-room taste profile: likes and full watches boost
+keywords from a clip's title/tags, fast skips decay them, and the next clips
+are found by balancing learned interests, exploration, and creator diversity.
+It keeps four reels ready ahead and up to 30 downloaded reels on disk.
 """
 
 import asyncio
@@ -60,8 +60,9 @@ WATCH_CACHE_DIR = os.path.join(BASE_DIR, 'watch_cache')
 REELS_CACHE_DIR = os.path.join(BASE_DIR, 'reels_cache')
 
 TOKEN_TTL = 7 * 86400          # links stay valid for a week
-MAX_MEDIA_CACHE = 10           # WatchTogether + ReelsTogether files combined
-REELS_HISTORY = 5              # recent backward history within the shared cache cap
+WATCH_CACHE_LIMIT = 10         # downloaded WatchTogether videos/HLS sessions
+REELS_CACHE_LIMIT = 30         # downloaded ReelsTogether clips in total
+REELS_HISTORY = 12             # recent backward history retained when possible
 CHAT_HISTORY = 100
 MAX_ACTIVE_ROOMS = 50
 MAX_ROOM_PARTICIPANTS = 100
@@ -72,7 +73,7 @@ MAX_ROOM_PLAYLISTS = 30
 MAX_PLAYLIST_ITEMS = 50
 ROOM_IDLE_TTL = 2 * 3600
 GLOBAL_DOWNLOADS = 4
-REELS_READY_AHEAD = 3          # keep this many reels downloaded ahead of the cursor
+REELS_READY_AHEAD = 4          # cache the next four reels while this one plays
 REELS_MAX_DURATION = 150       # seconds - skip anything longer in the shorts feed
 HLS_MIN_DURATION = 8 * 60      # longer than this -> stream while downloading
 
@@ -285,6 +286,7 @@ class Room:
         self.sync_task = None
         self._advanced_past = -1   # 'ended' debounce
         self.last_query = None     # avoid back-to-back identical feed searches
+        self.recent_uploaders = deque(maxlen=8)  # prevent one creator taking over
         self._topup_busy = False   # topup is not reentrant-safe
         self.skip_votes = set()
         # Created lazily in the websocket loop for Python 3.9 compatibility.
@@ -314,7 +316,9 @@ class Room:
 
     def download_limiter(self):
         if self.dl_sem is None:
-            self.dl_sem = asyncio.Semaphore(2)
+            # Reels prefetches four ahead; let those four use the global pool
+            # together. Long-form WatchTogether remains capped at two/room.
+            self.dl_sem = asyncio.Semaphore(4 if self.mode == 'reels' else 2)
         return self.dl_sem
 
     def save_profile(self):
@@ -713,16 +717,24 @@ def _blocking_ffmpeg_dl(url, headers, cache_dir, uid, kind=None):
     raise RuntimeError(last)
 
 
-def _trim_cache(keep, protected):
+def _trim_cache(keep, protected, cache_dirs=None):
     try:
         files = []
-        for cache_dir in (WATCH_CACHE_DIR, REELS_CACHE_DIR):
+        cache_dirs = tuple(cache_dirs or (WATCH_CACHE_DIR, REELS_CACHE_DIR))
+        # Preserve priority order (new item, current items, forward buffer,
+        # history), but never let protection make the configured cap soft.
+        protected = set([
+            path for path in protected
+            if any(path == root or path.startswith(root + os.sep)
+                   for root in cache_dirs)
+        ][:keep])
+        for cache_dir in cache_dirs:
             files.extend(
                 f for f in glob.glob(os.path.join(cache_dir, '*.*'))
                 if not f.endswith(('.part', '.ytdl'))
             )
         hls_root = os.path.join(WATCH_CACHE_DIR, 'hls')
-        if os.path.isdir(hls_root):
+        if WATCH_CACHE_DIR in cache_dirs and os.path.isdir(hls_root):
             files.extend(
                 os.path.join(hls_root, name) for name in os.listdir(hls_root)
                 if os.path.isdir(os.path.join(hls_root, name))
@@ -784,7 +796,7 @@ def _protected_files(extra=()):
             if idx >= 0:
                 add(room, room.queue[idx])
 
-    return set(ordered[:MAX_MEDIA_CACHE])
+    return ordered
 
 
 # ---------------------------------------------------------------- downloads
@@ -881,9 +893,10 @@ async def _download_item_inner(room, item):
             else:
                 logger.error(f"watch download failed for {item.get('url')}: {e}")
                 _set_embed_fallback(item, e)
-        _trim_cache(MAX_MEDIA_CACHE, _protected_files([
+        cache_limit = REELS_CACHE_LIMIT if room.mode == 'reels' else WATCH_CACHE_LIMIT
+        _trim_cache(cache_limit, _protected_files([
             os.path.join(cache_dir, item['file']) if item.get('file') else None
-        ]))
+        ]), (cache_dir,))
         await _after_ready(room, item)
 
 
@@ -925,7 +938,7 @@ async def _hls_item_inner(room, item):
 
     out_dir = os.path.join(WATCH_CACHE_DIR, 'hls', item['uid'])
     os.makedirs(out_dir, exist_ok=True)
-    _trim_cache(MAX_MEDIA_CACHE, _protected_files([out_dir]))
+    _trim_cache(WATCH_CACHE_LIMIT, _protected_files([out_dir]), (WATCH_CACHE_DIR,))
     playlist = os.path.join(out_dir, 'index.m3u8')
     cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
     for inp in fmt['inputs']:
@@ -991,7 +1004,7 @@ async def _hls_item_inner(room, item):
                 f.write('\n#EXT-X-ENDLIST\n')
     except OSError:
         pass
-    _trim_cache(MAX_MEDIA_CACHE, _protected_files([out_dir]))
+    _trim_cache(WATCH_CACHE_LIMIT, _protected_files([out_dir]), (WATCH_CACHE_DIR,))
     await _broadcast_state(room)
 
 
@@ -1201,7 +1214,12 @@ def _entry_score(room, entry):
     """Rank flat search results against what the room liked/disliked."""
     title = (entry.get('title') or '').lower()
     words = set(re.findall(r'[a-zA-ZğüşöçıİĞÜŞÖÇ0-9]{3,}', title))
-    return sum(room.interests.get(w, 0) for w in words if w not in STOPWORDS)
+    score = sum(room.interests.get(w, 0) for w in words if w not in STOPWORDS)
+    uploader = (entry.get('uploader') or entry.get('channel') or '').strip().lower()
+    if uploader and uploader in room.recent_uploaders:
+        # Repetition is allowed, just substantially less likely.
+        score -= 4 + list(room.recent_uploaders).count(uploader)
+    return score
 
 
 async def _reels_topup(room):
@@ -1221,9 +1239,10 @@ async def _reels_topup_inner(room):
         return
     loop = asyncio.get_running_loop()
     query = _pick_query(room)
+    missing = max(0, REELS_READY_AHEAD - _viable_ahead(room))
     try:
         entries = await loop.run_in_executor(
-            None, _blocking_search, f'{query} #shorts', 12)
+            None, _blocking_search, f'{query} #shorts', 20)
     except Exception as e:
         logger.warning(f"reels search failed ({query!r}): {e}")
         return
@@ -1235,7 +1254,7 @@ async def _reels_topup_inner(room):
     added = 0
     checked = 0
     for e in entries:
-        if (added >= 2 or checked >= 6 or
+        if (added >= missing or checked >= 14 or
                 _viable_ahead(room) >= REELS_READY_AHEAD or
                 len(room.queue) >= MAX_QUEUE_ITEMS):
             break
@@ -1271,6 +1290,9 @@ async def _reels_topup_inner(room):
             'tags': (info.get('tags') or [])[:10],
         }
         room.queue.append(item)
+        uploader_key = (item.get('uploader') or '').strip().lower()
+        if uploader_key:
+            room.recent_uploaders.append(uploader_key)
         added += 1
         _spawn(_download_item(room, item), f'download:{room.id}:{item["uid"]}')
     if added:
@@ -1561,6 +1583,15 @@ async def _handle_browser_message(room, ws, member, data):
             cfg['quality'] = quality
             changed.append(f'quality {quality}p')
         if _is_host(member):
+            if 'room_name' in data:
+                room_name = re.sub(r'\s+', ' ', str(data.get('room_name') or '').strip())[:50]
+                if room_name and room_name != room.name:
+                    room.name = room_name
+                    for token_info in tokens.values():
+                        if token_info.get('room') == room.id:
+                            token_info['name'] = room_name
+                    _save_tokens()
+                    changed.append(f'room name: {room_name}')
             control_policy = str(data.get('control_policy') or '')
             skip_policy = str(data.get('skip_policy') or '')
             if control_policy in ('host', 'moderators', 'everyone') \
@@ -2434,6 +2465,8 @@ WATCH_HTML = r"""<!DOCTYPE html>
 </div></div>
 <div class="modal hidden" id="settingsModal"><div class="box" style="text-align:left;width:340px">
   <b>⚙️ Room settings</b>
+  <label class="setrow"><span>✏️ Room name<small>host can rename this WatchTogether room</small></span>
+    <input id="setRoomName" maxlength="50" style="max-width:160px"></label>
   <label class="setrow"><span>🛡 Adblock<small>AdGuard in the shared browser</small></span>
     <input type="checkbox" id="setAdblock"></label>
   <label class="setrow"><span>⏭ SponsorBlock<small>cut sponsor segments from downloads</small></span>
@@ -2677,12 +2710,14 @@ function openSettings(){
   document.getElementById('setControlPolicy').value=st.settings.control_policy||'moderators';
   document.getElementById('setSkipPolicy').value=st.settings.skip_policy||'vote';
   document.getElementById('setVoteThreshold').value=String(st.settings.vote_threshold||0.5);
+  document.getElementById('setRoomName').value=st.name||'';
   const host=me()&&me().role==='host';
-  ['setControlPolicy','setSkipPolicy','setVoteThreshold'].forEach(id=>document.getElementById(id).disabled=!host);
+  ['setRoomName','setControlPolicy','setSkipPolicy','setVoteThreshold'].forEach(id=>document.getElementById(id).disabled=!host);
   document.getElementById('settingsModal').classList.remove('hidden');
 }
 function saveSettings(){
   send({t:'settings',
+    room_name: document.getElementById('setRoomName').value.trim(),
     adblock: document.getElementById('setAdblock').checked,
     sponsorblock: document.getElementById('setSponsor').checked,
     quality: +document.getElementById('setQuality').value,
