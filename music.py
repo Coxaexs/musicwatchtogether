@@ -4743,6 +4743,29 @@ class MusicCog(commands.Cog):
                 unique.append(name)
         return unique
 
+    @classmethod
+    def _format_artist_display(cls, artists) -> str:
+        """Render comma-separated credits once, ignoring case duplicates."""
+        return ', '.join(cls._dedupe_artist_names(artists))
+
+    @classmethod
+    def _clean_lazy_spotify_title(cls, title: str, url: str) -> str:
+        """Clean duplicate credits in Spotify queue entries saved by older builds."""
+        if not str(url or '').startswith('spotify:search:'):
+            return title
+        parts = re.split(r'(\s+[-–—|]\s+)', str(title or ''), maxsplit=1)
+        if len(parts) != 3:
+            return title
+        artists = cls._format_artist_display(parts[2])
+        return f'{parts[0]}{parts[1]}{artists}' if artists else parts[0]
+
+    def _normalize_lyrics_result(self, data: Optional[dict]) -> Optional[dict]:
+        if not isinstance(data, dict) or not data.get('artist'):
+            return data
+        normalized = dict(data)
+        normalized['artist'] = self._format_artist_display(data['artist'])
+        return normalized
+
     def _lyrics_search_context(self, query: str, artist: Optional[str] = None) -> tuple[str, Optional[str]]:
         """Return a clean LRCLIB track/artist pair without duplicating artist."""
         track = self._clean_lyrics_query(query or '')
@@ -4851,7 +4874,8 @@ class MusicCog(commands.Cog):
 
             return {
                 'track': item.get('trackName') or track_query,
-                'artist': item.get('artistName') or 'Unknown',
+                'artist': self._format_artist_display(
+                    item.get('artistName') or 'Unknown'),
                 'lyrics': lyrics,
             }
 
@@ -4903,7 +4927,7 @@ class MusicCog(commands.Cog):
         if cached and cached[0] == mtime:
             return cached[1]
         with open(cache_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            data = self._normalize_lyrics_result(json.load(f))
         if len(self._lyrics_file_cache) > 64:
             self._lyrics_file_cache.clear()
         self._lyrics_file_cache[cache_path] = (mtime, data)
@@ -4917,7 +4941,7 @@ class MusicCog(commands.Cog):
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
-                    cached_data = json.load(f)
+                    cached_data = self._normalize_lyrics_result(json.load(f))
                     if cached_data is None:
                         return None
                     return cached_data
@@ -4967,7 +4991,8 @@ class MusicCog(commands.Cog):
 
             result = {
                 'track': item.get('trackName') or track_query,
-                'artist': item.get('artistName') or 'Unknown',
+                'artist': self._format_artist_display(
+                    item.get('artistName') or 'Unknown'),
                 'lines': parsed_lines,
             }
             break
@@ -5094,7 +5119,10 @@ class MusicCog(commands.Cog):
             description = f"## [{song.title}]({song.url})"
         else:
             description = f"## {song.title}"
-        details = [part for part in (song.artist, song.album) if part]
+        details = [part for part in (
+            self._format_artist_display(song.artist) if song.artist else None,
+            song.album,
+        ) if part]
         if details:
             description += "\n" + " • ".join(details)
 
@@ -6516,7 +6544,8 @@ class MusicCog(commands.Cog):
 
         entry = random.choice(entries)
         return Song(
-            title=entry.get('title', 'Unknown'),
+            title=self._clean_lazy_spotify_title(
+                entry.get('title', 'Unknown'), entry.get('url', '')),
             url=entry['url'],
             duration=entry.get('duration', 'Unknown'),
             requester=guild.me,
@@ -6872,7 +6901,8 @@ class MusicCog(commands.Cog):
             requester=requester or guild.me,
             source_type=entry.get('source_type', 'youtube'),
             thumbnail=entry.get('thumbnail'),
-            artist=entry.get('artist'),
+            artist=(self._format_artist_display(entry.get('artist'))
+                    if entry.get('artist') else None),
             album=entry.get('album'),
             genres=tuple(entry.get('genres') or ()),
             played_at=entry.get('played_at'),

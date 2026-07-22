@@ -33,6 +33,25 @@ class LyricsMatchingTests(unittest.TestCase):
             "mor ve ötesi, mor ve ötesi, Mor ve Ötesi, Mor ve Ötesi, Tarkan Gözübüyük")
         self.assertEqual(artists, ["mor ve ötesi", "Tarkan Gözübüyük"])
 
+    def test_duplicate_artist_display_and_cached_result_are_cleaned(self):
+        raw = ("mor ve ötesi, mor ve ötesi, Mor ve Ötesi, Mor ve Ötesi, "
+               "Tarkan Gözübüyük")
+        expected = "mor ve ötesi, Tarkan Gözübüyük"
+        self.assertEqual(self.cog._format_artist_display(raw), expected)
+        self.assertEqual(
+            self.cog._normalize_lyrics_result({"artist": raw})["artist"],
+            expected,
+        )
+
+    def test_old_spotify_queue_title_is_cleaned_for_display(self):
+        title = ("Bir Derdim Var — mor ve ötesi, mor ve ötesi, Mor ve Ötesi, "
+                 "Mor ve Ötesi, Tarkan Gözübüyük")
+        self.assertEqual(
+            self.cog._clean_lazy_spotify_title(
+                title, "spotify:search:Bir Derdim Var"),
+            "Bir Derdim Var — mor ve ötesi, Tarkan Gözübüyük",
+        )
+
 
 class LyricsArtistFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_synced_lyrics_tries_unique_artists_one_at_a_time(self):

@@ -728,7 +728,9 @@ class WebUI:
         # Cache and return
         res = {
             'track': lyrics_data.get('track'),
-            'artist': lyrics_data.get('artist'),
+            'artist': (cog._format_artist_display(lyrics_data.get('artist'))
+                       if hasattr(cog, '_format_artist_display')
+                       else lyrics_data.get('artist')),
             'lines': lyrics_data.get('lines') # list of [timestamp, text]
         }
         self.lyrics_cache[cache_key] = res
