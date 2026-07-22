@@ -251,10 +251,16 @@ def admin_snapshot():
     return result
 
 
+def _validated_room_id(room_id):
+    room_id = str(room_id or '')
+    if not re.fullmatch(r'[wr][A-Za-z0-9_-]{1,80}', room_id):
+        raise ValueError('invalid room id')
+    return room_id
+
+
 def admin_update_room(room_id, data):
     """Validated room update used only by the password-protected admin API."""
-    if not re.fullmatch(r'[wr][A-Za-z0-9_-]{1,80}', str(room_id or '')):
-        raise ValueError('invalid room id')
+    room_id = _validated_room_id(room_id)
     cfg = update_settings(
         room_id,
         adblock=data.get('adblock') if 'adblock' in data else None,
@@ -274,6 +280,59 @@ def admin_update_room(room_id, data):
                 info['name'] = room_name
         _save_tokens()
     return cfg
+
+
+async def admin_delete_room(room_id):
+    """Permanently remove a room and revoke its links from the admin API."""
+    room_id = _validated_room_id(room_id)
+    exists = room_id in rooms or room_id in room_settings or \
+        room_id in room_playlists or room_id in profiles or \
+        any(info.get('room') == room_id for info in tokens.values())
+    if not exists:
+        raise KeyError(room_id)
+
+    # Stop work that could write the room back into persisted state while it is
+    # being deleted. Task names are created as ``watch:<kind>:<room id>...``.
+    room_tasks = [
+        task for task in list(task_registry.tasks)
+        if not task.done() and (
+            f':{room_id}:' in task.get_name() or
+            task.get_name().endswith(f':{room_id}')
+        )
+    ]
+    for task in room_tasks:
+        task.cancel()
+    if room_tasks:
+        await asyncio.gather(*room_tasks, return_exceptions=True)
+
+    if cobrowser:
+        session = cobrowser.get(room_id)
+        if session:
+            await session.stop()
+
+    room = rooms.pop(room_id, None)
+    if room:
+        for ws in list(room.sockets):
+            try:
+                await ws.close(code=4004, message=b'room deleted by administrator')
+            except Exception:
+                pass
+        room.sockets.clear()
+
+    removed_tokens = [
+        key for key, info in tokens.items() if info.get('room') == room_id
+    ]
+    for key in removed_tokens:
+        tokens.pop(key, None)
+    room_settings.pop(room_id, None)
+    room_playlists.pop(room_id, None)
+    profiles.pop(room_id, None)
+    _save_tokens()
+    _save_room_settings()
+    _save_room_playlists()
+    _save_profiles()
+    logger.info('Admin deleted room %s and revoked %s link(s)',
+                room_id, len(removed_tokens))
 
 
 def get_room_link(channel_id, channel_name, mode):

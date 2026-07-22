@@ -151,6 +151,37 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             watchtogether.rooms.pop(room.id, None)
 
+    async def test_admin_delete_room_revokes_links_and_persisted_state(self):
+        room_id = "w-admin-delete-unit"
+        room = watchtogether.Room(room_id, "Delete Me")
+        socket = mock.AsyncMock()
+        room.sockets[socket] = {'session': 'member'}
+        watchtogether.rooms[room_id] = room
+        watchtogether.room_settings[room_id] = {'quality': 360}
+        watchtogether.room_playlists[room_id] = {'Mix': []}
+        watchtogether.profiles[room_id] = {'seen': ['video']}
+        token = "admin-delete-token"
+        watchtogether.tokens[token] = {'room': room_id, 'name': 'Delete Me'}
+        try:
+            with mock.patch.object(watchtogether, '_save_tokens'), \
+                    mock.patch.object(watchtogether, '_save_room_settings'), \
+                    mock.patch.object(watchtogether, '_save_room_playlists'), \
+                    mock.patch.object(watchtogether, '_save_profiles'):
+                await watchtogether.admin_delete_room(room_id)
+            self.assertNotIn(room_id, watchtogether.rooms)
+            self.assertNotIn(room_id, watchtogether.room_settings)
+            self.assertNotIn(room_id, watchtogether.room_playlists)
+            self.assertNotIn(room_id, watchtogether.profiles)
+            self.assertNotIn(token, watchtogether.tokens)
+            socket.close.assert_awaited_once_with(
+                code=4004, message=b'room deleted by administrator')
+        finally:
+            watchtogether.rooms.pop(room_id, None)
+            watchtogether.room_settings.pop(room_id, None)
+            watchtogether.room_playlists.pop(room_id, None)
+            watchtogether.profiles.pop(room_id, None)
+            watchtogether.tokens.pop(token, None)
+
 
 class ReelsFeedTests(unittest.IsolatedAsyncioTestCase):
     async def test_topup_prefetches_four_and_penalizes_repeat_creators(self):
