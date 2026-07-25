@@ -879,6 +879,84 @@ class WebUI:
             'state': self._guild_state(guild, player),
         })
 
+    async def api_huddle_resolve(self, request):
+        """Run Huddle queries through the exact resolver used by /play.
+
+        Huddle owns the WebRTC output, but source matching (Spotify, YouTube
+        playlists, local-library preference and metadata) remains MusicCog's
+        job.  The returned URLs are then converted to browser-safe streams by
+        Huddle's small audio helper.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        query = (body.get('query') or '').strip()
+        if not query:
+            return web.json_response({'error': 'empty query'}, status=400)
+
+        guild = next((item for item in self.bot.guilds if item.me), None)
+        if not guild:
+            return web.json_response(
+                {'error': 'The music bot is not connected to Discord yet.'},
+                status=503,
+            )
+        requester = guild.me
+        songs = []
+        try:
+            if 'spotify.com' in query or query.startswith('spotify:'):
+                if 'playlist' in query or 'album' in query:
+                    songs, _total = await self.cog.process_spotify_playlist_fast(
+                        query, requester)
+                else:
+                    songs = await self.cog.process_spotify(query, requester)
+            elif 'list=' in query:
+                songs, _total = await self.cog.process_youtube_playlist_fast(
+                    query, requester)
+            else:
+                song = await self.bot.loop.run_in_executor(
+                    None, self.cog._local_song_for_query, query, requester)
+                if not song:
+                    song = await self.cog.process_youtube(query, requester)
+                if song:
+                    songs = [song]
+        except Exception as error:
+            logger.error("Huddle resolve failed for %r: %s",
+                         query, error, exc_info=True)
+            return web.json_response({'error': str(error)}, status=500)
+
+        if not songs:
+            return web.json_response(
+                {'error': 'No results found for that query.'}, status=404)
+
+        def duration_seconds(value):
+            if isinstance(value, (int, float)):
+                return value
+            parts = str(value or '').split(':')
+            try:
+                return sum(int(part) * (60 ** index)
+                           for index, part in enumerate(reversed(parts)))
+            except (TypeError, ValueError):
+                return None
+
+        return web.json_response({
+            'tracks': [{
+                'title': song.title,
+                'artist': getattr(song, 'artist', None),
+                'duration': duration_seconds(song.duration),
+                'thumbnail': song.thumbnail,
+                'page_url': song.url,
+                'source_type': song.source_type,
+                # Lazy Spotify entries use this form; yt-dlp needs the search
+                # text rather than the pseudo URL.
+                'resolve_query': (
+                    song.url.replace('spotify:search:', '', 1)
+                    if str(song.url).startswith('spotify:search:')
+                    else song.url
+                ),
+            } for song in songs[:50]],
+        })
+
     async def api_lyrics(self, request):
         if huddle.is_huddle_id(request.match_info.get('guild_id', '')):
             # Synced lyrics come from the Discord-side player for now.
@@ -1286,6 +1364,7 @@ async def start_web_server(bot):
     app.router.add_get('/api/live', ui.api_live)
     app.router.add_post('/api/guilds/{guild_id}/action', ui.api_action)
     app.router.add_post('/api/guilds/{guild_id}/play', ui.api_play)
+    app.router.add_post('/api/huddle/resolve', ui.api_huddle_resolve)
     app.router.add_get('/api/guilds/{guild_id}/lyrics', ui.api_lyrics)
     app.router.add_get('/api/guilds/{guild_id}/playlists', ui.api_playlists)
     app.router.add_post('/api/guilds/{guild_id}/playlists', ui.api_playlist_action)
