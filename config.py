@@ -53,6 +53,11 @@ CACHE_LOOKUP_DEBUG = os.getenv("CACHE_LOOKUP_DEBUG", "0")
 # Role name that can always skip songs without a vote
 DJ_ROLE_NAME = os.getenv("DJ_ROLE_NAME", "DJ")
 
+# Huddle (the self-hosted chat app that shares this bot). When both are set the
+# dashboard also lists Huddle voice rooms and can drive their playback.
+HUDDLE_BASE_URL = os.getenv("HUDDLE_BASE_URL", "")
+HUDDLE_BOT_TOKEN = os.getenv("HUDDLE_BOT_TOKEN", "")
+
 # Web dashboard (served by the bot itself)
 WEB_UI_ENABLED = os.getenv("WEB_UI_ENABLED", "1") == "1"
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")

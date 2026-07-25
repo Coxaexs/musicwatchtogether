@@ -24,6 +24,7 @@ import time
 from aiohttp import web
 
 import config
+import huddle
 from music import Song, get_autocomplete_suggestions, state_store
 from security import SlidingWindowLimiter, client_identity
 from storage import save_bytes_atomic, save_json
@@ -476,6 +477,11 @@ class WebUI:
                     'playing': bool(vc and vc.is_playing()),
                     'title': player.current.title if player and player.current else None,
                 })
+        # Huddle voice rooms sit alongside the Discord guilds; a Huddle that is
+        # offline simply contributes nothing.
+        if allowed_guild_id is None:
+            guilds.extend(await huddle.guild_entries())
+
         return web.json_response({
             'ready': self.bot.is_ready(),
             'guilds': guilds,
@@ -484,11 +490,20 @@ class WebUI:
 
 
     async def api_guild_state(self, request):
+        requested = request.match_info.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            try:
+                return web.json_response(await huddle.room_state(requested))
+            except KeyError:
+                raise web.HTTPNotFound(text='huddle room not found')
         guild, player = self._get_guild_and_player(request)
         return web.json_response(self._guild_state(guild, player))
 
     async def api_live(self, request):
         """Push changed player state to the dashboard without HTTP polling."""
+        requested = request.query.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            return await self._huddle_live(request, requested)
         try:
             guild_id = int(request.query.get('guild_id', ''))
         except ValueError:
@@ -523,7 +538,51 @@ class WebUI:
             await socket.close()
         return socket
 
+    async def _huddle_live(self, request, guild_id):
+        """Same live channel for Huddle rooms, fed by polling the Huddle hub."""
+        socket = web.WebSocketResponse(heartbeat=25)
+        await socket.prepare(request)
+        previous = None
+        try:
+            while not socket.closed:
+                try:
+                    payload = await huddle.room_state(guild_id)
+                except KeyError:
+                    break
+                except Exception:
+                    payload = None
+                if payload is not None:
+                    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+                    if encoded != previous:
+                        await socket.send_str(encoded)
+                        previous = encoded
+                try:
+                    message = await socket.receive(timeout=1.0)
+                    if message.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED,
+                                        web.WSMsgType.ERROR):
+                        break
+                except asyncio.TimeoutError:
+                    pass
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            await socket.close()
+        return socket
+
     async def api_action(self, request):
+        requested = request.match_info.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            try:
+                body = await request.json()
+            except Exception:
+                raise web.HTTPBadRequest(text='invalid json')
+            try:
+                return web.json_response(await huddle.action(requested, body))
+            except KeyError:
+                raise web.HTTPNotFound(text='huddle room not found')
+            except (ValueError, RuntimeError) as error:
+                return web.json_response({'error': str(error)}, status=400)
+
         guild, player = self._get_guild_and_player(request)
         try:
             body = await request.json()
@@ -738,6 +797,24 @@ class WebUI:
         return web.json_response(self._guild_state(guild, player))
 
     async def api_play(self, request):
+        requested = request.match_info.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            try:
+                body = await request.json()
+            except Exception:
+                raise web.HTTPBadRequest(text='invalid json')
+            query = (body.get('query') or '').strip()
+            if not query:
+                return web.json_response({'error': 'empty query'}, status=400)
+            try:
+                state = await huddle.play(requested, query)
+            except KeyError:
+                raise web.HTTPNotFound(text='huddle room not found')
+            except RuntimeError as error:
+                return web.json_response({'error': str(error)}, status=502)
+            title = state['current']['title'] if state.get('current') else query
+            return web.json_response({'ok': True, 'first_title': title, 'state': state})
+
         guild, player = self._get_guild_and_player(request)
         cog = self.cog
         try:
@@ -803,6 +880,9 @@ class WebUI:
         })
 
     async def api_lyrics(self, request):
+        if huddle.is_huddle_id(request.match_info.get('guild_id', '')):
+            # Synced lyrics come from the Discord-side player for now.
+            return web.json_response({'track': None, 'artist': None, 'lines': []})
         guild, player = self._get_guild_and_player(request)
         if not player.current:
             return web.json_response({'track': None, 'artist': None, 'lines': []})
@@ -879,6 +959,9 @@ class WebUI:
         return [items[name] for name in sorted(items, key=str.lower)]
 
     async def api_playlists(self, request):
+        if huddle.is_huddle_id(request.match_info.get('guild_id', '')):
+            # Saved playlists are still a Discord-side feature.
+            return web.json_response({'playlists': []})
         guild, _player = self._get_guild_and_player(request)
         user_id = self._get_acting_user_id(request)
         return web.json_response({'playlists': self._playlist_json(guild.id, user_id)})

@@ -62,3 +62,4 @@ musicbot.sqlite3*
 
 # Claude Code local settings
 .claude/
+dislikes.json
