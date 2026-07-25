@@ -37,7 +37,11 @@ SAMPLES_PER_FRAME = 960
 CHANNELS = 2
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * CHANNELS * 2
 OPUS_BITRATE = 256_000
-BUFFERED_FRAMES = 24
+# Keep three seconds of already-decoded PCM ahead of the sender. This does not
+# add three seconds of playback latency: FFmpeg fills it faster than realtime,
+# while the first frame is still sent immediately. It does absorb CDN and
+# scheduler stalls that otherwise arrive as tiny silent "dips".
+BUFFERED_FRAMES = 150
 MUSIC_FILTERS = {
     "bassboost": "bass=g=10:f=110:w=0.6",
     "nightcore": "aresample=48000,asetrate=48000*1.25",
@@ -55,7 +59,11 @@ class MusicOpusEncoder(DefaultOpusEncoder):
         self.codec.bit_rate = OPUS_BITRATE
         # aiortc defaults to Opus' speech-tuned VOIP mode. That aggressively
         # models voices and can add a faint watery/noisy texture to music.
-        self.codec.options = {"application": "audio"}
+        self.codec.options = {
+            "application": "audio",
+            "vbr": "on",
+            "compression_level": "10",
+        }
 
 
 # aiortc resolves this module global when an RTP sender starts.
@@ -118,8 +126,10 @@ class RoomAudioTrack(MediaStreamTrack):
             preset = settings.get("audio_filter")
             if preset in MUSIC_FILTERS:
                 filters.append(MUSIC_FILTERS[preset])
-            # Smooth source clock discontinuities before they reach Opus.
-            filters.append("aresample=48000:async=1000:first_pts=0")
+            # Use libsoxr's high-quality resampler. `async=1000` used to
+            # continuously stretch/drop samples to chase source timestamps,
+            # which can sound like a faint watery noise on music.
+            filters.append("aresample=48000:resampler=soxr:precision=28")
             fade = (
                 int(settings.get("automix_blend") or 8)
                 if settings.get("automix")
@@ -141,6 +151,12 @@ class RoomAudioTrack(MediaStreamTrack):
                 "error",
                 "-ss",
                 f"{max(0.0, position_seconds):.3f}",
+                "-reconnect",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_delay_max",
+                "2",
                 "-i",
                 url,
                 "-vn",
@@ -327,6 +343,16 @@ class RoomPublisher:
                         await websocket.send_json(
                             {"t": "voice-join", "channelId": self.channel_id}
                         )
+                        # A music publisher only sends. Marking it deafened is
+                        # both truthful in the UI and prevents browsers from
+                        # treating it like another microphone listener.
+                        await websocket.send_json(
+                            {
+                                "t": "voice-state",
+                                "muted": False,
+                                "deafened": True,
+                            }
+                        )
                         logger.info(
                             "Music publisher joined Huddle room %s",
                             self.channel_id,
@@ -370,7 +396,6 @@ class RoomPublisher:
         if peer is None or peer.connectionState in ("closed", "failed"):
             peer = RTCPeerConnection()
             self.peers[remote_id] = peer
-            peer.addTrack(self.relay.subscribe(self.source))
 
             @peer.on("connectionstatechange")
             async def connectionstatechange():
@@ -385,6 +410,27 @@ class RoomPublisher:
                 type=description["type"],
             )
         )
+        # Reuse the offer's first audio m-line for the music stream and reject
+        # every incoming media section. The bot is permanently deafened but
+        # never muted: it sends music and receives no microphones/screens.
+        music_attached = False
+        for transceiver in peer.getTransceivers():
+            if transceiver.kind == "audio" and not music_attached:
+                transceiver.direction = "sendonly"
+                if transceiver.sender.track is None:
+                    transceiver.sender.replaceTrack(
+                        self.relay.subscribe(self.source)
+                    )
+                music_attached = True
+            else:
+                transceiver.direction = "inactive"
+                if transceiver.sender.track is not None:
+                    transceiver.sender.replaceTrack(None)
+        if not music_attached:
+            peer.addTransceiver(
+                self.relay.subscribe(self.source),
+                direction="sendonly",
+            )
         for candidate in self.pending_candidates.pop(remote_id, []):
             await peer.addIceCandidate(candidate)
         answer = await peer.createAnswer()

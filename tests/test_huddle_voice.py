@@ -15,6 +15,9 @@ class RoomAudioTrackTests(unittest.IsolatedAsyncioTestCase):
         encoder = huddle_voice.MusicOpusEncoder()
         self.assertEqual(encoder.codec.bit_rate, 256_000)
         self.assertEqual(encoder.codec.options.get("application"), "audio")
+        self.assertEqual(encoder.codec.options.get("vbr"), "on")
+        self.assertEqual(encoder.codec.options.get("compression_level"), "10")
+        self.assertGreaterEqual(huddle_voice.BUFFERED_FRAMES, 100)
 
     async def test_silence_frame_shape(self):
         track = huddle_voice.RoomAudioTrack()
@@ -65,6 +68,11 @@ class LiveHuddleWebRTCTests(unittest.IsolatedAsyncioTestCase):
                             participant.get("bot")
                             and participant["connectionId"] != own_id
                         ):
+                            self.assertFalse(participant.get("muted"))
+                            self.assertTrue(
+                                participant.get("deafened"),
+                                "music publisher must be send-only/deafened",
+                            )
                             target_id = participant["connectionId"]
                             break
 
