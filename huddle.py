@@ -11,7 +11,12 @@ so a bot with no Huddle beside it behaves exactly as before.
 """
 
 import logging
+import json
+import os
+import hashlib
 import time
+from collections import Counter
+from datetime import datetime
 
 import aiohttp
 
@@ -28,6 +33,56 @@ _CACHE_TTL = 2.0
 
 _session = None
 _cache = {'at': 0.0, 'servers': []}
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SETTINGS_FILE = os.path.join(_BOT_DIR, 'guild_settings.json')
+_DISLIKES_FILE = os.path.join(_BOT_DIR, 'dislikes.json')
+_FAVORITES_FILE = os.path.join(_BOT_DIR, 'favorites.json')
+_STATS_FILE = os.path.join(_BOT_DIR, 'stats.jsonl')
+
+_DEFAULT_SETTINGS = {
+    'autoplay': False,
+    'artist_diversity': True,
+    'vibe_match': True,
+    'automix': False,
+    'automix_blend': 8,
+    'audio_filter': None,
+    'crossfade_seconds': 0,
+    'karaoke_mode': False,
+}
+
+
+def _read_json(path, fallback):
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            value = json.load(handle)
+        return value if isinstance(value, type(fallback)) else fallback
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return fallback
+
+
+def _write_json(path, value):
+    temporary = path + '.tmp'
+    with open(temporary, 'w', encoding='utf-8') as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(temporary, path)
+
+
+def settings_for(channel_or_guild_id):
+    guild_id = (channel_or_guild_id if is_huddle_id(channel_or_guild_id)
+                else PREFIX + str(channel_or_guild_id))
+    stored = _read_json(_SETTINGS_FILE, {}).get(guild_id) or {}
+    return {**_DEFAULT_SETTINGS, **stored}
+
+
+def update_settings(channel_or_guild_id, **patch):
+    guild_id = (channel_or_guild_id if is_huddle_id(channel_or_guild_id)
+                else PREFIX + str(channel_or_guild_id))
+    all_settings = _read_json(_SETTINGS_FILE, {})
+    settings = {**_DEFAULT_SETTINGS, **(all_settings.get(guild_id) or {})}
+    settings.update(patch)
+    all_settings[guild_id] = settings
+    _write_json(_SETTINGS_FILE, all_settings)
+    return settings
 
 
 def enabled():
@@ -169,6 +224,7 @@ async def room_state(guild_id):
         current['position_seconds'] = _position_seconds(player)
 
     members = room.get('members') or []
+    settings = settings_for(guild_id)
     return {
         'id': guild_id,
         'name': f"{server['name']} · {room['name']}",
@@ -180,14 +236,14 @@ async def room_state(guild_id):
         'paused': bool(player.get('paused')),
         'volume': int(player.get('volume') or 100),
         'loop': {'track': 'song', 'queue': 'queue'}.get(player.get('loop'), 'off'),
-        'autoplay': False,
-        'artist_diversity': False,
-        'vibe_match': False,
-        'audio_filter': 'off',
-        'crossfade_seconds': 0,
-        'automix': False,
-        'automix_blend_seconds': 0,
-        'karaoke': False,
+        'autoplay': settings['autoplay'],
+        'artist_diversity': settings['artist_diversity'],
+        'vibe_match': settings['vibe_match'],
+        'audio_filter': settings['audio_filter'] or 'off',
+        'crossfade_seconds': settings['crossfade_seconds'],
+        'automix': settings['automix'],
+        'automix_blend_seconds': settings['automix_blend'],
+        'karaoke': settings['karaoke_mode'],
         'idle_disconnect_minutes': 0,
         'sleep_timer_ends_at': 0,
         'is_247': False,
@@ -226,6 +282,48 @@ _SIMPLE_ACTIONS = {
 async def action(guild_id, body):
     """Translates a dashboard action into a hub player action."""
     name = body.get('action')
+    if name == 'settings':
+        return await room_state(guild_id)
+    if name in ('like', 'dislike'):
+        result = await feedback(guild_id, body.get('user_id') or 'huddle', name)
+        state = await room_state(guild_id)
+        state['feedback'] = {**result, 'kind': name}
+        return state
+    if name in ('stats', 'wrapped'):
+        state = await room_state(guild_id)
+        state['report'] = stats(guild_id, wrapped=name == 'wrapped')
+        return state
+    settings = settings_for(guild_id)
+    if name in ('autoplay', 'artist_diversity', 'vibe_match', 'automix', 'karaoke'):
+        key = 'karaoke_mode' if name == 'karaoke' else name
+        enabled = body.get('enabled')
+        if enabled is None:
+            enabled = not bool(settings.get(key))
+        update_settings(guild_id, **{key: bool(enabled)})
+        return await room_state(guild_id)
+    if name == 'automix_blend':
+        update_settings(
+            guild_id,
+            automix_blend=max(4, min(15, int(body.get('seconds') or 8))),
+        )
+        return await room_state(guild_id)
+    if name == 'filter':
+        preset = str(body.get('preset') or 'off')
+        if preset not in ('off', 'bassboost', 'nightcore', 'slowed', '8d', 'karaoke'):
+            raise ValueError('invalid filter preset')
+        update_settings(
+            guild_id,
+            audio_filter=None if preset == 'off' else preset,
+            karaoke_mode=preset == 'karaoke',
+        )
+        return await room_state(guild_id)
+    if name == 'crossfade':
+        update_settings(
+            guild_id,
+            crossfade_seconds=max(0, min(10, int(body.get('seconds') or 0))),
+        )
+        return await room_state(guild_id)
+
     if name in _SIMPLE_ACTIONS:
         payload = dict(_SIMPLE_ACTIONS[name])
     elif name == 'volume':
@@ -248,6 +346,129 @@ async def action(guild_id, body):
     await _request('POST', '/api/bot/player', {'channelId': channel_id, 'action': payload})
     _cache['at'] = 0.0
     return await room_state(guild_id)
+
+
+def _feedback_file(kind):
+    return _FAVORITES_FILE if kind == 'like' else _DISLIKES_FILE
+
+
+async def feedback(guild_id, user_id, kind):
+    """Toggle a room-scoped like/dislike in the bot's existing data files."""
+    if kind not in ('like', 'dislike'):
+        raise ValueError('feedback must be like or dislike')
+    state = await room_state(guild_id)
+    current = state.get('current')
+    if not current:
+        raise ValueError('Nothing is playing.')
+    channel_id = channel_id_from(guild_id)
+    servers = await fetch_servers(force=True)
+    track = None
+    for server in servers:
+        for room in server.get('voiceChannels') or []:
+            if room.get('id') == channel_id:
+                track = (room.get('player') or {}).get('track')
+                break
+    if not track:
+        raise ValueError('Nothing is playing.')
+
+    path = _feedback_file(kind)
+    data = _read_json(path, {})
+    stable_user_id = int.from_bytes(
+        hashlib.sha256(str(user_id).encode('utf-8')).digest()[:8], 'big'
+    ) & 0x7FFFFFFFFFFFFFFF
+    entries = data.setdefault(str(stable_user_id), [])
+    url = track.get('pageUrl') or track.get('audioUrl')
+    for index, entry in enumerate(entries):
+        if entry.get('url') == url and str(entry.get('guild_id')) == guild_id:
+            entries.pop(index)
+            _write_json(path, data)
+            return {'added': False, 'title': track.get('title') or 'track'}
+    entries.append({
+        'title': track.get('title') or 'Unknown',
+        'url': url,
+        'artist': track.get('artist'),
+        'guild_id': guild_id,
+    })
+    _write_json(path, data)
+    return {'added': True, 'title': track.get('title') or 'track'}
+
+
+def record_play(channel_id, track):
+    """Write Huddle plays into the exact stats stream used by /stats/wrapped."""
+    if not track:
+        return
+    entry = {
+        'ts': int(time.time()),
+        'guild_id': PREFIX + str(channel_id),
+        'user_id': track.get('requestedBy'),
+        'user_name': track.get('requestedBy') or 'Huddle',
+        'title': track.get('title') or 'Unknown',
+        'url': track.get('pageUrl') or track.get('audioUrl'),
+        'seconds': track.get('duration') or 0,
+        'channel_id': channel_id,
+    }
+    try:
+        # A publisher restart can rediscover the track already in progress. Avoid
+        # counting that as a second listen in stats/wrapped.
+        try:
+            with open(_STATS_FILE, 'rb') as handle:
+                handle.seek(0, 2)
+                end = handle.tell()
+                handle.seek(max(0, end - 16384))
+                recent_lines = handle.read().decode('utf-8', errors='ignore').splitlines()
+            for line in reversed(recent_lines[-50:]):
+                try:
+                    recent = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    recent.get('guild_id') == entry['guild_id']
+                    and recent.get('url') == entry['url']
+                    and entry['ts'] - int(recent.get('ts') or 0) < 120
+                ):
+                    return
+        except FileNotFoundError:
+            pass
+        with open(_STATS_FILE, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except OSError as error:
+        logger.debug('Could not log Huddle play: %s', error)
+
+
+def stats(guild_id, wrapped=False):
+    now = datetime.now()
+    start = None
+    label = 'All time'
+    if wrapped:
+        start = datetime(now.year, now.month, 1)
+        label = f"{now.strftime('%B %Y')} so far"
+    plays = []
+    try:
+        with open(_STATS_FILE, 'r', encoding='utf-8') as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(entry.get('guild_id')) != guild_id:
+                    continue
+                if start and int(entry.get('ts') or 0) < int(start.timestamp()):
+                    continue
+                plays.append(entry)
+    except FileNotFoundError:
+        pass
+    songs = Counter(item.get('title') or 'Unknown' for item in plays).most_common(5)
+    requesters = Counter(
+        item.get('user_name') or 'Unknown' for item in plays
+    ).most_common(5)
+    return {
+        'label': label,
+        'plays': len(plays),
+        'unique': len({item.get('url') for item in plays}),
+        'hours': round(sum(item.get('seconds') or 0 for item in plays) / 3600, 1),
+        'topSongs': songs,
+        'topRequesters': requesters,
+    }
 
 
 async def say(channel_id, text, link=None, action_label=None):

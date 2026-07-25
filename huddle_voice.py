@@ -12,10 +12,13 @@ import json
 import logging
 import sys
 import time
+from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
 from av import AudioFrame
+import aiortc.codecs
+from aiortc.codecs import OpusEncoder as DefaultOpusEncoder
 from aiortc import (
     MediaStreamTrack,
     RTCPeerConnection,
@@ -25,6 +28,7 @@ from aiortc.contrib.media import MediaRelay
 from aiortc.sdp import candidate_from_sdp
 
 import config
+import huddle
 
 
 logger = logging.getLogger("MusicBot.HuddleVoice")
@@ -32,6 +36,38 @@ SAMPLE_RATE = 48_000
 SAMPLES_PER_FRAME = 960
 CHANNELS = 2
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * CHANNELS * 2
+OPUS_BITRATE = 256_000
+BUFFERED_FRAMES = 24
+MUSIC_FILTERS = {
+    "bassboost": "bass=g=10:f=110:w=0.6",
+    "nightcore": "aresample=48000,asetrate=48000*1.25",
+    "slowed": "aresample=48000,asetrate=48000*0.85",
+    "8d": "apulsator=hz=0.09",
+    "karaoke": "pan=stereo|c0=c0-c1|c1=c1-c0",
+}
+
+
+class MusicOpusEncoder(DefaultOpusEncoder):
+    """Use Discord-like music bandwidth instead of aiortc's 96 kbps default."""
+
+    def __init__(self):
+        super().__init__()
+        self.codec.bit_rate = OPUS_BITRATE
+        # aiortc defaults to Opus' speech-tuned VOIP mode. That aggressively
+        # models voices and can add a faint watery/noisy texture to music.
+        self.codec.options = {"application": "audio"}
+
+
+# aiortc resolves this module global when an RTP sender starts.
+aiortc.codecs.OpusEncoder = MusicOpusEncoder
+aiortc.codecs.CODECS["audio"][0].parameters.update(
+    {
+        "stereo": 1,
+        "sprop-stereo": 1,
+        "useinbandfec": 1,
+        "maxaveragebitrate": OPUS_BITRATE,
+    }
+)
 
 
 def _api_url(path: str) -> str:
@@ -51,7 +87,9 @@ class RoomAudioTrack(MediaStreamTrack):
         super().__init__()
         self._process = None
         self._reader_task = None
-        self._frames = asyncio.Queue(maxsize=4)
+        # Nearly half a second absorbs FFmpeg/network scheduling jitter. The
+        # WebRTC sender consumes this queue at an exact 20 ms cadence.
+        self._frames = asyncio.Queue(maxsize=BUFFERED_FRAMES)
         self._process_lock = asyncio.Lock()
         self._paused = True
         self._volume = 1.0
@@ -65,6 +103,8 @@ class RoomAudioTrack(MediaStreamTrack):
         position_seconds: float,
         paused: bool,
         volume: int,
+        duration_seconds: float = 0,
+        settings: dict | None = None,
     ):
         self._volume = max(0.0, min(1.0, volume / 100))
         async with self._process_lock:
@@ -73,17 +113,39 @@ class RoomAudioTrack(MediaStreamTrack):
             self._url = url
             if paused or not url:
                 return
+            settings = settings or {}
+            filters = []
+            preset = settings.get("audio_filter")
+            if preset in MUSIC_FILTERS:
+                filters.append(MUSIC_FILTERS[preset])
+            # Smooth source clock discontinuities before they reach Opus.
+            filters.append("aresample=48000:async=1000:first_pts=0")
+            fade = (
+                int(settings.get("automix_blend") or 8)
+                if settings.get("automix")
+                else int(settings.get("crossfade_seconds") or 0)
+            )
+            if fade:
+                filters.append(f"afade=t=in:st=0:d={min(fade, 2)}")
+                remaining = max(0, duration_seconds - position_seconds)
+                fade_start = remaining - fade
+                if fade_start > fade:
+                    filters.append(
+                        f"afade=t=out:st={fade_start:.2f}:d={fade}"
+                    )
+
             command = [
                 "ffmpeg",
                 "-nostdin",
                 "-loglevel",
                 "error",
-                "-re",
                 "-ss",
                 f"{max(0.0, position_seconds):.3f}",
                 "-i",
                 url,
                 "-vn",
+                "-af",
+                ",".join(filters),
                 "-acodec",
                 "pcm_s16le",
                 "-f",
@@ -139,12 +201,9 @@ class RoomAudioTrack(MediaStreamTrack):
         try:
             while process.returncode is None:
                 data = await process.stdout.readexactly(BYTES_PER_FRAME)
-                if self._frames.full():
-                    try:
-                        self._frames.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                self._frames.put_nowait(data)
+                # Backpressure keeps FFmpeg close to the listener instead of
+                # racing through the track and dropping decoded music.
+                await self._frames.put(data)
         except (asyncio.CancelledError, asyncio.IncompleteReadError, ConnectionError):
             return
 
@@ -160,13 +219,22 @@ class RoomAudioTrack(MediaStreamTrack):
             self._next_frame_at = loop.time()
         else:
             self._next_frame_at += frame_duration
-            await asyncio.sleep(max(0.0, self._next_frame_at - loop.time()))
+            now = loop.time()
+            # Never burst several packets to "catch up" after FFmpeg/network
+            # briefly delayed a frame. Bursts sound like tiny dips at the
+            # receiver even though no PCM was lost.
+            if self._next_frame_at < now:
+                self._next_frame_at = now
+            else:
+                await asyncio.sleep(self._next_frame_at - now)
 
         data = bytes(BYTES_PER_FRAME)
         if not self._paused:
             try:
-                data = self._frames.get_nowait()
-            except asyncio.QueueEmpty:
+                # Wait for real PCM instead of injecting a silent frame every
+                # time FFmpeg and the sender wake a few milliseconds apart.
+                data = await asyncio.wait_for(self._frames.get(), timeout=1)
+            except asyncio.TimeoutError:
                 pass
 
         if self._volume < 0.999 and data.strip(b"\0"):
@@ -206,11 +274,14 @@ class RoomPublisher:
     async def update(self, player: dict):
         track = player.get("track") or {}
         track_id = track.get("id")
+        settings = huddle.settings_for(self.channel_id)
+        settings_key = tuple(sorted(settings.items()))
         key = (
             track_id,
             bool(player.get("paused")),
             int(player.get("positionMs") or 0),
             int(player.get("updatedAt") or 0),
+            settings_key,
         )
         volume = int(player.get("volume") or 100)
         if key == self.state_key:
@@ -229,6 +300,8 @@ class RoomPublisher:
             position_ms / 1000,
             bool(player.get("paused")),
             volume,
+            float(track.get("duration") or 0),
+            settings,
         )
 
     async def stop(self):
@@ -347,12 +420,16 @@ class RoomPublisher:
 
 
 class HuddleVoiceManager:
-    def __init__(self):
+    def __init__(self, cog=None, song_class=None):
         self.headers = {
             "Authorization": f"Bearer {config.HUDDLE_BOT_TOKEN}",
             "Accept": "application/json",
         }
         self.publishers = {}
+        self.cog = cog
+        self.song_class = song_class
+        self.autoplay_tasks = {}
+        self.recorded_tracks = {}
         self.task = None
 
     async def start(self):
@@ -370,6 +447,9 @@ class HuddleVoiceManager:
         for publisher in list(self.publishers.values()):
             await publisher.stop()
         self.publishers.clear()
+        for task in self.autoplay_tasks.values():
+            task.cancel()
+        self.autoplay_tasks.clear()
 
     async def _run(self):
         timeout = aiohttp.ClientTimeout(total=10)
@@ -398,6 +478,7 @@ class HuddleVoiceManager:
                 player = room.get("player") or {}
                 if player.get("track"):
                     active[room["id"]] = player
+                    await self._observe_room(room["id"], player)
 
         for channel_id in set(self.publishers) - set(active):
             publisher = self.publishers.pop(channel_id)
@@ -410,3 +491,81 @@ class HuddleVoiceManager:
                 publisher = RoomPublisher(channel_id, self.headers)
                 self.publishers[channel_id] = publisher
             await publisher.update(player)
+
+    async def _observe_room(self, channel_id: str, player: dict):
+        track = player.get("track") or {}
+        track_id = track.get("id")
+        if track_id and self.recorded_tracks.get(channel_id) != track_id:
+            self.recorded_tracks[channel_id] = track_id
+            huddle.record_play(channel_id, track)
+
+        settings = huddle.settings_for(channel_id)
+        if not settings.get("autoplay") or player.get("queue"):
+            return
+        duration = float(track.get("duration") or 0)
+        if not duration:
+            return
+        position = float(player.get("positionMs") or 0) / 1000
+        if not player.get("paused"):
+            position += max(
+                0,
+                time.time() - float(player.get("updatedAt") or 0) / 1000,
+            )
+        if duration - position > 75:
+            return
+        existing = self.autoplay_tasks.get(channel_id)
+        if existing and not existing.done():
+            return
+        self.autoplay_tasks[channel_id] = asyncio.create_task(
+            self._queue_autoplay(channel_id, track)
+        )
+
+    async def _queue_autoplay(self, channel_id: str, track: dict):
+        if not self.cog or not self.song_class:
+            return
+        try:
+            guild = SimpleNamespace(
+                id=huddle.PREFIX + channel_id,
+                name=f"Huddle · {channel_id}",
+                voice_client=None,
+                me=SimpleNamespace(
+                    id=0,
+                    bot=True,
+                    display_name="Huddle Autoplay",
+                ),
+            )
+            player = self.cog.get_player(guild)
+            requester = guild.me
+            song = self.song_class(
+                title=track.get("title") or "Unknown",
+                url=track.get("pageUrl") or track.get("audioUrl"),
+                duration=huddle._format_duration(track.get("duration")) or "Unknown",
+                requester=requester,
+                source_type="youtube",
+                thumbnail=track.get("thumbnail"),
+                artist=track.get("artist"),
+            )
+            if not player.current or player.current.url != song.url:
+                if player.current:
+                    player.history.appendleft(player.current)
+                player.current = song
+            settings = huddle.settings_for(channel_id)
+            player.autoplay = True
+            player.artist_diversity = bool(settings.get("artist_diversity"))
+            player.vibe_match = bool(settings.get("vibe_match"))
+            recommendation = await self.cog.pick_autoplay_recommendation(player)
+            if recommendation:
+                await huddle.play(
+                    huddle.PREFIX + channel_id,
+                    recommendation.url,
+                    requested_by="Smart Autoplay",
+                )
+                logger.info(
+                    "Queued Huddle autoplay for %s: %s",
+                    channel_id,
+                    recommendation.title,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("Huddle autoplay failed for %s: %s", channel_id, error)

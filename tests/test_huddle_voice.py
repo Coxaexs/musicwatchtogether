@@ -11,6 +11,11 @@ import huddle_voice
 
 
 class RoomAudioTrackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_music_opus_profile(self):
+        encoder = huddle_voice.MusicOpusEncoder()
+        self.assertEqual(encoder.codec.bit_rate, 256_000)
+        self.assertEqual(encoder.codec.options.get("application"), "audio")
+
     async def test_silence_frame_shape(self):
         track = huddle_voice.RoomAudioTrack()
         frame = await track.recv()
@@ -95,11 +100,29 @@ class LiveHuddleWebRTCTests(unittest.IsolatedAsyncioTestCase):
 
                 track = await asyncio.wait_for(incoming_track, timeout=15)
                 audible = False
-                for _ in range(30):
+                silent_after_audio = 0
+                observed_after_audio = 0
+                for _ in range(130):
                     frame = await asyncio.wait_for(track.recv(), timeout=3)
-                    if any(bytes(frame.planes[0])):
+                    has_signal = any(bytes(frame.planes[0]))
+                    if has_signal:
                         audible = True
-                        break
+                    if audible:
+                        observed_after_audio += 1
+                        if not has_signal:
+                            silent_after_audio += 1
+                        if observed_after_audio >= 100:
+                            break
                 self.assertTrue(audible, "WebRTC arrived but carried only silence")
+                self.assertGreaterEqual(
+                    observed_after_audio,
+                    100,
+                    "WebRTC audio stopped before the continuity window completed",
+                )
+                self.assertLessEqual(
+                    silent_after_audio,
+                    1,
+                    "WebRTC inserted silent holes into continuous music",
+                )
 
         await peer.close()

@@ -8123,7 +8123,7 @@ async def main():
             logger.error(f"Web UI failed to start (bot will run without it): {e}")
         try:
             import huddle_voice
-            huddle_voice_manager = huddle_voice.HuddleVoiceManager()
+            huddle_voice_manager = huddle_voice.HuddleVoiceManager(cog, Song)
             await huddle_voice_manager.start()
         except Exception as e:
             logger.error(f"Huddle WebRTC voice failed to start: {e}")
