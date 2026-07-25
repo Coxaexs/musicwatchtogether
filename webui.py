@@ -958,6 +958,41 @@ class WebUI:
         items.update({name: playlist_json(name, entries, str(user_id), False) for name, entries in own.items()})
         return [items[name] for name in sorted(items, key=str.lower)]
 
+    async def api_lyrics_search(self, request):
+        """Lyrics for an arbitrary track, so Huddle rooms can show them too."""
+        query = (request.query.get('q') or '').strip()[:200]
+        if not query:
+            return web.json_response({'error': 'give a track name'}, status=400)
+        artist = (request.query.get('artist') or '').strip()[:120] or None
+        try:
+            duration = int(float(request.query.get('duration') or 0)) or None
+        except ValueError:
+            duration = None
+
+        cog = self.cog
+        if not cog:
+            return web.json_response({'track': None, 'lines': [], 'lyrics': None})
+
+        synced = await cog._fetch_synced_lyrics(query, artist, duration)
+        if synced:
+            return web.json_response({
+                'track': synced.get('track'),
+                'artist': synced.get('artist'),
+                'lines': synced.get('lines') or [],
+                'synced': True,
+            })
+
+        plain = await cog._fetch_lyrics(query, artist)
+        if not plain:
+            return web.json_response({'track': None, 'lines': [], 'lyrics': None})
+        return web.json_response({
+            'track': plain.get('track'),
+            'artist': plain.get('artist'),
+            'lines': [],
+            'lyrics': plain.get('lyrics'),
+            'synced': False,
+        })
+
     async def api_playlists(self, request):
         if huddle.is_huddle_id(request.match_info.get('guild_id', '')):
             # Saved playlists are still a Discord-side feature.
@@ -1256,6 +1291,7 @@ async def start_web_server(bot):
     app.router.add_post('/api/guilds/{guild_id}/playlists', ui.api_playlist_action)
     app.router.add_post('/api/guilds/{guild_id}/playlist-cover', ui.api_playlist_cover)
     app.router.add_get('/api/autocomplete', ui.api_autocomplete)
+    app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
     os.makedirs(PLAYLIST_COVERS_DIR, exist_ok=True)
     app.router.add_static('/playlist-covers/', PLAYLIST_COVERS_DIR)
 
