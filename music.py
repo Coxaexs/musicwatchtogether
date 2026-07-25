@@ -8115,17 +8115,26 @@ async def main():
         cog = MusicCog(bot)
         await bot.add_cog(cog)
         web_runner = None
+        huddle_voice_manager = None
         try:
             import webui
             web_runner = await webui.start_web_server(bot)
         except Exception as e:
             logger.error(f"Web UI failed to start (bot will run without it): {e}")
         try:
+            import huddle_voice
+            huddle_voice_manager = huddle_voice.HuddleVoiceManager()
+            await huddle_voice_manager.start()
+        except Exception as e:
+            logger.error(f"Huddle WebRTC voice failed to start: {e}")
+        try:
             await bot.start(config.DISCORD_TOKEN)
         finally:
             try:
                 await cog.shutdown()
             finally:
+                if huddle_voice_manager:
+                    await huddle_voice_manager.stop()
                 if web_runner:
                     await web_runner.cleanup()
 
