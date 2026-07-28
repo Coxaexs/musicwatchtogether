@@ -2484,6 +2484,14 @@ WATCH_HTML = r"""<!DOCTYPE html>
   .setrow small{color:var(--muted);display:block}
   .setrow input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent)}
   .setrow select{background:var(--panel2);color:var(--text);border:1px solid #333350;border-radius:6px;padding:6px}
+  /* Huddle embeds the exact same room and websocket instead of forking the
+     player. Only the surrounding standalone chrome is hidden. */
+  body.huddle-embed{padding:0;overflow:auto}
+  .huddle-embed .top,.huddle-embed .chatbox{display:none}
+  .huddle-embed .layout{display:block;max-width:none;margin:0;padding:0}
+  .huddle-embed .stage{border-radius:0}
+  .huddle-embed .card{margin:8px;border-radius:10px}
+  .huddle-embed .toast{bottom:10px}
 </style>
 </head>
 <body>
@@ -2614,6 +2622,7 @@ WATCH_HTML = r"""<!DOCTYPE html>
 </div></div>
 <script>
 const P = new URLSearchParams(location.search);
+document.body.classList.toggle('huddle-embed', P.get('embed')==='1');
 const ROOM = P.get('room') || '';
 const LINK_TOKEN = new URLSearchParams(location.hash.slice(1)).get('token') || '';
 let CLIENT_ID='';
@@ -2627,7 +2636,9 @@ async function exchangeRoomToken(){
   const r=await fetch('/watch/api/session',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({room:ROOM,token:LINK_TOKEN})});
-  history.replaceState(null,'',location.pathname+'?room='+encodeURIComponent(ROOM));
+  const nextParams=new URLSearchParams({room:ROOM});
+  if(P.get('embed')==='1')nextParams.set('embed','1');
+  history.replaceState(null,'',location.pathname+'?'+nextParams.toString());
   if(!r.ok){toast('❌ This room link is invalid or expired');return false}
   return true;
 }
