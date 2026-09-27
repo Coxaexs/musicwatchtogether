@@ -28,10 +28,20 @@ from aiortc.contrib.media import MediaRelay
 from aiortc.sdp import candidate_from_sdp
 
 import config
+import dj
 import huddle
+import mixer
+
+
+def _mix_keys(track: dict):
+    """Cache keys for a Huddle track's analysis."""
+    return [mixer.track_key(track.get("pageUrl")),
+            mixer.track_key(track.get("query"))]
 
 
 logger = logging.getLogger("MusicBot.HuddleVoice")
+#: The running HuddleVoiceManager, so the DJ booth can see room players.
+MANAGER = None
 SAMPLE_RATE = 48_000
 SAMPLES_PER_FRAME = 960
 CHANNELS = 2
@@ -104,6 +114,14 @@ class RoomAudioTrack(MediaStreamTrack):
         self._pts = 0
         self._next_frame_at = None
         self._url = None
+        self.track_id = None
+        self._filters = []
+        self._mix = None
+        # Seconds into the source that the decoder has delivered so far.
+        self._start_pos = 0.0
+        self._src_pos = 0.0
+        # A live DJ booth (dj.DJEngine) replaces the FFmpeg source entirely.
+        self.dj = None
 
     async def configure(
         self,
@@ -113,28 +131,22 @@ class RoomAudioTrack(MediaStreamTrack):
         volume: int,
         duration_seconds: float = 0,
         settings: dict | None = None,
+        track_id: str | None = None,
     ):
         self._volume = max(0.0, min(1.0, volume / 100))
         async with self._process_lock:
             await self._stop_process()
             self._paused = paused
             self._url = url
+            self.track_id = track_id
+            self._start_pos = self._src_pos = max(0.0, position_seconds)
             if paused or not url:
                 return
             settings = settings or {}
-            filters = []
-            preset = settings.get("audio_filter")
-            if preset in MUSIC_FILTERS:
-                filters.append(MUSIC_FILTERS[preset])
-            # Use libsoxr's high-quality resampler. `async=1000` used to
-            # continuously stretch/drop samples to chase source timestamps,
-            # which can sound like a faint watery noise on music.
-            filters.append("aresample=48000:resampler=soxr:precision=28")
-            fade = (
-                int(settings.get("automix_blend") or 8)
-                if settings.get("automix")
-                else int(settings.get("crossfade_seconds") or 0)
-            )
+            filters = self._base_filters(settings)
+            # With AutoMix the mixer renders the transition; the old
+            # fade-out/fade-in only applies to the plain crossfade setting.
+            fade = 0 if settings.get("automix") else int(settings.get("crossfade_seconds") or 0)
             if fade:
                 filters.append(f"afade=t=in:st=0:d={min(fade, 2)}")
                 remaining = max(0, duration_seconds - position_seconds)
@@ -143,46 +155,57 @@ class RoomAudioTrack(MediaStreamTrack):
                     filters.append(
                         f"afade=t=out:st={fade_start:.2f}:d={fade}"
                     )
-
-            command = [
-                "ffmpeg",
-                "-nostdin",
-                "-loglevel",
-                "error",
-                "-ss",
-                f"{max(0.0, position_seconds):.3f}",
-                "-reconnect",
-                "1",
-                "-reconnect_streamed",
-                "1",
-                "-reconnect_delay_max",
-                "2",
-                "-i",
-                url,
-                "-vn",
-                "-af",
-                ",".join(filters),
-                "-acodec",
-                "pcm_s16le",
-                "-f",
-                "s16le",
-                "-ar",
-                str(SAMPLE_RATE),
-                "-ac",
-                str(CHANNELS),
-                "pipe:1",
-            ]
-            self._process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
+            self._filters = self._base_filters(settings)
+            self._process = await self._spawn(url, position_seconds, filters)
             logger.info(
                 "Started Huddle audio at %.2fs (pid %s)",
                 position_seconds,
                 self._process.pid,
             )
             self._reader_task = asyncio.create_task(self._pump_frames())
+
+    @staticmethod
+    def _base_filters(settings: dict) -> list:
+        filters = []
+        preset = settings.get("audio_filter")
+        if preset in MUSIC_FILTERS:
+            filters.append(MUSIC_FILTERS[preset])
+        # Use libsoxr's high-quality resampler. `async=1000` used to
+        # continuously stretch/drop samples to chase source timestamps,
+        # which can sound like a faint watery noise on music.
+        filters.append("aresample=48000:resampler=soxr:precision=28")
+        return filters
+
+    @staticmethod
+    async def _spawn(url: str, position_seconds: float, filters: list):
+        command = [
+            "ffmpeg", "-nostdin", "-loglevel", "error",
+            "-ss", f"{max(0.0, position_seconds):.3f}",
+            "-reconnect", "1", "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "2",
+            "-i", url, "-vn", "-af", ",".join(filters),
+            "-acodec", "pcm_s16le", "-f", "s16le",
+            "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), "pipe:1",
+        ]
+        return await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+    def set_mix(self, mix: dict | None):
+        """Arm a rendered transition out of the song now playing.
+
+        mix: {url, out_at, segment (s16le bytes), next_url, next_resume,
+              next_track_id, on_start (called when the segment goes out)}
+        """
+        self._mix = mix
+
+    def mix_armed_for(self, url: str) -> dict | None:
+        mix = self._mix
+        if mix and mix["url"] == url and self._start_pos < mix["out_at"] - 0.25:
+            return mix
+        return None
 
     def set_volume(self, volume: int):
         self._volume = max(0.0, min(1.0, volume / 100))
@@ -201,6 +224,10 @@ class RoomAudioTrack(MediaStreamTrack):
 
         process = self._process
         self._process = None
+        await self._kill(process)
+
+    @staticmethod
+    async def _kill(process):
         if not process or process.returncode is not None:
             return
         process.terminate()
@@ -210,17 +237,54 @@ class RoomAudioTrack(MediaStreamTrack):
             process.kill()
             await process.communicate()
 
+    async def _put_bytes(self, pending: bytearray):
+        while len(pending) >= BYTES_PER_FRAME:
+            await self._frames.put(bytes(pending[:BYTES_PER_FRAME]))
+            del pending[:BYTES_PER_FRAME]
+
     async def _pump_frames(self):
-        process = self._process
-        if not process or not process.stdout:
-            return
+        pending = bytearray()
+        bytes_per_second = SAMPLE_RATE * CHANNELS * 2
         try:
-            while process.returncode is None:
-                data = await process.stdout.readexactly(BYTES_PER_FRAME)
+            while True:
+                process = self._process
+                if not process or not process.stdout:
+                    return
+                try:
+                    data = await process.stdout.readexactly(BYTES_PER_FRAME)
+                except asyncio.IncompleteReadError as partial:
+                    pending.extend(partial.partial)
+                    await self._put_bytes(pending)
+                    return
+                mix = self.mix_armed_for(self._url)
+                frame_seconds = len(data) / bytes_per_second
+                if mix and self._src_pos + frame_seconds >= mix["out_at"]:
+                    # Cut the outgoing song on the exact sample, splice in
+                    # the rendered transition, then carry on with the next
+                    # song where the transition leaves it.
+                    keep = int((mix["out_at"] - self._src_pos) * SAMPLE_RATE) * CHANNELS * 2
+                    pending.extend(data[: max(0, keep)])
+                    await self._put_bytes(pending)
+                    await self._frames.put(mix["on_start"])
+                    pending.extend(mix["segment"])
+                    self._mix = None
+                    self._url = mix["next_url"]
+                    self.track_id = mix["next_track_id"]
+                    self._start_pos = self._src_pos = mix["next_resume"]
+                    replacement = await self._spawn(
+                        mix["next_url"], mix["next_resume"], self._filters)
+                    self._process = replacement
+                    asyncio.create_task(self._kill(process))
+                    logger.info("AutoMix: transition into %s (pid %s)",
+                                mix["next_track_id"], replacement.pid)
+                    await self._put_bytes(pending)
+                    continue
+                self._src_pos += frame_seconds
+                pending.extend(data)
                 # Backpressure keeps FFmpeg close to the listener instead of
                 # racing through the track and dropping decoded music.
-                await self._frames.put(data)
-        except (asyncio.CancelledError, asyncio.IncompleteReadError, ConnectionError):
+                await self._put_bytes(pending)
+        except (asyncio.CancelledError, ConnectionError):
             return
 
     async def shutdown(self):
@@ -245,11 +309,32 @@ class RoomAudioTrack(MediaStreamTrack):
                 await asyncio.sleep(self._next_frame_at - now)
 
         data = bytes(BYTES_PER_FRAME)
+        engine = self.dj
+        if engine is not None:
+            try:
+                data = engine.render()
+            except Exception:
+                logger.exception("DJ render failed")
+            frame = AudioFrame(format="s16", layout="stereo", samples=SAMPLES_PER_FRAME)
+            frame.planes[0].update(data)
+            frame.sample_rate = SAMPLE_RATE
+            frame.pts = self._pts
+            frame.time_base = Fraction(1, SAMPLE_RATE)
+            self._pts += SAMPLES_PER_FRAME
+            return frame
         if not self._paused:
             try:
                 # Wait for real PCM instead of injecting a silent frame every
                 # time FFmpeg and the sender wake a few milliseconds apart.
-                data = await asyncio.wait_for(self._frames.get(), timeout=1)
+                item = await asyncio.wait_for(self._frames.get(), timeout=1)
+                if callable(item):
+                    # A transition marker: the mix starts with this frame.
+                    try:
+                        item()
+                    except Exception:
+                        logger.exception("AutoMix start callback failed")
+                    item = await asyncio.wait_for(self._frames.get(), timeout=1)
+                data = item if isinstance(item, bytes) else data
             except asyncio.TimeoutError:
                 pass
 
@@ -285,9 +370,34 @@ class RoomPublisher:
         self.state_key = None
         self.active = True
         self.websocket = None
+        self.mix_key = None
+        self.mix_task = None
         self.task = asyncio.create_task(self._run())
 
+    async def _update_dj(self, session, player: dict):
+        """The booth is on air: keep the room's own player out of the way."""
+        if self.source.dj is not session.engine:
+            await self.source.configure("", 0, True, 100)  # stop FFmpeg
+            self.source.set_mix(None)
+            self.mix_key = None
+            self.source.dj = session.engine
+            logger.info("DJ booth is live in Huddle room %s", self.channel_id)
+        # Someone pressed play on the room player: pause it again, or the
+        # hub would advance through the DJ's queue on its own.
+        if player.get("track") and not player.get("paused"):
+            now = time.monotonic()
+            if now - getattr(self, "_dj_paused_at", 0) > 3:
+                self._dj_paused_at = now
+                asyncio.create_task(session.pause_hub())
+
     async def update(self, player: dict):
+        session = dj.sessions.get(huddle.PREFIX + self.channel_id)
+        if session and session.live:
+            await self._update_dj(session, player)
+            return
+        if self.source.dj is not None:
+            self.source.dj = None
+            self.state_key = None  # pick the room player back up from scratch
         track = player.get("track") or {}
         track_id = track.get("id")
         settings = huddle.settings_for(self.channel_id)
@@ -302,8 +412,21 @@ class RoomPublisher:
         volume = int(player.get("volume") or 100)
         if key == self.state_key:
             self.source.set_volume(volume)
+            self._maybe_plan(player, settings)
+            return
+        # The hub catching up with a transition we already played: the new
+        # song is running from the mix, so don't restart it.
+        previous_id = self.state_key[0] if self.state_key else None
+        if (track_id and track_id != previous_id
+                and track_id == self.source.track_id
+                and not player.get("paused")):
+            self.state_key = key
+            self.source.set_volume(volume)
+            self._maybe_plan(player, settings)
             return
 
+        # A seek or pause keeps the rendered transition: the source only
+        # plays it if the new position is still before the mix point.
         self.state_key = key
         position_ms = int(player.get("positionMs") or 0)
         if track_id and not player.get("paused"):
@@ -318,10 +441,87 @@ class RoomPublisher:
             volume,
             float(track.get("duration") or 0),
             settings,
+            track_id,
         )
+        self._maybe_plan(player, settings)
+
+    # ---------------------------------------------------------------- mixing
+
+    def _mix_spec(self, track: dict, settings: dict):
+        """The transition out of `track`: its own, else Auto with AutoMix."""
+        spec = track.get("mix")
+        if spec:
+            return spec
+        if settings.get("automix"):
+            return {"preset": "auto"}
+        return None
+
+    def _maybe_plan(self, player: dict, settings: dict):
+        track = player.get("track") or {}
+        queue = player.get("queue") or []
+        upcoming = queue[0] if queue else None
+        spec = self._mix_spec(track, settings)
+        if (not spec or not upcoming
+                or player.get("loop") == "track"
+                or settings.get("audio_filter") in ("nightcore", "slowed")
+                or not track.get("audioUrl") or not upcoming.get("audioUrl")):
+            if self.mix_key is not None:
+                self.mix_key = None
+                self.source.set_mix(None)
+            return
+        key = (track.get("id"), upcoming.get("id"), json.dumps(spec, sort_keys=True))
+        if key == self.mix_key or player.get("paused"):
+            return
+        self.mix_key = key
+        self.source.set_mix(None)
+        if self.mix_task and not self.mix_task.done():
+            self.mix_task.cancel()
+        self.mix_task = asyncio.create_task(self._prepare_mix(key, track, upcoming, spec))
+
+    async def _prepare_mix(self, key, track: dict, upcoming: dict, spec: dict):
+        out_url, in_url = track["audioUrl"], upcoming["audioUrl"]
+        try:
+            out_meta, in_meta = await asyncio.gather(
+                mixer.analyze_async(out_url, *_mix_keys(track)),
+                mixer.analyze_async(in_url, *_mix_keys(upcoming)),
+            )
+            plan = mixer.plan(out_meta, in_meta, spec, track.get("duration"),
+                              self.source._src_pos)
+            if not plan:
+                return
+            loop = asyncio.get_running_loop()
+            segment = await loop.run_in_executor(None, mixer.render, out_url, in_url, plan)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("AutoMix: could not prepare %r -> %r: %s",
+                           track.get("title"), upcoming.get("title"), error)
+            return
+        if self.mix_key != key or self.source._url != out_url:
+            return
+        channel_id, from_id = self.channel_id, track["id"]
+        position_ms = int(plan["in_at"] * 1000)
+
+        def on_start():
+            asyncio.create_task(huddle._request("POST", "/api/bot/player", {
+                "channelId": channel_id,
+                "action": {"name": "mixAdvance", "fromTrackId": from_id,
+                           "positionMs": position_ms},
+            }))
+
+        self.source.set_mix({
+            "url": out_url, "out_at": plan["out_at"], "segment": segment,
+            "next_url": in_url, "next_resume": plan["in_resume_at"],
+            "next_track_id": upcoming["id"], "on_start": on_start,
+        })
+        logger.info("AutoMix: %s (%s bars) %r -> %r at %.1fs",
+                    plan["spec"]["preset"], plan["spec"]["bars"],
+                    track.get("title"), upcoming.get("title"), plan["out_at"])
 
     async def stop(self):
         self.active = False
+        if self.mix_task and not self.mix_task.done():
+            self.mix_task.cancel()
         if self.websocket and not self.websocket.closed:
             await self.websocket.close()
         for peer in list(self.peers.values()):
@@ -475,13 +675,18 @@ class HuddleVoiceManager:
         self.cog = cog
         self.song_class = song_class
         self.autoplay_tasks = {}
+        self.resolve_tasks = {}
         self.recorded_tracks = {}
+        #: channel id -> the room's raw hub player, refreshed every poll
+        self.players = {}
         self.task = None
 
     async def start(self):
+        global MANAGER
         if not config.HUDDLE_BASE_URL or not config.HUDDLE_BOT_TOKEN:
             logger.info("Huddle WebRTC publisher disabled (not configured)")
             return
+        MANAGER = self
         self.task = asyncio.create_task(self._run())
         logger.info("Huddle WebRTC publisher started")
 
@@ -517,14 +722,61 @@ class HuddleVoiceManager:
                     logger.warning("Huddle voice state poll failed: %s", error)
                 await asyncio.sleep(1)
 
+    #: How many queued placeholders to have resolved ahead of time.
+    RESOLVE_AHEAD = 2
+
+    def _resolve_upcoming(self, channel_id: str, player: dict):
+        """Look up playlist placeholders just before they are needed."""
+        upcoming = [player.get("track")] + list(player.get("queue") or [])[: self.RESOLVE_AHEAD]
+        for index, track in enumerate(upcoming):
+            if not track or track.get("audioUrl") or not track.get("query"):
+                continue
+            track_id = track.get("id")
+            task = self.resolve_tasks.get(track_id)
+            if task and not task.done():
+                continue
+            self.resolve_tasks[track_id] = asyncio.create_task(
+                self._resolve_track(channel_id, track, current=index == 0)
+            )
+        for track_id, task in list(self.resolve_tasks.items()):
+            if task.done():
+                self.resolve_tasks.pop(track_id, None)
+
+    async def _resolve_track(self, channel_id: str, track: dict, current: bool):
+        try:
+            await huddle.resolve(channel_id, track["id"])
+        except Exception as error:
+            logger.warning("Could not resolve %r: %s", track.get("title"), error)
+            if current:
+                # Don't sit silently on a song that cannot be found.
+                try:
+                    await huddle._request("POST", "/api/bot/player", {
+                        "channelId": channel_id,
+                        "action": {"name": "skip"},
+                    })
+                except Exception:
+                    pass
+
     async def _sync(self, data: dict):
         active = {}
+        players = {}
         for server in data.get("servers") or []:
             for room in server.get("voiceChannels") or []:
                 player = room.get("player") or {}
+                players[room["id"]] = player
                 if player.get("track"):
+                    self._resolve_upcoming(room["id"], player)
                     active[room["id"]] = player
                     await self._observe_room(room["id"], player)
+        self.players = players
+        # A room with the DJ booth on stays published even with no track.
+        for key, session in list(dj.sessions.items()):
+            channel_id = huddle.channel_id_from(key)
+            if channel_id and session.live:
+                if channel_id not in players:
+                    await session.stop()  # the room was deleted
+                    continue
+                active.setdefault(channel_id, players[channel_id])
 
         for channel_id in set(self.publishers) - set(active):
             publisher = self.publishers.pop(channel_id)

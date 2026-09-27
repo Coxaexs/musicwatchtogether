@@ -11,6 +11,7 @@ Config (via .env / config.py):
 """
 
 import asyncio
+from types import SimpleNamespace
 import hashlib
 import json
 import logging
@@ -21,10 +22,13 @@ import shutil
 import struct
 import time
 
+import aiohttp
 from aiohttp import web
 
 import config
+import dj
 import huddle
+import mixer
 from music import Song, get_autocomplete_suggestions, state_store
 from security import SlidingWindowLimiter, client_identity
 from storage import save_bytes_atomic, save_json
@@ -57,6 +61,124 @@ def _valid_token_info(token):
         _save_tokens()
         return None
     return info
+
+# ---------------------------------------------------------------- mix storage
+
+#: (guild id, playlist name) -> background analysis task
+_mix_jobs = {}
+#: entry key -> (resolved audio URL, expires at)
+_audio_urls = {}
+
+
+def _entry_keys(entry):
+    url = entry.get('url') or ''
+    query = url[len('spotify:search:'):] if url.startswith('spotify:search:') else url
+    return [mixer.track_key(url), mixer.track_key(query)]
+
+
+def _pair_key(entries, index):
+    """Transitions follow the two songs, so they survive reordering."""
+    return f"{entries[index].get('url')}\n{entries[index + 1].get('url')}"
+
+
+def _playlist_mix(guild_id, owner, name):
+    mixes = state_store.load('playlist_mixes', {})
+    record = mixes.get(str(guild_id), {}).get(owner, {}).get(name) or {}
+    return {'enabled': bool(record.get('enabled')),
+            'transitions': dict(record.get('transitions') or {})}
+
+
+def _save_playlist_mix(guild_id, owner, name, record):
+    mixes = state_store.load('playlist_mixes', {})
+    mixes.setdefault(str(guild_id), {}).setdefault(owner, {})[name] = record
+    state_store.save('playlist_mixes', mixes)
+
+
+def playlist_mix_specs(guild_id, owner, name, entries):
+    """Per-entry transition specs for queueing, or None when not mixed."""
+    record = _playlist_mix(guild_id, owner, name)
+    if not record['enabled']:
+        return None
+    return [record['transitions'].get(_pair_key(entries, i)) or {'preset': 'auto'}
+            if i < len(entries) - 1 else None for i in range(len(entries))]
+
+
+def _resolve_with_bot(query):
+    """The bot's own yt-dlp (has the YouTube cookies) as a fallback."""
+    opts = {'format': 'bestaudio/best', 'default_search': 'ytsearch1', 'noplaylist': True,
+            'quiet': True, 'no_warnings': True, 'skip_download': True}
+    if getattr(config, 'YTDLP_COOKIEFILE', None):
+        opts['cookiefile'] = config.YTDLP_COOKIEFILE
+    import yt_dlp
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+    if info and info.get('entries'):
+        info = next((entry for entry in info['entries'] if entry), None)
+    if not info or not info.get('url'):
+        raise RuntimeError('No playable result was found.')
+    return {'audio_url': info['url'], 'page_url': info.get('webpage_url'),
+            'duration': info.get('duration')}
+
+
+async def _resolve_audio(query):
+    """Stream URL + page URL for a search or link, via the yt-dlp helper."""
+    helper = getattr(config, 'MUSIC_HELPER_URL', 'http://127.0.0.1:8731').rstrip('/')
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f'{helper}/resolve', json={'query': query},
+                                    timeout=aiohttp.ClientTimeout(total=60)) as response:
+                data = await response.json(content_type=None)
+                if response.status < 400 and data.get('audio_url'):
+                    return data
+                error = data.get('error') or 'could not resolve'
+    except Exception as exc:
+        error = str(exc)
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, _resolve_with_bot, query)
+    except Exception as exc:
+        raise RuntimeError(f'{error} / {exc}')
+
+
+async def _entry_audio(entry, attempts=2):
+    """(audio URL, analysis) for a playlist entry, analysing if needed.
+
+    A failed stream URL is dropped and looked up again: YouTube links go
+    stale or get throttled, and retrying the dead link only fails again.
+    """
+    keys = _entry_keys(entry)
+    for attempt in range(attempts):
+        cached = _audio_urls.get(keys[1])
+        if cached and cached[1] > time.time():
+            source = cached[0]
+        else:
+            query = huddle._playlist_track(entry)['query']
+            resolved = await _resolve_audio(query)
+            source = resolved['audio_url']
+            keys = keys[:2] + [mixer.track_key(resolved.get('page_url'))]
+            _audio_urls[keys[1]] = (source, time.time() + 3 * 3600)
+        try:
+            return source, await mixer.analyze_async(source, *keys)
+        except Exception:
+            _audio_urls.pop(keys[1], None)
+            if attempt == attempts - 1:
+                raise
+
+
+#: entry key -> why it could not be analysed (shown in the editor)
+_mix_failures = {}
+
+
+async def _analyze_entries(entries):
+    for entry in entries:
+        if mixer.cache.get(*_entry_keys(entry)):
+            continue
+        try:
+            await _entry_audio(entry)
+            _mix_failures.pop(_entry_keys(entry)[1], None)
+        except Exception as error:
+            _mix_failures[_entry_keys(entry)[1]] = str(error)[:200]
+            logger.warning(f"Mix analysis skipped {entry.get('title')!r}: {error}")
+
 
 def generate_token(guild_id, user_id=None):
     token = secrets.token_urlsafe(16)
@@ -168,7 +290,10 @@ class WebUI:
 
     @staticmethod
     def _supplied_token(request):
-        return request.cookies.get('mb_session') or ''
+        # The DJ booth also sends its link token as a header, so it keeps
+        # working where the SameSite cookie is not sent (embedded frames).
+        return (request.cookies.get('mb_session')
+                or request.headers.get('X-MB-Session', '').strip() or '')
 
     @staticmethod
     def _set_session_cookie(request, response, token):
@@ -229,6 +354,14 @@ class WebUI:
             return web.json_response({'error': 'admin password required'}, status=401)
         if request.path.startswith('/api/') and not self._authorized(request):
             return web.json_response({'error': 'unauthorized'}, status=401)
+        # Huddle rooms skip _get_guild_and_player, so hold a room-scoped link
+        # to its own room here.
+        requested = (request.match_info.get('guild_id')
+                     or request.query.get('guild_id', ''))
+        if huddle.is_huddle_id(requested):
+            allowed = self._get_allowed_guild_id(request)
+            if allowed is not None and str(allowed) != requested:
+                return web.json_response({'error': 'forbidden'}, status=403)
         return await handler(request)
 
     # ---------- helpers ----------
@@ -283,6 +416,7 @@ class WebUI:
             'crossfade_seconds': player.crossfade_seconds,
             'automix': player.automix_enabled,
             'automix_blend_seconds': player.automix_blend_seconds,
+            'dj': str(guild.id) in dj.sessions,
             'karaoke': player.karaoke_mode,
             'idle_disconnect_minutes': player.idle_disconnect_seconds // 60,
             'sleep_timer_ends_at': player.sleep_timer_ends_at,
@@ -460,6 +594,174 @@ class WebUI:
             return web.json_response({'error': 'room not found'}, status=404)
         return await self.api_admin_state(request)
 
+    async def api_admin_huddle_link(self, request):
+        """Huddle's /web: a link token scoped to one Huddle voice room.
+
+        Huddle signs in with the master password (admin middleware) and hands
+        the link to the member who asked, like Discord's /web.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        channel_id = str(body.get('channel_id') or '').strip()
+        if not channel_id or len(channel_id) > 100:
+            return web.json_response({'error': 'channel_id required'}, status=400)
+        guild_id = huddle.PREFIX + channel_id
+        token = generate_token(guild_id, None)
+        return web.json_response({'guild_id': guild_id, 'token': token})
+
+    # ------------------------------------------------------------ playlist mix
+
+    def _mix_target(self, request):
+        requested = request.match_info.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            guild, _player = self._huddle_playlist_target(requested)
+        else:
+            guild, _player = self._get_guild_and_player(request)
+        return guild
+
+    def _mix_playlist(self, request, guild, name):
+        """(entries, owner_key, mix record) for a playlist this user can see."""
+        cog = self.cog
+        user_id = self._get_acting_user_id(request)
+        data = cog._read_playlists()
+        owner = cog.resolve_playlist_owner(data, guild.id, user_id, name)
+        if not owner:
+            raise web.HTTPNotFound(text=f'No playlist named {name}.')
+        entries = cog._bucket_for(data.get(str(guild.id), {}), owner).get(name, [])
+        return data, entries, owner, _playlist_mix(guild.id, owner, name)
+
+    def _mix_json(self, guild, name, entries, record):
+        tracks = []
+        metas = []
+        for entry in entries:
+            meta = mixer.cache.get(*_entry_keys(entry))
+            metas.append(meta)
+            track = huddle._playlist_track(entry)
+            tracks.append({
+                'title': track['title'], 'artist': track['artist'],
+                'thumbnail': _thumbnail_from_url(entry.get('url'), entry.get('thumbnail')),
+                'duration': entry.get('duration'),
+                'bpm': round(meta['bpm']) if meta and meta.get('bpm') else None,
+                'camelot': meta.get('camelot') if meta else None,
+                'energy': meta.get('energy') if meta else None,
+            })
+        transitions = []
+        for index in range(max(0, len(entries) - 1)):
+            spec = mixer.normalize_spec(record['transitions'].get(_pair_key(entries, index)))
+            resolved = None
+            if metas[index] and metas[index + 1]:
+                resolved = mixer.resolve_spec(spec, metas[index], metas[index + 1])
+            transitions.append({'index': index, 'spec': spec, 'resolved': resolved})
+        job = _mix_jobs.get((str(guild.id), name))
+        return {
+            'name': name,
+            'enabled': bool(record.get('enabled')),
+            'tracks': tracks,
+            'transitions': transitions,
+            'analysis': {
+                'done': sum(1 for meta in metas if meta),
+                'total': len(entries),
+                'running': bool(job and not job.done()),
+                'failed': [tracks[i]['title'] for i, entry in enumerate(entries)
+                           if not metas[i] and _entry_keys(entry)[1] in _mix_failures],
+            },
+            'catalog': mixer.catalog(),
+        }
+
+    async def api_playlist_mix(self, request):
+        guild = self._mix_target(request)
+        name = (request.query.get('name') or '').strip()[:50]
+        _data, entries, _owner, record = self._mix_playlist(request, guild, name)
+        return web.json_response(self._mix_json(guild, name, entries, record))
+
+    async def api_playlist_mix_action(self, request):
+        guild = self._mix_target(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        name = (body.get('name') or '').strip()[:50]
+        action = body.get('action')
+        async with self._playlist_lock():
+            data, entries, owner, record = self._mix_playlist(request, guild, name)
+            if action in ('enable', 'disable'):
+                record['enabled'] = action == 'enable'
+                _save_playlist_mix(guild.id, owner, name, record)
+                if record['enabled']:
+                    self._start_mix_analysis(guild.id, name, entries)
+            elif action == 'set':
+                index = int(body.get('index', -1))
+                if not 0 <= index < len(entries) - 1:
+                    return web.json_response({'error': 'No such transition.'}, status=404)
+                spec = mixer.normalize_spec(body.get('spec'))
+                key = _pair_key(entries, index)
+                if spec['preset'] == 'auto':
+                    record['transitions'].pop(key, None)
+                else:
+                    record['transitions'][key] = spec
+                _save_playlist_mix(guild.id, owner, name, record)
+            elif action == 'analyze':
+                self._start_mix_analysis(guild.id, name, entries)
+            elif action == 'reorder':
+                metas = [mixer.cache.get(*_entry_keys(entry)) for entry in entries]
+                known = [i for i, meta in enumerate(metas) if meta]
+                if len(known) < 3:
+                    return web.json_response(
+                        {'error': 'Analyse the playlist first so songs can be ordered by BPM and key.'},
+                        status=409)
+                order = [known[i] for i in mixer.smart_order([metas[i] for i in known])]
+                order += [i for i in range(len(entries)) if i not in set(known)]
+                reordered = [entries[i] for i in order]
+                self.cog._bucket_for(data.setdefault(str(guild.id), {}), owner)[name] = reordered
+                self.cog._write_playlists(data)
+                entries = reordered
+            else:
+                return web.json_response({'error': f'unknown mix action {action!r}'}, status=400)
+        return web.json_response(self._mix_json(guild, name, entries, record))
+
+    async def api_playlist_mix_preview(self, request):
+        """An MP3 of one transition: 6 s before, the blend, 6 s after."""
+        guild = self._mix_target(request)
+        name = (request.query.get('name') or '').strip()[:50]
+        index = int(request.query.get('index', -1))
+        _data, entries, _owner, record = self._mix_playlist(request, guild, name)
+        if not 0 <= index < len(entries) - 1:
+            raise web.HTTPNotFound(text='No such transition.')
+        spec = request.query.get('spec')
+        try:
+            spec = json.loads(spec) if spec else record['transitions'].get(_pair_key(entries, index))
+        except ValueError:
+            spec = None
+        try:
+            (out_src, out_meta), (in_src, in_meta) = await asyncio.gather(
+                _entry_audio(entries[index]), _entry_audio(entries[index + 1]))
+            plan = mixer.plan(out_meta, in_meta, spec, out_meta.get('duration'))
+            if not plan:
+                return web.json_response({'error': 'This transition is a straight cut.'}, status=409)
+            loop = asyncio.get_running_loop()
+            pcm = await loop.run_in_executor(None, mixer.render_preview, out_src, in_src, plan)
+            process = await asyncio.create_subprocess_exec(
+                'ffmpeg', '-nostdin', '-loglevel', 'error', '-f', 's16le', '-ar', '48000',
+                '-ac', '2', '-i', 'pipe:0', '-b:a', '160k', '-f', 'mp3', 'pipe:1',
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+            mp3, _ = await process.communicate(pcm)
+        except Exception as error:
+            logger.warning(f'Mix preview failed: {error}', exc_info=True)
+            return web.json_response({'error': f'Could not render the preview: {error}'}, status=502)
+        return web.Response(body=mp3, content_type='audio/mpeg',
+                            headers={'Cache-Control': 'no-store',
+                                     'X-Mix-Preset': plan['spec']['preset'],
+                                     'X-Mix-Bars': str(plan['spec']['bars'])})
+
+    def _start_mix_analysis(self, guild_id, name, entries):
+        key = (str(guild_id), name)
+        job = _mix_jobs.get(key)
+        if job and not job.done():
+            return
+        _mix_jobs[key] = asyncio.ensure_future(_analyze_entries(list(entries)))
+
     async def api_guilds(self, request):
         guilds = []
         allowed_guild_id = self._get_allowed_guild_id(request)
@@ -481,6 +783,9 @@ class WebUI:
         # offline simply contributes nothing.
         if allowed_guild_id is None:
             guilds.extend(await huddle.guild_entries())
+        elif huddle.is_huddle_id(str(allowed_guild_id)):
+            guilds.extend(entry for entry in await huddle.guild_entries()
+                          if entry['id'] == allowed_guild_id)
 
         return web.json_response({
             'ready': self.bot.is_ready(),
@@ -488,6 +793,70 @@ class WebUI:
             'auth_required': bool(config.WEB_UI_PASSWORD) and allowed_guild_id is None
         })
 
+
+    # ---------- DJ booth ----------
+
+    async def dj_page(self, request):
+        import dj_ui
+        return web.Response(text=dj_ui.DJ_HTML, content_type='text/html',
+                            headers={'Cache-Control': 'no-store'})
+
+    def _dj_target(self, request):
+        """(session key, Discord player or None for a Huddle room)."""
+        requested = request.match_info.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            return requested, None
+        guild, player = self._get_guild_and_player(request)
+        return str(guild.id), player
+
+    async def api_dj_state(self, request):
+        key, _player = self._dj_target(request)
+        session = dj.sessions.get(key)
+        if not session:
+            return web.json_response(dj.inactive_state())
+        full = request.query.get('full') == '1'
+        state = session.state(full=full)
+        if full:
+            state['catalog'] = dj.catalog()
+        return web.json_response(state)
+
+    async def api_dj_action(self, request):
+        key, player = self._dj_target(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        op = body.get('op')
+        try:
+            if op == 'start':
+                auto = bool(body.get('auto', True))
+                if player is None:
+                    import huddle_voice
+                    if not huddle_voice.MANAGER:
+                        raise RuntimeError('Huddle voice publishing is not running on the bot.')
+                    await huddle.room_state(key)  # KeyError for an unknown room
+                    session = await dj.start_huddle(huddle.channel_id_from(key), auto=auto)
+                else:
+                    session = await dj.start_discord(player, auto=auto)
+            elif op == 'stop':
+                session = dj.sessions.get(key)
+                if session:
+                    await session.stop()
+                return web.json_response(dj.inactive_state())
+            else:
+                session = dj.sessions.get(key)
+                if not session:
+                    return web.json_response({'error': 'DJ mode is off. Start it first.'}, status=409)
+                requester = self._acting_member(request, player.guild) if player else None
+                await session.handle(body, requester)
+        except KeyError:
+            return web.json_response({'error': 'Huddle room not found.'}, status=404)
+        except (ValueError, RuntimeError, TypeError) as error:
+            return web.json_response({'error': str(error)}, status=400)
+        state = session.state(full=bool(body.get('full')))
+        if body.get('full'):
+            state['catalog'] = dj.catalog()
+        return web.json_response(state)
 
     async def api_guild_state(self, request):
         requested = request.match_info.get('guild_id', '')
@@ -892,6 +1261,10 @@ class WebUI:
         except Exception:
             raise web.HTTPBadRequest(text='invalid json')
         query = (body.get('query') or '').strip()
+        # Spotify imports store "spotify:search:<title artist>" placeholders;
+        # those are plain searches, not Spotify links.
+        if query.startswith('spotify:search:'):
+            query = query[len('spotify:search:'):].strip()
         if not query:
             return web.json_response({'error': 'empty query'}, status=400)
 
@@ -1072,9 +1445,10 @@ class WebUI:
         })
 
     async def api_playlists(self, request):
-        if huddle.is_huddle_id(request.match_info.get('guild_id', '')):
-            # Saved playlists are still a Discord-side feature.
-            return web.json_response({'playlists': []})
+        requested = request.match_info.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            user_id = self._get_acting_user_id(request)
+            return web.json_response({'playlists': self._playlist_json(requested, user_id)})
         guild, _player = self._get_guild_and_player(request)
         user_id = self._get_acting_user_id(request)
         return web.json_response({'playlists': self._playlist_json(guild.id, user_id)})
@@ -1083,8 +1457,26 @@ class WebUI:
         async with self._playlist_lock():
             return await self._api_playlist_action(request)
 
+    def _huddle_playlist_target(self, guild_id):
+        """Stand-ins so the playlist code can store a Huddle room's playlists.
+
+        Playlists are keyed by guild id, so a Huddle room gets its own set.
+        Huddle has no Discord member or voice client; imports are attributed
+        to the bot, and load/play go through Huddle's player instead.
+        """
+        me = next((g.me for g in self.bot.guilds if g.me), None)
+        guild = SimpleNamespace(id=guild_id, me=me, voice_client=None,
+                                get_member=lambda _user_id: None)
+        player = SimpleNamespace(current=None, queue=[])
+        return guild, player
+
     async def _api_playlist_action(self, request):
-        guild, player = self._get_guild_and_player(request)
+        requested = request.match_info.get('guild_id', '')
+        is_huddle = huddle.is_huddle_id(requested)
+        if is_huddle:
+            guild, player = self._huddle_playlist_target(requested)
+        else:
+            guild, player = self._get_guild_and_player(request)
         try:
             body = await request.json()
         except Exception:
@@ -1238,6 +1630,24 @@ class WebUI:
             removed = entries.pop(index)
             cog._write_playlists(data)
             message = f"Removed {removed.get('title', 'song')} from {name}."
+        elif action in ('load', 'play') and is_huddle:
+            entries = found_lists.get(name) if found_lists is not None else None
+            if entries is None:
+                return web.json_response({'error': f'No playlist named {name}.'}, status=404)
+            if not entries:
+                return web.json_response({'error': f'{name} is empty.'}, status=409)
+            # Absolute URL so Huddle's vinyl can load an uploaded cover.
+            cover = cog.playlist_cover_url(guild.id, found_owner, name, entries)
+            if cover and cover.startswith('/'):
+                cover = config.WEB_SERVER_URL.rstrip('/') + '/musicbot' + cover
+            try:
+                await huddle.play_many(requested, entries, name, cover,
+                                       start_now=action == 'play',
+                                       mixes=playlist_mix_specs(guild.id, found_owner, name, entries))
+            except (KeyError, ValueError, RuntimeError) as error:
+                return web.json_response({'error': str(error) or 'Huddle room not found.'},
+                                         status=400)
+            message = ('Playing' if action == 'play' else 'Added') + f' {name} ({len(entries)} songs).'
         elif action in ('load', 'play'):
             entries = found_lists.get(name) if found_lists is not None else None
             if entries is None:
@@ -1260,7 +1670,8 @@ class WebUI:
                 player.web_playlist_name = name
                 player.web_playlist_cover = cog.playlist_cover_url(guild.id, found_owner, name, entries)
                 player.web_playlist_started_at = time.time()
-            for entry in entries:
+            specs = playlist_mix_specs(guild.id, found_owner, name, entries) or []
+            for index, entry in enumerate(entries):
                 player.queue.append(Song(
                     title=entry.get('title', 'Unknown'),
                     url=entry['url'],
@@ -1269,7 +1680,14 @@ class WebUI:
                     source_type=entry.get('source_type', 'youtube'),
                     thumbnail=entry.get('thumbnail'),
                     playlist=name,
+                    mix=specs[index] if index < len(specs) else None,
                 ))
+            if specs and not player.automix_enabled:
+                # A mixed playlist plays mixed, like on Spotify.
+                player.automix_enabled = True
+                player.clear_preloads()
+                player.schedule_automix()
+                cog.save_player_settings(player)
             if action == 'play' and (vc.is_playing() or vc.is_paused()):
                 vc.stop()
             elif not vc.is_playing() and not vc.is_paused():
@@ -1282,7 +1700,8 @@ class WebUI:
             'message': message,
             'imported_name': imported_name,
             'playlists': self._playlist_json(guild.id, user_id),
-            'state': self._guild_state(guild, player),
+            'state': (await huddle.room_state(requested) if is_huddle
+                      else self._guild_state(guild, player)),
         })
 
     async def api_playlist_cover(self, request):
@@ -1290,7 +1709,11 @@ class WebUI:
             return await self._api_playlist_cover(request)
 
     async def _api_playlist_cover(self, request):
-        guild, _player = self._get_guild_and_player(request)
+        requested = request.match_info.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            guild, _player = self._huddle_playlist_target(requested)
+        else:
+            guild, _player = self._get_guild_and_player(request)
         reader = await request.multipart()
         name = ''
         image = b''
@@ -1357,6 +1780,7 @@ async def start_web_server(bot):
     app.router.add_post('/api/session', ui.api_session)
     app.router.add_get('/api/metrics', ui.api_metrics)
     app.router.add_get('/api/admin/state', ui.api_admin_state)
+    app.router.add_post('/api/admin/huddle-link', ui.api_admin_huddle_link)
     app.router.add_post('/api/admin/update', ui.api_admin_update)
     app.router.add_delete('/api/admin/rooms/{room_id}', ui.api_admin_delete_room)
     app.router.add_get('/api/guilds', ui.api_guilds)
@@ -1368,7 +1792,14 @@ async def start_web_server(bot):
     app.router.add_get('/api/guilds/{guild_id}/lyrics', ui.api_lyrics)
     app.router.add_get('/api/guilds/{guild_id}/playlists', ui.api_playlists)
     app.router.add_post('/api/guilds/{guild_id}/playlists', ui.api_playlist_action)
+    app.router.add_get('/api/guilds/{guild_id}/playlists/mix', ui.api_playlist_mix)
+    app.router.add_post('/api/guilds/{guild_id}/playlists/mix', ui.api_playlist_mix_action)
+    app.router.add_get('/api/guilds/{guild_id}/playlists/mix/preview', ui.api_playlist_mix_preview)
     app.router.add_post('/api/guilds/{guild_id}/playlist-cover', ui.api_playlist_cover)
+    app.router.add_get('/dj/', ui.dj_page)
+    app.router.add_get('/api/guilds/{guild_id}/dj', ui.api_dj_state)
+    app.router.add_post('/api/guilds/{guild_id}/dj', ui.api_dj_action)
+    dj.resolver = _resolve_audio
     app.router.add_get('/api/autocomplete', ui.api_autocomplete)
     app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
     os.makedirs(PLAYLIST_COVERS_DIR, exist_ok=True)
@@ -1669,6 +2100,48 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .playlist-track .track-source { display:none; }
   }
 
+  /* ---------- playlist mix (Spotify-style transitions) ---------- */
+  .mix-toggle.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .mix-progress { color:var(--muted); font-size:12px; }
+  .mix-layout { display:grid; grid-template-columns:minmax(0,1fr); gap:18px; }
+  .mix-layout.editing { grid-template-columns:minmax(0,1fr) 340px; }
+  .playlist-track.mixed { grid-template-columns:34px minmax(220px,2fr) 64px 52px 90px 42px; }
+  .track-head.mixed { grid-template-columns:34px minmax(220px,2fr) 64px 52px 90px 42px; }
+  .bpm { font-variant-numeric:tabular-nums; color:var(--muted); }
+  .camelot { display:inline-block; min-width:30px; text-align:center; padding:2px 6px; border-radius:5px;
+             font-size:11px; font-weight:700; color:#fff; }
+  .camelot.pending { background:var(--panel2); color:var(--muted); }
+  .transition-row { display:flex; align-items:center; gap:10px; margin:-2px 0 -2px 46px; padding:2px 0; position:relative; }
+  .transition-row::before { content:''; position:absolute; left:-12px; top:-8px; bottom:-8px; width:2px;
+                            background:linear-gradient(var(--accent),var(--accent2)); opacity:.45; border-radius:2px; }
+  .transition-chip { font-size:12px; padding:4px 11px; border-radius:999px; background:var(--panel2);
+                     border:1px solid var(--border); color:var(--text); cursor:pointer; }
+  .transition-chip.custom { border-color:var(--accent); }
+  .transition-chip.active { background:var(--text); color:var(--bg); }
+  .mix-editor { position:sticky; top:12px; align-self:start; background:var(--panel2); border-radius:var(--radius);
+                padding:16px; display:flex; flex-direction:column; gap:12px; max-height:calc(100vh - 40px); overflow:auto; }
+  .mix-editor h3 { margin:0; font-size:16px; display:flex; justify-content:space-between; align-items:center; }
+  .mix-editor .beta { font-size:10px; padding:2px 6px; border-radius:5px; background:var(--accent2); color:#000; margin-left:6px; }
+  .mix-pair { display:flex; flex-direction:column; gap:8px; font-size:13px; }
+  .mix-pair div { display:flex; justify-content:space-between; gap:8px; }
+  .mix-pair .t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .mix-wave { height:74px; border-radius:10px; background:var(--panel); position:relative; overflow:hidden; }
+  .mix-wave canvas { width:100%; height:100%; display:block; }
+  .preset-row { display:flex; gap:6px; flex-wrap:wrap; }
+  .preset-row button { padding:6px 11px; border-radius:999px; font-size:12px; }
+  .preset-row button.on { background:var(--text); color:var(--bg); }
+  .lane { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:9px 11px;
+          border-radius:10px; background:var(--panel); border-left:3px solid var(--lane,var(--accent)); font-size:13px; }
+  .lane select { max-width:190px; background:transparent; color:var(--text); border:none; text-align:right; }
+  .mix-editor .actions { display:flex; gap:8px; }
+  .mix-editor .actions button { flex:1; }
+  @media (max-width: 900px) {
+    .mix-layout.editing { grid-template-columns:minmax(0,1fr); }
+    .mix-editor { position:static; max-height:none; }
+    .playlist-track.mixed, .track-head.mixed { grid-template-columns:26px minmax(0,1fr) 44px 40px 36px; }
+    .playlist-track.mixed .track-duration { display:none; }
+  }
+
   /* ---------- turntable (vinyl themes) ---------- */
   .deck { position: relative; width: 380px; height: 336px; max-width: 100%;
           margin: 0 auto; user-select: none; -webkit-user-select: none; }
@@ -1812,6 +2285,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <nav class="view-nav" aria-label="Main views">
     <button id="playerViewBtn" class="active" onclick="showView('player')">▶ Player</button>
     <button id="playlistViewBtn" onclick="showView('playlists')">▦ Playlists</button>
+    <button onclick="if(selected)location.href=basePath+'dj/?guild_id='+encodeURIComponent(selected)">🎧 DJ booth</button>
   </nav>
   <div id="content"><div class="empty">Loading…</div></div>
 </div>
@@ -1971,6 +2445,14 @@ function playlistCardsHTML() {
 }
 
 function renderPlaylistPage() {
+  // Redrawing would close a dropdown the user has open in the mix editor;
+  // wait until they pick something or leave it.
+  const focused = document.activeElement;
+  if (focused && focused.tagName === 'SELECT' && focused.closest('.mix-editor')) {
+    mixRenderDeferred = true;
+    return;
+  }
+  mixRenderDeferred = false;
   const content = document.getElementById('content');
   const oldSearch = document.getElementById('playlistSongSearch');
   const oldSpotify = document.getElementById('spotifyImportUrl');
@@ -1990,13 +2472,36 @@ function renderPlaylistPage() {
       <div class="playlist-grid">${playlistCardsHTML()}</div></section>`;
   } else {
     const cover = playlist.cover ? `style="background-image:url('${cssUrl(mediaUrl(playlist.cover))}')"` : '';
-    const rows = playlist.tracks.length ? playlist.tracks.map((track, index) => `<div class="playlist-track">
+    if (!mixData || mixData.name !== playlist.name) loadMix(playlist.name);
+    const mix = mixData && mixData.name === playlist.name ? mixData : null;
+    const mixing = Boolean(mix && mix.enabled);
+    const rows = playlist.tracks.length ? playlist.tracks.map((track, index) => {
+      const info = mixing ? (mix.tracks[index] || {}) : null;
+      const middle = mixing
+        ? `<div class="bpm">${info.bpm || '···'}</div><div>${camelotBadge(info.camelot)}</div>`
+        : `<div class="track-source">${esc(track.source_type === 'spotify' ? 'Spotify' : 'YouTube')}</div>`;
+      const row = `<div class="playlist-track${mixing ? ' mixed' : ''}">
       <div class="track-number">${index + 1}</div>
       <div class="track-main"><span class="track-art ${track.thumbnail ? '' : 'missing'}">${track.thumbnail ? `<img src="${esc(mediaUrl(track.thumbnail))}" alt="" onerror="this.parentElement.classList.add('missing');this.remove()">` : ''}</span><div class="track-title">${esc(track.title)}</div></div>
-      <div class="track-source">${esc(track.source_type === 'spotify' ? 'Spotify' : 'YouTube')}</div>
+      ${middle}
       <div class="track-duration">${esc(track.duration)}</div>
       <button class="danger" onclick="removePlaylistSong(${index})" title="Remove song">✕</button>
-    </div>`).join('') : '<div class="empty">This playlist is empty. Search above to add its first song.</div>';
+    </div>`;
+      const transition = mixing && mix.transitions[index] ? transitionChip(mix.transitions[index]) : '';
+      return row + transition;
+    }).join('') : '<div class="empty">This playlist is empty. Search above to add its first song.</div>';
+    const head = mixing
+      ? '<div class="track-head mixed"><span>#</span><span>Title</span><span>BPM</span><span>Key</span><span>Duration</span><span></span></div>'
+      : '<div class="track-head"><span>#</span><span>Title</span><span>Source</span><span>Duration</span><span></span></div>';
+    const analysis = mix && mix.analysis;
+    const failed = (analysis && analysis.failed) || [];
+    const progress = !mixing || !analysis || analysis.done >= analysis.total ? ''
+      : analysis.running
+        ? `<span class="mix-progress">⏳ Analysing ${analysis.done}/${analysis.total}</span>`
+        : `<span class="mix-progress" title="${esc(failed.join('\n'))}">${analysis.done}/${analysis.total} analysed${failed.length ? ` · ${failed.length} couldn't be analysed (they use a plain fade)` : ''} · <a href="#" onclick="mixAction('analyze');return false">retry</a></span>`;
+    const mixButtons = `<button class="mix-toggle ${mixing ? 'on' : ''}" onclick="mixAction('${mixing ? 'disable' : 'enable'}')" title="Mix: DJ-style transitions between songs">⧉ Mix</button>`
+      + (mixing ? `<button onclick="mixAction('reorder')" title="Reorder by BPM and key so transitions flow">✦ Smart reorder</button>` : '') + progress;
+    const editing = mixing && mixEditIndex !== null && mix.transitions[mixEditIndex];
     html = `<section class="card playlist-page"><div class="playlist-hero">
       <div class="playlist-cover-large ${playlist.cover ? '' : 'empty'}" ${cover}>
         <label class="cover-upload">▣ Change photo<input type="file" accept="image/png,image/jpeg,image/webp" onchange="uploadPlaylistCover(this.files[0])"></label>
@@ -2006,9 +2511,10 @@ function renderPlaylistPage() {
         <button class="playlist-play" onclick="playlistAction('play',openPlaylistName)" title="Play playlist">▶</button>
         <button onclick="playlistAction('load',openPlaylistName)">＋ Add to queue</button>
         <button onclick="openPlaylistName=null;render()">← Library</button>
+        ${mixButtons}
         <div class="playlist-add"><input id="playlistSongSearch" list="playlistSuggestions" placeholder="Search a song or paste a Spotify / YouTube link" oninput="handleAutocomplete(this.value,'playlistSuggestions')" onkeydown="if(event.key==='Enter')addSongToPlaylist()">
           <datalist id="playlistSuggestions"></datalist><button class="primary" onclick="addSongToPlaylist()">＋ Add song</button></div>
-      </div><div class="track-head"><span>#</span><span>Title</span><span>Source</span><span>Duration</span><span></span></div>${rows}</div>
+      </div><div class="mix-layout${editing ? ' editing' : ''}"><div>${head}${rows}</div>${editing ? mixEditorHTML(mix) : ''}</div></div>
     </section>`;
   }
   content.innerHTML = html + playerControlsHTML(state);
@@ -2021,7 +2527,185 @@ function renderPlaylistPage() {
   }
   const lyricsCard = document.getElementById('lyricsCard');
   if (lyricsCard) lyricsCard.style.display = 'none';
+  drawMixWave();
   tickProgress();
+}
+
+// ---------------------------------------------------------------- mix editor
+let mixData = null, mixLoading = null, mixEditIndex = null, mixDraft = null, mixPoll = null;
+let mixRenderDeferred = false;
+// Catch up on a redraw that was held while a mix-editor dropdown was open.
+document.addEventListener('focusout', event => {
+  if (event.target.tagName === 'SELECT' && event.target.closest('.mix-editor')) {
+    setTimeout(() => { if (mixRenderDeferred && activeView === 'playlists') render(); }, 0);
+  }
+});
+const mixAudio = new Audio();
+const CAMELOT_COLORS = ['#e8615a','#f08a4b','#f4b04a','#d9c84a','#9fcf4f','#5ec46a','#48c1a0','#3fb6c9','#4a93d9','#6a78e0','#9168d8','#c35fb6'];
+function camelotBadge(code) {
+  if (!code) return '<span class="camelot pending">···</span>';
+  const n = parseInt(code, 10) || 1;
+  return `<span class="camelot" style="background:${CAMELOT_COLORS[(n - 1) % 12]}${code.endsWith('A') ? 'cc' : ''}">${esc(code)}</span>`;
+}
+function mixLabel(id, lane) {
+  if (!mixData) return id;
+  const list = lane ? mixData.catalog.lanes[lane] : mixData.catalog.presets;
+  const item = (list || []).find(entry => entry.id === id);
+  return item ? item.en : id;
+}
+function transitionChip(transition) {
+  const spec = transition.spec, resolved = transition.resolved;
+  const auto = spec.preset === 'auto';
+  const shown = auto ? resolved : spec;
+  const label = auto
+    ? (resolved ? `✦ Auto · ${mixLabel(resolved.preset)} · ${resolved.bars} bars` : '✦ Auto')
+    : `✎ ${spec.preset === 'custom' ? 'Custom' : mixLabel(spec.preset)} · ${shown.bars} bars`;
+  return `<div class="transition-row"><button class="transition-chip ${auto ? '' : 'custom'} ${mixEditIndex === transition.index ? 'active' : ''}"
+    onclick="openTransition(${transition.index})">${esc(label)}</button></div>`;
+}
+async function loadMix(name) {
+  if (mixLoading === name) return;
+  mixLoading = name;
+  try {
+    mixData = await api(basePath + 'api/guilds/' + selected + '/playlists/mix?name=' + encodeURIComponent(name));
+  } catch (e) { mixData = {name, enabled:false, tracks:[], transitions:[], analysis:{done:0,total:0}, catalog:{presets:[],lanes:{}}}; }
+  mixLoading = null;
+  scheduleMixPoll();
+  if (activeView === 'playlists') render();
+}
+function scheduleMixPoll() {
+  clearTimeout(mixPoll);
+  if (mixData && mixData.enabled && mixData.analysis && mixData.analysis.running) {
+    mixPoll = setTimeout(() => { if (openPlaylistName) { mixData = null; loadMix(openPlaylistName); } }, 3000);
+  }
+}
+async function mixAction(action, extra) {
+  if (!openPlaylistName) return;
+  try {
+    if (action === 'reorder') toast('⏳ Reordering by BPM and key…');
+    mixData = await api(basePath + 'api/guilds/' + selected + '/playlists/mix',
+      {method:'POST', body:JSON.stringify(Object.assign({action, name:openPlaylistName}, extra || {}))});
+    if (action === 'enable') toast('⧉ Mix on — every song now flows into the next.');
+    if (action === 'disable') { toast('Mix off.'); mixEditIndex = null; }
+    if (action === 'reorder') {
+      toast('✦ Reordered for smoother transitions.');
+      const res = await api(basePath + 'api/guilds/' + selected + '/playlists');
+      playlists = res.playlists || playlists;
+    }
+    scheduleMixPoll();
+    render();
+  } catch (e) { toast('❌ ' + e.message); }
+}
+function openTransition(index) {
+  if (mixEditIndex === index) { closeTransition(); return; }
+  mixEditIndex = index;
+  const transition = mixData.transitions[index];
+  const base = transition.spec.preset === 'auto' ? {preset:'auto'} : Object.assign({}, transition.spec);
+  mixDraft = base;
+  render();
+}
+function closeTransition() { mixEditIndex = null; mixDraft = null; mixAudio.pause(); render(); }
+function draftShown() {
+  const transition = mixData.transitions[mixEditIndex];
+  if (mixDraft.preset === 'auto') return transition.resolved || {preset:'auto', bars:8, volume:'smooth_fade', eq:'none', filter:'none', effects:'none', loop:'none'};
+  return mixDraft;
+}
+function setPreset(id) {
+  if (id === 'auto') { mixDraft = {preset:'auto'}; render(); return; }
+  const preset = mixData.catalog.presets.find(entry => entry.id === id);
+  const defaults = {fade:['smooth_fade','bass_fade','none','none'], rise:['fade_in_out','end_bass_swap','noise_out','none'],
+    blend:['overlay','mid_bass_swap','none','none'], wave:['smooth_fade','three_band','hp_in_lp_out','none'],
+    melt:['fade','long_bass_cut','lp_out','reverb_end_out'], slam:['fade_in_cut_out','fast_bass_cut','none','echo_half_cut'],
+    none:['overlay','none','none','none']}[id];
+  mixDraft = {preset:id, bars:preset ? preset.bars : 8, volume:defaults[0], eq:defaults[1], filter:defaults[2], effects:defaults[3], loop:'none'};
+  render();
+}
+function setLane(lane, value) {
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  const shown = Object.assign({}, draftShown());
+  delete shown.auto; delete shown.label;
+  shown[lane] = lane === 'bars' ? parseInt(value, 10) : value;
+  if (mixDraft.preset === 'auto' || lane !== 'bars') shown.preset = 'custom';
+  mixDraft = shown;
+  render();
+}
+function mixEditorHTML(mix) {
+  const transition = mix.transitions[mixEditIndex];
+  const a = mix.tracks[mixEditIndex] || {}, b = mix.tracks[mixEditIndex + 1] || {};
+  const shown = draftShown();
+  const presets = [{id:'auto', en:'✦ Auto'}].concat(mix.catalog.presets);
+  const lanes = [['volume','Volume','#4a93d9'],['eq','EQ','#f4b04a'],['filter','Filter','#c35fb6'],['effects','Effects','#5ec46a'],['loop','Loop','#e8615a']];
+  const laneHTML = lanes.map(([lane, title, color]) => `<div class="lane" style="--lane:${color}"><span>${title}</span>
+    <select onchange="setLane('${lane}',this.value)">${(mix.catalog.lanes[lane] || []).map(option =>
+      `<option value="${option.id}" ${shown[lane] === option.id ? 'selected' : ''}>${esc(option.en)}</option>`).join('')}</select></div>`).join('');
+  const bars = mix.catalog.bars.map(n => `<option value="${n}" ${shown.bars === n ? 'selected' : ''}>${n} bar${n === 1 ? '' : 's'}</option>`).join('');
+  const current = mixDraft.preset === 'custom' ? 'custom' : mixDraft.preset;
+  return `<aside class="mix-editor"><h3><span>Edit transition<span class="beta">Beta</span></span>
+      <button onclick="closeTransition()" title="Close">✕</button></h3>
+    <div class="mix-pair">
+      <div><span class="t">${esc(a.title || '')} · <span class="bpm">${esc(a.artist || '')}</span></span><span>${a.bpm || '···'} BPM ${camelotBadge(a.camelot)}</span></div>
+      <div class="mix-wave"><canvas id="mixWave" width="600" height="148"></canvas></div>
+      <div><span class="t">${esc(b.title || '')} · <span class="bpm">${esc(b.artist || '')}</span></span><span>${b.bpm || '···'} BPM ${camelotBadge(b.camelot)}</span></div>
+    </div>
+    <div class="preset-row">${presets.map(preset => `<button class="${current === preset.id ? 'on' : ''}" onclick="setPreset('${preset.id}')">${esc(preset.en)}</button>`).join('')}</div>
+    ${mixDraft.preset === 'auto' ? `<div class="mix-progress">${transition.resolved ? `Auto picked <b>${esc(mixLabel(transition.resolved.preset))}</b> from tempo, key and energy.` : 'Auto will choose once both songs are analysed.'}</div>` : ''}
+    <div class="lane" style="--lane:var(--muted)"><span>Length</span><select onchange="setLane('bars',this.value)">${bars}</select></div>
+    ${laneHTML}
+    <div class="actions"><button id="mixPreviewBtn" onclick="previewTransition()">▶ Preview</button>
+      <button class="primary" onclick="saveTransition()">Save</button></div>
+  </aside>`;
+}
+function drawMixWave() {
+  const canvas = document.getElementById('mixWave');
+  if (!canvas || !mixData || mixEditIndex === null) return;
+  const ctx = canvas.getContext('2d'), w = canvas.width, h = canvas.height;
+  const shown = draftShown();
+  const style = getComputedStyle(document.body);
+  ctx.clearRect(0, 0, w, h);
+  // Two stylised waveforms, outgoing on top, incoming below, with the volume
+  // lane drawn over them the way Spotify's editor shows the crossfade.
+  const bars = Math.max(1, shown.bars || 8);
+  for (let i = 0; i < w; i += 3) {
+    const t = i / w, beat = Math.abs(Math.sin(t * Math.PI * bars * 4)) * 0.6 + 0.4;
+    const outAmp = (1 - Math.max(0, Math.min(1, (t - 0.15) / 0.8))) * beat * 30 + 3;
+    const inAmp = Math.max(0, Math.min(1, t / 0.85)) * beat * 30 + 3;
+    ctx.fillStyle = '#e8843c'; ctx.fillRect(i, h * 0.28 - outAmp / 2, 2, outAmp);
+    ctx.fillStyle = '#4a93d9'; ctx.fillRect(i, h * 0.72 - inAmp / 2, 2, inAmp);
+  }
+  ctx.strokeStyle = style.getPropertyValue('--text') || '#fff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, h * 0.12);
+  ctx.bezierCurveTo(w * 0.45, h * 0.12, w * 0.55, h * 0.44, w, h * 0.44); ctx.stroke();
+  ctx.strokeStyle = '#f4b04a';
+  ctx.beginPath(); ctx.moveTo(0, h * 0.9);
+  ctx.bezierCurveTo(w * 0.45, h * 0.9, w * 0.55, h * 0.56, w, h * 0.56); ctx.stroke();
+  ctx.fillStyle = style.getPropertyValue('--muted') || '#aaa'; ctx.font = '20px sans-serif';
+  ctx.fillText(`${shown.bars || 0} bars`, w / 2 - 30, h / 2 + 7);
+}
+async function previewTransition() {
+  const button = document.getElementById('mixPreviewBtn');
+  if (!mixAudio.paused) { mixAudio.pause(); if (button) button.textContent = '▶ Preview'; return; }
+  if (button) { button.disabled = true; button.textContent = '⏳ Rendering…'; }
+  const spec = mixDraft.preset === 'auto' ? null : mixDraft;
+  const url = basePath + 'api/guilds/' + selected + '/playlists/mix/preview?name=' + encodeURIComponent(openPlaylistName)
+    + '&index=' + mixEditIndex + (spec ? '&spec=' + encodeURIComponent(JSON.stringify(spec)) : '');
+  try {
+    const response = await fetch(url, {headers: hdrs()});
+    if (!response.ok) { let e = 'Preview failed'; try { e = (await response.json()).error || e; } catch (_) {} throw new Error(e); }
+    mixAudio.src = URL.createObjectURL(await response.blob());
+    await mixAudio.play();
+    const btn = document.getElementById('mixPreviewBtn');
+    if (btn) { btn.disabled = false; btn.textContent = '⏸ Stop'; }
+    mixAudio.onended = () => { const b2 = document.getElementById('mixPreviewBtn'); if (b2) b2.textContent = '▶ Preview'; };
+  } catch (e) {
+    toast('❌ ' + e.message);
+    const btn = document.getElementById('mixPreviewBtn');
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Preview'; }
+  }
+}
+async function saveTransition() {
+  const spec = mixDraft.preset === 'auto' ? {preset:'auto'} : mixDraft;
+  await mixAction('set', {index: mixEditIndex, spec});
+  toast('✓ Transition saved.');
 }
 
 async function playlistAction(action, name, extra) {

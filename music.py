@@ -27,6 +27,8 @@ from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import config
+import dj
+import mixer
 from storage import SQLiteDocumentStore, load_json, save_json
 
 # Setup musics folder for downloaded songs
@@ -482,6 +484,27 @@ class AutoMixPlan:
     bpm_out: Optional[float] = None
     bpm_in: Optional[float] = None
     release_seconds: Optional[float] = None  # resume the original tempo here
+    segment: Optional[bytes] = None  # mixer-rendered transition (s16le 48k stereo)
+    preset: Optional[str] = None     # mixer preset name, for logs
+
+
+@dataclass
+class RenderedMix:
+    """A mixer plan plus its rendered segment, waiting for its moment."""
+    plan: dict
+    segment: bytes
+
+    @property
+    def out_at(self) -> float:
+        return self.plan['out_at']
+
+    def as_plan(self, song, in_path) -> 'AutoMixPlan':
+        return AutoMixPlan(
+            song=song, fade_seconds=self.plan['length'], file_path=in_path,
+            start_seconds=self.plan['in_at'], atempo=self.plan['stretch'],
+            bpm_out=self.plan.get('bpm_out'), bpm_in=self.plan.get('bpm_in'),
+            release_seconds=self.plan['in_resume_at'], segment=self.segment,
+            preset=self.plan['spec']['preset'])
 
 
 class AutoMixTransition(discord.AudioSource):
@@ -589,6 +612,76 @@ class AutoMixTransition(discord.AudioSource):
                 source.cleanup()
             except Exception:
                 pass
+
+
+class RenderedTransition(discord.AudioSource):
+    """Plays a mixer-rendered transition, then the incoming song.
+
+    The mixer already blended both songs (EQ, filters, effects, volume), so
+    the outgoing source is released as soon as this is swapped in.
+    """
+
+    def __init__(self, outgoing, segment: bytes, continuation, on_release=None):
+        if isinstance(outgoing, (AutoMixTransition, RenderedTransition)):
+            outgoing = outgoing.active_source()
+        self.outgoing = outgoing
+        self.segment = segment
+        self.offset = 0
+        self.continuation = continuation
+        self.on_release = on_release
+        self._released = False
+        self._volume = getattr(continuation, 'volume', 1.0)
+
+    def active_source(self):
+        return self.continuation if self._released else self
+
+    @property
+    def volume(self):
+        return self._volume
+
+    @volume.setter
+    def volume(self, value):
+        self._volume = value
+        if hasattr(self.continuation, 'volume'):
+            self.continuation.volume = value
+
+    def is_opus(self) -> bool:
+        return False
+
+    def _release_outgoing(self):
+        if self.outgoing is not None:
+            try:
+                self.outgoing.cleanup()
+            except Exception:
+                pass
+            self.outgoing = None
+
+    def read(self) -> bytes:
+        self._release_outgoing()
+        frame_size = discord.opus.Encoder.FRAME_SIZE
+        if self.offset < len(self.segment):
+            frame = self.segment[self.offset:self.offset + frame_size]
+            self.offset += frame_size
+            if len(frame) < frame_size:
+                frame += b'\x00' * (frame_size - len(frame))
+            if abs(self._volume - 1.0) > 0.001:
+                frame = audioop.mul(frame, 2, min(self._volume, 2.0))
+            return frame
+        if not self._released:
+            self._released = True
+            if self.on_release:
+                try:
+                    self.on_release()
+                except Exception:
+                    pass
+        return self.continuation.read()
+
+    def cleanup(self):
+        self._release_outgoing()
+        try:
+            self.continuation.cleanup()
+        except Exception:
+            pass
 
 
 INVITE_ALLOWED_USER_IDS = {
@@ -1131,6 +1224,10 @@ YTDL_PLAYLIST_OPTIONS = {
     'extract_flat': 'in_playlist',
 }
 
+if config.YTDLP_COOKIEFILE:
+    for _opts in (YTDL_FORMAT_OPTIONS, YTDL_SEARCH_OPTIONS, YTDL_PLAYLIST_OPTIONS):
+        _opts['cookiefile'] = config.YTDLP_COOKIEFILE
+
 ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 ytdl_search = yt_dlp.YoutubeDL(YTDL_SEARCH_OPTIONS)
 ytdl_playlist = yt_dlp.YoutubeDL(YTDL_PLAYLIST_OPTIONS)
@@ -1150,6 +1247,7 @@ class Song:
     genres: tuple[str, ...] = ()
     played_at: Optional[int] = None
     playlist: Optional[str] = None  # Saved-playlist name this song was queued from
+    mix: Optional[dict] = None  # transition into the next song (mixer spec)
     autoplay: bool = False
     autoplay_score: Optional[float] = None
     autoplay_reason: Optional[str] = None
@@ -2318,6 +2416,34 @@ class MusicPlayer:
         except Exception as e:
             logger.debug(f"AutoMix queue top-up failed: {e}")
 
+    async def _render_mix(self, song, next_song, out_path, in_path, file_pos):
+        """Spotify-style transition via the shared mixer, or None to fall back.
+
+        Uses the transition saved on the playlist (song.mix) or Auto. Speed
+        filters (nightcore/slowed) keep the classic crossfade.
+        """
+        if FILTER_SPEED_FACTORS.get(self.audio_filter, 1.0) != 1.0:
+            return None
+        spec = getattr(song, 'mix', None) or {'preset': 'auto'}
+        try:
+            out_meta, in_meta = await asyncio.gather(
+                mixer.analyze_async(out_path, mixer.track_key(song.url), out_path),
+                mixer.analyze_async(in_path, mixer.track_key(next_song.url), in_path))
+            plan = mixer.plan(out_meta, in_meta, spec,
+                              parse_duration_to_seconds(song.duration), file_pos)
+            if not plan:
+                return None
+            filters = [AUDIO_FILTERS[self.audio_filter]] if self.audio_filter in AUDIO_FILTERS else []
+            filters.append(LOUDNORM_FILTER)
+            segment = await self.bot.loop.run_in_executor(
+                None, lambda: mixer.render(out_path, in_path, plan, filters))
+        except Exception as e:
+            logger.warning(f"AutoMix render failed, using the classic blend: {e}")
+            return None
+        logger.info(f"🎛️ AutoMix ready: {plan['spec']['preset']} ({plan['spec']['bars']} bars) "
+                    f"{song.title} → {next_song.title} at {plan['out_at']:.1f}s")
+        return RenderedMix(plan, segment)
+
     async def _automix_watcher(self):
         """Watch the current song and hand playback to AutoMix near its end.
 
@@ -2376,6 +2502,7 @@ class MusicPlayer:
             in_path = None
             analyzed_song = None
             preload_kicked = False
+            rendered = rendered_for = None
 
             while True:
                 if (self.current is not song or self.current_song_key != song_key
@@ -2432,14 +2559,25 @@ class MusicPlayer:
                                 and info.get('head_activity', 0) >= 0.65):
                             effective_blend = min(effective_blend, 4.0)
                         trigger_at = transition_trigger()
+                        mixed = await self._render_mix(song, next_song, out_path, path, file_pos)
+                        if mixed and self.current is song and self.current_song_key == song_key:
+                            rendered, rendered_for = mixed, next_song
+                            trigger_at = mixed.out_at
                         continue  # analysis took time; recompute the position first
 
                 if remaining <= 0.05:
+                    # A render that finished after its cue would replay audio.
+                    if rendered is not None and file_pos > rendered.out_at + 0.25:
+                        rendered = None
                     break
                 await asyncio.sleep(min(1.0, max(0.05, remaining - 0.03)))
 
             next_song = self.queue[0] if self.queue else None
             if next_song is None:
+                return
+
+            if rendered is not None and rendered_for is next_song:
+                await self.play_next(automix_plan=rendered.as_plan(next_song, in_path))
                 return
 
             # A long blind overlap can sound muddy when tempo analysis is not
@@ -2604,7 +2742,22 @@ class MusicPlayer:
                     handoff = automix_plan
 
                 continuation = None
-                if handoff and handoff.file_path:
+                if handoff and handoff.segment is not None and handoff.file_path:
+                    # The mixer already rendered the blend; afterwards the new
+                    # song carries on from where the segment leaves it.
+                    continuation_raw = discord.FFmpegPCMAudio(
+                        handoff.file_path,
+                        before_options=f'-ss {handoff.release_seconds:.3f}',
+                        options=build_audio_options(filter_name=self.audio_filter),
+                    )
+                    source = discord.PCMVolumeTransformer(continuation_raw, volume=self.volume)
+                    stale = self.preloaded_sources.pop(song_key, None)
+                    if stale:
+                        try:
+                            stale.cleanup()
+                        except Exception:
+                            pass
+                elif handoff and handoff.file_path:
                     # Open the analyzed local file directly: skip lead-in
                     # silence and stretch tempo to beat-match the outgoing song
                     extra_filters = []
@@ -2714,11 +2867,16 @@ class MusicPlayer:
                             logger.info(
                                 f"🎚️ AutoMix returned {self.current.title} to its configured tempo")
 
-                    transition = AutoMixTransition(
-                        voice_client.source, source, handoff.fade_seconds,
-                        continuation=continuation,
-                        on_release=release_tempo,
-                    )
+                    if handoff.segment is not None:
+                        transition = RenderedTransition(
+                            voice_client.source, handoff.segment, source,
+                            on_release=release_tempo)
+                    else:
+                        transition = AutoMixTransition(
+                            voice_client.source, source, handoff.fade_seconds,
+                            continuation=continuation,
+                            on_release=release_tempo,
+                        )
                     swapped = False
                     try:
                         voice_client.source = transition
@@ -2729,7 +2887,9 @@ class MusicPlayer:
                         if handoff.file_path:
                             started_at_offset = handoff.start_seconds
                             self._automix_speed = handoff.atempo
-                        if handoff.bpm_out and handoff.bpm_in and abs(handoff.atempo - 1.0) >= 0.003:
+                        if handoff.segment is not None:
+                            logger.info(f"🎧 AutoMix: {handoff.preset} into {self.current.title}")
+                        elif handoff.bpm_out and handoff.bpm_in and abs(handoff.atempo - 1.0) >= 0.003:
                             logger.info(
                                 f"🎧 AutoMix: beat-matched blend into {self.current.title} "
                                 f"({handoff.bpm_in:.0f}→{handoff.bpm_in * handoff.atempo:.0f} BPM "
@@ -7209,6 +7369,74 @@ class MusicCog(commands.Cog):
         else:
             player.cancel_automix()
             await interaction.response.send_message("🎧 AutoMix **off** - songs will play back to back again.")
+
+    # ---------- DJ booth ----------
+
+    def _dj_booth_url(self, interaction: discord.Interaction) -> str:
+        import webui
+        token = webui.generate_token(interaction.guild.id, interaction.user.id)
+        base_url = getattr(config, "WEB_SERVER_URL", "https://deeppixel.online").rstrip("/")
+        return f"{base_url}/musicbot/dj/?guild_id={interaction.guild.id}#token={token}"
+
+    @app_commands.command(name="dj", description="DJ booth: two live decks, EQ, FX, sampler and Auto DJ")
+    @app_commands.describe(mode="Auto DJ mixes the queue for you; Manual leaves the decks to you",
+                           style="How Auto DJ blends one song into the next")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="Auto DJ (mixes the queue for you)", value="auto"),
+            app_commands.Choice(name="Manual (you mix in the booth)", value="manual"),
+            app_commands.Choice(name="Get my booth link", value="link"),
+            app_commands.Choice(name="Off (back to the normal queue)", value="off"),
+        ],
+        style=[app_commands.Choice(name=label, value=key) for key, (label, _beats) in dj.STYLES.items()],
+    )
+    async def dj_cmd(self, interaction: discord.Interaction, mode: str = "auto",
+                     style: Optional[str] = None):
+        key = str(interaction.guild.id)
+        session = dj.sessions.get(key)
+        if mode == "off":
+            if not session:
+                await interaction.response.send_message("🎧 DJ mode isn't on.", ephemeral=True)
+                return
+            await interaction.response.defer()
+            await session.stop()
+            await interaction.followup.send("🎧 DJ mode **off**. Back to the normal queue.")
+            return
+        if mode == "link":
+            note = "" if session else "\n*DJ mode is off. Press **Go live** in the booth or run `/dj` to start it.*"
+            await interaction.response.send_message(
+                f"🎛️ **[Open your DJ booth]({self._dj_booth_url(interaction)})**{note}", ephemeral=True)
+            return
+        if not await self.ensure_voice(interaction):
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        player = self.get_player(interaction.guild)
+        player.last_message_channel = interaction.channel
+        try:
+            session = await dj.start_discord(player, auto=mode == "auto")
+        except RuntimeError as error:
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+            return
+        session.auto = mode == "auto"
+        if style:
+            session.auto_style = style
+        how = (f"**Auto DJ** is mixing the queue ({dj.STYLES[session.auto_style][0].lower()} transitions). "
+               "Every `/play` lands in the crate and gets mixed in."
+               if session.auto else
+               "**Manual**: load decks, ride the faders and drop FX from the booth.")
+        embed = discord.Embed(
+            title="🎧 DJ booth is live",
+            description=(f"{how}\n\n"
+                         "🎚️ Two decks with sync, pitch, hot cues, loops and scratching\n"
+                         "🎛️ 3-band EQ, color filter, crossfader\n"
+                         "✨ Beat FX (echo, reverb, flanger, roll, trans) and a sampler\n\n"
+                         "`/dj mode:Get my booth link` for your own control link · `/dj mode:Off` to stop"),
+            color=0xff7a18)
+        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(
+            f"🎛️ **[Open the DJ booth]({self._dj_booth_url(interaction)})** (your personal link)",
+            ephemeral=True)
 
     # ---------- karaoke mode ----------
 
