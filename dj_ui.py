@@ -41,6 +41,8 @@ body:not([data-mode=simple]) .simple-only{display:none!important}
 .onair.live{color:var(--red)}.onair.live i{background:var(--red);box-shadow:0 0 10px var(--red);animation:blink 1.4s infinite}
 .pill{padding:7px 12px;border-radius:999px;border:1px solid var(--edge2);font-weight:700;font-size:11px;letter-spacing:.08em}
 .pill.auto.on{background:var(--orange);border-color:var(--orange);color:#1a0d00;box-shadow:0 0 16px #ff8a1c66}
+.pill.stemsw.on{background:#ff4fa3;border-color:#ff4fa3;color:#2a0016;box-shadow:0 0 16px #ff4fa366}
+.pill.stemsw:disabled{opacity:.35;cursor:not-allowed}
 .pill.end:hover{border-color:var(--red);color:var(--red)}
 @keyframes blink{50%{opacity:.35}}
 
@@ -158,6 +160,12 @@ input[type=range]::-moz-range-thumb{background:linear-gradient(90deg,#8d939c,#e9
 .loadbar .btn{flex:1}
 .deck .status{grid-column:1/-1;color:var(--muted);font-size:12px;min-height:16px}
 .deck .status.err{color:var(--red)}
+.stems{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.stem{position:relative;overflow:hidden;border-radius:8px;padding:9px 4px 11px;font-weight:800;font-size:10px;letter-spacing:.1em;background:#0d0f12;border:1px solid #000;box-shadow:0 1px 0 #ffffff10 inset;color:var(--dim)}
+.stem i{position:absolute;left:0;bottom:0;height:3px;width:calc(var(--g,1)*100%);background:var(--pc);transition:width .2s}
+.stem.lit{color:#fff;box-shadow:0 0 0 1px var(--pc) inset,0 0 12px color-mix(in srgb,var(--pc) 35%,transparent)}
+.stems.wait .stem,.stems.off .stem{opacity:.35;pointer-events:none}
+.stems.wait .stem i{animation:blink 1s infinite}
 
 /* ---------- mixer ---------- */
 .mixer{display:flex;flex-direction:column;gap:10px}
@@ -255,6 +263,7 @@ input[type=range]::-moz-range-thumb{background:linear-gradient(90deg,#8d939c,#e9
     <button data-mode="simple">SIMPLE</button><button data-mode="medium">MEDIUM</button><button data-mode="advanced">ADVANCED</button>
   </div>
   <div class="onair" id="onair"><i></i>OFF AIR</div>
+  <button class="pill stemsw" id="stemsTop" title="Split songs into drums, bass, vocals and melody for stem controls and stem mixes">STEMS</button>
   <button class="pill auto" id="autoTop" title="Auto DJ mixes the queue for you">AUTO DJ</button>
   <button class="pill end" id="endBtn">END SET</button>
 </header>
@@ -364,6 +373,7 @@ function knob(p){
   <svg viewBox="0 0 44 44"><path class="kt"/><path class="ka"/><circle class="kb" cx="22" cy="22" r="14"/><line class="kp" x1="22" y1="22" x2="22" y2="11"/></svg>
   <label>${p.label}</label><output></output></div>`;
 }
+const STEMS=[['drums','DRUMS','#ffb020'],['bass','BASS','#1f6bff'],['vocals','VOCALS','#ff4fa3'],['other','MELODY','#2fe07a']];
 function deckHTML(k){
   const loops=[1/4,1/2,1,2,4,8,16,32];
   return `
@@ -401,6 +411,7 @@ function deckHTML(k){
     </div>
     <button class="btn simple-only" data-op="sync" style="height:44px">SYNC</button>
   </div>
+  <div class="stems med" data-stems title="Stems: click to mute or bring back a part, shift-click to solo it.">${STEMS.map(([n,l,c])=>`<button class="stem" data-stem="${n}" style="--pc:${c}">${l}<i></i></button>`).join('')}</div>
   <div class="loadbar"><button class="btn" data-op="load_next">⤓ LOAD NEXT</button><button class="btn med" data-op="eject">EJECT</button></div>
   <div class="status" data-r="status"></div>`;
 }
@@ -513,6 +524,9 @@ function wire(){
       if(op==='bjump')return api({op:'beat_jump',deck:k,beats:+b.dataset.beats});
       if(op==='spinback')return api({op:'brake',deck:k,spinback:true});
       if(op==='load_next')return api({op:'load_next',deck:k});
+      if(b.dataset.stem){const g=S?.decks?.[k]?.stems?.gain||{};const n=b.dataset.stem;
+        if(e.shiftKey){for(const [m] of STEMS)api({op:'set',deck:k,param:'stem_'+m,value:m===n?1:0});return}
+        return api({op:'set',deck:k,param:'stem_'+n,value:(g[n]??1)>0.5?0:1})}
       if(op)return api({op,deck:k});
       if(b.dataset.flag)return api({op:'flag',deck:k,name:b.dataset.flag});
       if(b.dataset.scale)return api({op:'bpm_scale',deck:k,value:+b.dataset.scale});
@@ -543,6 +557,7 @@ function wire(){
   $('#fxOn').onclick=()=>api({op:'fx',on:!S?.fx?.on});
   $('#mixBtn').onclick=()=>api({op:'mix',style:$('#mixStyle').value});
   $('#mixStyle').onchange=()=>api({op:'auto',style:$('#mixStyle').value});
+  $('#stemsTop').onclick=()=>api({op:'stems',on:!S?.stems?.on}).then(r=>r&&toast(S?.stems?.on?'Stems on: songs get split into parts.':'Stems off.'));
   $('#autoSwitch').onclick=$('#autoTop').onclick=()=>api({op:'auto',on:!S?.auto?.on});
   $('#autoBeats').onchange=()=>api({op:'auto',beats:$('#autoBeats').value?+$('#autoBeats').value:null});
   $('#endBtn').onclick=()=>{if(confirm('End the DJ set? The room goes back to its normal queue.'))api({op:'stop'})};
@@ -692,8 +707,15 @@ function renderDeck(k){
     else{const n=(CAT?.samples||[])[i];color=HOT[(i+4)%8];label=SAMPLE_NAMES[n]||n||''}
     p.style.setProperty('--pc',color);p.classList.toggle('lit',lit);if(p.innerHTML!==label)p.innerHTML=label;
   });
+  const st=d.stems||{},sg=st.gain||{},box=$('[data-stems]',el);
+  box.classList.toggle('hide',!S.stems?.on);
+  box.classList.toggle('wait',d.loaded&&st.status==='separating');
+  box.classList.toggle('off',!d.loaded||(st.status!=='ready'&&st.status!=='separating'));
+  $$('.stem',box).forEach(b=>{const kar=d.karaoke&&b.dataset.stem==='vocals';const g=kar?0:(sg[b.dataset.stem]??1);b.style.setProperty('--g',g);b.classList.toggle('lit',st.status==='ready'&&g>0.5);
+    b.firstChild.textContent=kar?'🎤 KARAOKE':(STEMS.find(x=>x[0]===b.dataset.stem)||[])[1];b.title=kar?'Karaoke mode is on for this room: vocals stay out':''});
   const status=$('[data-r=status]',el);
-  status.textContent=d.error?('⚠ '+d.error):(d.loading?'Decoding and analysing…':'');
+  status.textContent=d.error?('⚠ '+d.error):(d.loading?'Decoding and analysing…':
+    (d.loaded&&st.status==='separating'?'Splitting stems… (plays normally meanwhile)':(d.loaded&&st.status==='failed'?'Stems unavailable for this song.':'')));
   status.classList.toggle('err',!!d.error);
   const ch=$(`.ch[data-deck=${k}]`);
   if(ch){
@@ -708,6 +730,9 @@ function renderDeck(k){
 }
 function renderMixer(){
   const m=S.mixer,fx=S.fx;
+  const sw=$('#stemsTop'),stm=S.stems||{};
+  sw.classList.toggle('on',!!stm.on);sw.disabled=!stm.available;
+  sw.title=stm.available?(stm.on?'Stems on: click to turn off for this room':'Stems off: click to split songs into drums, bass, vocals and melody'):'Stem separation is not installed on this bot';
   $('#onair').className='onair'+(S.live?' live':'');$('#onair').lastChild.textContent=S.live?'ON AIR':'STARTING…';
   if(!held('xfader'))$('#xfader').value=m.xfader;
   $$('#xfCurve button').forEach(b=>b.classList.toggle('on',b.dataset.v===m.xf_curve));

@@ -251,8 +251,8 @@ async def room_state(guild_id):
         'queue': [_song_json(item) for item in (player.get('queue') or [])[:100]],
         'queue_length': len(player.get('queue') or []),
         'history': [],
-        'active_playlist': None,
-        'active_playlist_cover': None,
+        'active_playlist': (track or {}).get('playlist', {}).get('name') if (track or {}).get('playlist') else None,
+        'active_playlist_cover': (track or {}).get('playlist', {}).get('cover') if (track or {}).get('playlist') else None,
         'listeners': [m.get('name') for m in members if not m.get('bot')],
     }
 
@@ -266,6 +266,65 @@ async def play(guild_id, query, requested_by='Music dashboard'):
     })
     _cache['at'] = 0.0
     return await room_state(guild_id)
+
+
+def _seconds(duration):
+    if isinstance(duration, (int, float)):
+        return duration
+    try:
+        parts = [int(p) for p in str(duration).split(':')]
+    except ValueError:
+        return None
+    total = 0
+    for part in parts:
+        total = total * 60 + part
+    return total or None
+
+
+def _playlist_track(entry):
+    """A saved playlist entry as a Huddle placeholder track."""
+    url = entry.get('url') or ''
+    # Spotify imports store "spotify:search:<title artist>"; that is a search.
+    query = url[len('spotify:search:'):] if url.startswith('spotify:search:') else url
+    title = entry.get('title') or query
+    artist = ''
+    if ' — ' in title:
+        title, artist = title.split(' — ', 1)
+    return {
+        'query': query or title,
+        'title': title,
+        'artist': artist,
+        'thumbnail': entry.get('thumbnail'),
+        'duration': _seconds(entry.get('duration')),
+    }
+
+
+async def play_many(guild_id, entries, playlist_name, cover=None, start_now=False,
+                    mixes=None):
+    """Queue a whole playlist at once; the bot resolves each one as it nears.
+
+    `mixes` holds each entry's transition into the next when the playlist is
+    mixed (see webui.playlist_mix_specs)."""
+    tracks = [_playlist_track(entry) for entry in entries]
+    for track, spec in zip(tracks, mixes or []):
+        track['mix'] = spec
+    await _request('POST', '/api/bot/player', {
+        'channelId': channel_id_from(guild_id),
+        'tracks': tracks,
+        'startNow': bool(start_now),
+        'playlist': {'name': playlist_name, 'cover': cover},
+        'requestedBy': f'Playlist: {playlist_name}',
+    })
+    _cache['at'] = 0.0
+    return await room_state(guild_id)
+
+
+async def resolve(channel_id, track_id):
+    """Ask Huddle to look up the audio for one queued placeholder."""
+    return await _request('POST', '/api/bot/player', {
+        'channelId': channel_id,
+        'resolveTrackId': track_id,
+    })
 
 
 #: Dashboard action names that map straight onto a hub player action.

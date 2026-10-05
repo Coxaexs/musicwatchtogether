@@ -129,6 +129,10 @@ _info_opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True,
               'nocheckcertificate': True, 'skip_download': True,
               'socket_timeout': 15}
 
+if config.YTDLP_COOKIEFILE:
+    _search_opts['cookiefile'] = config.YTDLP_COOKIEFILE
+    _info_opts['cookiefile'] = config.YTDLP_COOKIEFILE
+
 
 def _dl_opts(cache_dir, vertical=False, quality=720, sponsorblock=False):
     height = 1280 if vertical else quality
@@ -152,6 +156,8 @@ def _dl_opts(cache_dir, vertical=False, quality=720, sponsorblock=False):
             {'key': 'SponsorBlock', 'categories': SB_CATEGORIES},
             {'key': 'ModifyChapters', 'remove_sponsor_segments': SB_CATEGORIES},
         ]
+    if config.YTDLP_COOKIEFILE:
+        opts['cookiefile'] = config.YTDLP_COOKIEFILE
     return opts
 
 

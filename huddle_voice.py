@@ -31,6 +31,7 @@ import config
 import dj
 import huddle
 import mixer
+import stems
 
 
 def _mix_keys(track: dict):
@@ -372,6 +373,8 @@ class RoomPublisher:
         self.websocket = None
         self.mix_key = None
         self.mix_task = None
+        self.last_player = None
+        self.karaoke_tasks = {}          # track id -> instrumental prep task
         self.task = asyncio.create_task(self._run())
 
     async def _update_dj(self, session, player: dict):
@@ -398,16 +401,24 @@ class RoomPublisher:
         if self.source.dj is not None:
             self.source.dj = None
             self.state_key = None  # pick the room player back up from scratch
+        self.last_player = player
         track = player.get("track") or {}
         track_id = track.get("id")
         settings = huddle.settings_for(self.channel_id)
         settings_key = tuple(sorted(settings.items()))
+        url = str(track.get("audioUrl") or "")
+        instrumental = self._karaoke(player, settings)
+        if instrumental:
+            # Real stems karaoke: the song minus its vocal track, so the
+            # phase-cancel filter is not needed (and would damage it).
+            url, settings = instrumental, {**settings, "audio_filter": None}
         key = (
             track_id,
             bool(player.get("paused")),
             int(player.get("positionMs") or 0),
             int(player.get("updatedAt") or 0),
             settings_key,
+            url,
         )
         volume = int(player.get("volume") or 100)
         if key == self.state_key:
@@ -435,7 +446,7 @@ class RoomPublisher:
                 int(time.time() * 1000) - int(player.get("updatedAt") or 0),
             )
         await self.source.configure(
-            str(track.get("audioUrl") or ""),
+            url,
             position_ms / 1000,
             bool(player.get("paused")),
             volume,
@@ -444,6 +455,50 @@ class RoomPublisher:
             track_id,
         )
         self._maybe_plan(player, settings)
+
+    # ---------------------------------------------------------------- karaoke
+
+    def _karaoke(self, player: dict, settings: dict):
+        """The instrumental to play for the current song in karaoke mode.
+
+        Returns None (keep the phase-cancel filter) until it is ready; the
+        current and next songs are prepared in the background, and the room
+        switches over at the same position when the current one is done.
+        """
+        if not (settings.get("karaoke_mode") or settings.get("audio_filter") == "karaoke"):
+            return None
+        if not stems.enabled():
+            return None
+        track = player.get("track") or {}
+        upcoming = (player.get("queue") or [None])[0]
+        for item in (track, upcoming):
+            if item and item.get("audioUrl") and item.get("id") not in self.karaoke_tasks:
+                self.karaoke_tasks[item["id"]] = asyncio.create_task(self._prepare_karaoke(item))
+        if len(self.karaoke_tasks) > 20:
+            for done in [k for k, t in self.karaoke_tasks.items() if t.done()][:10]:
+                self.karaoke_tasks.pop(done, None)
+        return stems.instrumental_for(_mix_keys(track)) if track.get("audioUrl") else None
+
+    async def _prepare_karaoke(self, track: dict):
+        try:
+            try:
+                await stems.prepare(track["audioUrl"], _mix_keys(track), track.get("title"),
+                                    instrumental=True)
+            except Exception:
+                # The queued song's stream link may have expired (403).
+                lookup = track.get("pageUrl") or track.get("query") or track.get("title")
+                if not (dj.resolver and lookup):
+                    raise
+                resolved = await dj.resolver(lookup)
+                await stems.prepare(resolved["audio_url"], _mix_keys(track), track.get("title"),
+                                    instrumental=True)
+        except Exception as error:
+            logger.warning("Karaoke: could not split %r: %s", track.get("title"), error)
+            return
+        player = self.last_player or {}
+        if (player.get("track") or {}).get("id") == track.get("id") and self.source.dj is None:
+            self.state_key = None            # re-sync onto the instrumental
+            await self.update(player)
 
     # ---------------------------------------------------------------- mixing
 

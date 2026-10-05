@@ -29,6 +29,7 @@ from urllib.parse import quote
 import config
 import dj
 import mixer
+import stems
 from storage import SQLiteDocumentStore, load_json, save_json
 
 # Setup musics folder for downloaded songs
@@ -2108,13 +2109,18 @@ class MusicPlayer:
         self._automix_speed = 1.0  # atempo AutoMix applied to the current song
         self._automix_file_offset = 0.0  # File position where the current source started
 
-    def build_source_options(self, song: Optional[Song] = None, start_seconds: int = 0) -> str:
-        """FFmpeg output options for this guild's active filter/crossfade settings."""
+    def build_source_options(self, song: Optional[Song] = None, start_seconds: int = 0,
+                             instrumental: bool = False) -> str:
+        """FFmpeg output options for this guild's active filter/crossfade settings.
+
+        `instrumental`: the source is a stems karaoke instrumental, which needs
+        no vocal-cancel filter.
+        """
         duration_seconds = parse_duration_to_seconds(song.duration) if song else None
         # AutoMix blends live; a baked-in afade would fight the mixer
         crossfade = 0 if self.automix_enabled else self.crossfade_seconds
         return build_audio_options(
-            filter_name=self.audio_filter,
+            filter_name=None if instrumental and self.audio_filter == 'karaoke' else self.audio_filter,
             crossfade_seconds=crossfade,
             duration_seconds=duration_seconds,
             start_seconds=start_seconds,
@@ -2125,6 +2131,51 @@ class MusicPlayer:
         self.paused_started_at = None
         self.total_paused_seconds = 0.0
         self.current_song_key = None
+
+    # ---- stems karaoke ----
+
+    @staticmethod
+    def _stem_keys(song: Song) -> list:
+        url = song.url or ''
+        query = url[len('spotify:search:'):] if url.startswith('spotify:search:') else url
+        return [mixer.track_key(url), mixer.track_key(query)]
+
+    def karaoke_instrumental(self, song: Optional[Song]) -> Optional[str]:
+        """The song minus its vocals, when karaoke is on and it is ready."""
+        if not (song and self.karaoke_mode and stems.enabled()):
+            return None
+        return stems.instrumental_for(self._stem_keys(song))
+
+    def schedule_karaoke_prep(self):
+        """Split the current and next song so karaoke can drop the real vocals."""
+        if not (self.karaoke_mode and stems.enabled()):
+            return
+        tasks = self.__dict__.setdefault('_karaoke_tasks', {})
+        for song in (self.current, self.queue[0] if self.queue else None):
+            if song and id(song) not in tasks:
+                tasks[id(song)] = asyncio.create_task(self._prepare_karaoke(song))
+        for key in [k for k, t in tasks.items() if t.done()][:-10]:
+            tasks.pop(key, None)
+
+    async def _prepare_karaoke(self, song: Song):
+        try:
+            if song.source_type == 'local':
+                source = song.url
+            else:
+                source = find_cached_song(extract_youtube_video_id(song.url or ''))
+                if not source:
+                    import webui
+                    query = song.url[len('spotify:search:'):] if (song.url or '').startswith('spotify:search:') else song.url
+                    source = (await webui._resolve_audio(query or song.title))['audio_url']
+            await stems.prepare(source, self._stem_keys(song), song.title, instrumental=True)
+        except Exception as e:
+            logger.warning(f"Karaoke: could not split {song.title!r}: {e}")
+            return
+        # Ready mid-song: carry on from the same spot without the vocals.
+        voice_client = self.guild.voice_client
+        if (self.current is song and self.karaoke_mode and voice_client
+                and voice_client.is_playing() and not dj.sessions.get(str(self.guild.id))):
+            await self.seek_to(self.get_playback_position_seconds())
 
     def cancel_idle_disconnect(self):
         task = self.idle_disconnect_task
@@ -2787,6 +2838,18 @@ class MusicPlayer:
                             stale.cleanup()
                         except Exception:
                             pass
+                elif self.karaoke_instrumental(self.current):
+                    # Stems karaoke: the song minus its vocal track
+                    raw = discord.FFmpegPCMAudio(
+                        self.karaoke_instrumental(self.current),
+                        options=self.build_source_options(self.current, instrumental=True))
+                    source = discord.PCMVolumeTransformer(raw, volume=self.volume)
+                    stale = self.preloaded_sources.pop(song_key, None)
+                    if stale:
+                        try:
+                            stale.cleanup()
+                        except Exception:
+                            pass
                 # Check if we have a preloaded source
                 elif song_key in self.preloaded_sources:
                     print(f"🚀 Using preloaded source for: {self.current.title}")
@@ -2911,6 +2974,7 @@ class MusicPlayer:
                 # Smart Autoplay needs to finish recommendation lookup and
                 # caching before AutoMix reaches the outro.
                 self.schedule_autoplay_prefetch()
+                self.schedule_karaoke_prep()
 
                 # Send now playing embed with lyrics to the last message channel
                 if self.last_message_channel:
@@ -3045,6 +3109,10 @@ class MusicPlayer:
         else:
             file_path = find_cached_song(extract_youtube_video_id(self.current.url))
 
+        instrumental = self.karaoke_instrumental(self.current)
+        if instrumental:
+            file_path = instrumental
+
         if not file_path:
             return False
 
@@ -3058,7 +3126,8 @@ class MusicPlayer:
             source = discord.FFmpegPCMAudio(
                 file_path,
                 before_options=f'-ss {max(0, position_seconds)}',
-                options=self.build_source_options(self.current, start_seconds=max(0, position_seconds))
+                options=self.build_source_options(self.current, start_seconds=max(0, position_seconds),
+                                                  instrumental=bool(instrumental))
             )
             source = discord.PCMVolumeTransformer(source, volume=self.volume)
 
@@ -6202,6 +6271,7 @@ class MusicCog(commands.Cog):
             if karaoke:
                 player.audio_filter = 'karaoke'
                 player.last_message_channel = interaction.channel
+                player.schedule_karaoke_prep()
             else:
                 if player.audio_filter == 'karaoke':
                     player.audio_filter = None

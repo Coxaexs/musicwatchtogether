@@ -36,6 +36,19 @@ YTDL_OPTIONS = {
     'source_address': '0.0.0.0',
 }
 
+# YouTube cookies (optional) for age-restricted videos. Point YTDLP_COOKIES at a
+# Netscape-format cookies.txt exported from a logged-in browser. yt-dlp writes
+# the jar back on exit, so it gets a private copy and the original stays intact.
+YTDLP_COOKIEFILE = None
+_cookies_source = os.getenv("YTDLP_COOKIES", "").strip()
+if _cookies_source and os.path.isfile(_cookies_source):
+    import shutil
+    import tempfile
+    YTDLP_COOKIEFILE = os.path.join(tempfile.mkdtemp(prefix="ytdlp-"), "cookies.txt")
+    shutil.copyfile(_cookies_source, YTDLP_COOKIEFILE)
+if YTDLP_COOKIEFILE:
+    YTDL_OPTIONS['cookiefile'] = YTDLP_COOKIEFILE
+
 # Supported local file formats
 SUPPORTED_FORMATS = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.opus', '.webm']
 
@@ -63,3 +76,6 @@ WEB_UI_ENABLED = os.getenv("WEB_UI_ENABLED", "1") == "1"
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = int(os.getenv("WEB_UI_PORT", "8722"))
 WEB_UI_PASSWORD = os.getenv("WEB_UI_PASSWORD", "")
+
+# yt-dlp stream resolver shared with Huddle (huddle_music_helper.py)
+MUSIC_HELPER_URL = os.getenv("MUSIC_HELPER_URL", "http://127.0.0.1:8731")

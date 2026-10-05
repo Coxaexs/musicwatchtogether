@@ -12,6 +12,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+stems-env/
 env/
 venv/
 
@@ -19,6 +20,9 @@ venv/
 musics/
 lyrics/
 watch_cache/
+stems_cache/
+dj_settings.json
+.restart
 reels_cache/
 *.mp3
 *.m4a
@@ -38,6 +42,8 @@ logs/
 backups/
 
 # ---- runtime state (per-deployment, not source) ----
+mix_analysis.json
+wrapped_state.json
 player_state.json
 guild_settings.json
 watch_tokens.json
@@ -63,3 +69,4 @@ musicbot.sqlite3*
 # Claude Code local settings
 .claude/
 dislikes.json
+youtube-cookies.txt

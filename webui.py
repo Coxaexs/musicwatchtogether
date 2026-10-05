@@ -29,6 +29,7 @@ import config
 import dj
 import huddle
 import mixer
+import stems
 from music import Song, get_autocomplete_suggestions, state_store
 from security import SlidingWindowLimiter, client_identity
 from storage import save_bytes_atomic, save_json
@@ -178,6 +179,125 @@ async def _analyze_entries(entries):
         except Exception as error:
             _mix_failures[_entry_keys(entry)[1]] = str(error)[:200]
             logger.warning(f"Mix analysis skipped {entry.get('title')!r}: {error}")
+
+
+# ------------------------------------------------------------ stems prep
+#
+# Separating a song takes ~15 s of GPU time, so songs that come back again
+# and again are prepared once and kept: songs in playlists someone pressed
+# "Prepare" on, and the most played songs overall. Their stems and karaoke
+# instrumentals are pinned in the stems cache and never evicted.
+
+#: (guild id, playlist name) -> {"task", "done", "total", "failed", "force"}
+_prep_jobs = {}
+TOP_PINNED = int(os.environ.get('DJ_STEMS_TOP', '40'))
+TOP_REFRESH_SECONDS = 6 * 3600
+
+
+def _playlist_pin(guild_id, owner, name):
+    return f'playlist:{guild_id}:{owner}:{name}'
+
+
+async def _prepare_entry(entry, force=False, pin_reason=None):
+    """Analysis (BPM, key, beat grid) plus stems and karaoke instrumental."""
+    keys = _entry_keys(entry)
+    if force:
+        mixer.cache.drop(*keys)
+        stems.forget(keys)
+    for attempt in range(2):
+        source, _meta = await _entry_audio(entry)
+        try:
+            await stems.prepare(source, keys, entry.get('title'), instrumental=True,
+                                pin_reason=pin_reason, background=True)
+            return
+        except Exception:
+            # A throttled or expired stream link: drop it and fetch a fresh one.
+            _audio_urls.pop(keys[1], None)
+            if attempt:
+                raise
+
+
+async def _prepare_entries(job, entries, pin_reason, force=False):
+    for entry in entries:
+        try:
+            await _prepare_entry(entry, force, pin_reason)
+            _mix_failures.pop(_entry_keys(entry)[1], None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            job['failed'].append(entry.get('title') or entry.get('url'))
+            _mix_failures[_entry_keys(entry)[1]] = str(error)[:200]
+            logger.warning(f"Prepare skipped {entry.get('title')!r}: {error}")
+        job['done'] += 1
+    # Pins follow the playlist as it is now: removed songs are let go.
+    stems.set_pins(pin_reason, [d for d in (stems.lookup(_entry_keys(e)) for e in entries) if d])
+
+
+def _prep_json(guild_id, name, entries):
+    job = _prep_jobs.get((str(guild_id), name))
+    ready = sum(1 for entry in entries if stems.lookup(_entry_keys(entry)))
+    return {
+        'available': stems.enabled(),
+        'ready': ready,
+        'total': len(entries),
+        'running': bool(job and not job['task'].done()),
+        'done': job['done'] if job else 0,
+        'job_total': job['total'] if job else 0,
+        'failed': job['failed'] if job else [],
+    }
+
+
+def _top_played(limit):
+    """Most played track keys (and a URL to fetch them) from the stats log."""
+    counts, urls = {}, {}
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stats.jsonl'),
+                  encoding='utf-8') as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                url = entry.get('url') or ''
+                # Long things (films, podcasts in Watch Together) are not songs.
+                if not url or (entry.get('seconds') or 0) > 15 * 60:
+                    continue
+                key = mixer.track_key(url)
+                counts[key] = counts.get(key, 0) + 1
+                urls.setdefault(key, (url, entry.get('title')))
+    except OSError:
+        return []
+    top = sorted(counts, key=counts.get, reverse=True)[:limit]
+    return [(key, *urls[key]) for key in top if counts[key] >= 2]
+
+
+async def _warm_top_songs():
+    """Keep the most played songs split and pinned. Runs in the background."""
+    await asyncio.sleep(600)                     # let the bot settle first
+    while True:
+        try:
+            if stems.enabled() and not stems.gpu_ok():
+                logger.info("Top songs: GPU unavailable, not warming stems on the CPU")
+            elif stems.enabled():
+                digests = []
+                for key, url, title in _top_played(TOP_PINNED):
+                    digest = stems.lookup([key])
+                    if not digest:
+                        try:
+                            source = url if os.path.exists(url) else (await _resolve_audio(url))['audio_url']
+                            digest = await stems.prepare(source, [key], title, instrumental=True,
+                                                         background=True)
+                        except Exception as error:
+                            logger.info(f"Top songs: skipped {title!r}: {error}")
+                    if digest:
+                        digests.append(digest)
+                stems.set_pins('top', digests)
+                logger.info(f"Top songs: {len(digests)} kept split and pinned")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Top songs warm-up failed")
+        await asyncio.sleep(TOP_REFRESH_SECONDS)
 
 
 def generate_token(guild_id, user_id=None):
@@ -668,6 +788,7 @@ class WebUI:
                            if not metas[i] and _entry_keys(entry)[1] in _mix_failures],
             },
             'catalog': mixer.catalog(),
+            'prep': _prep_json(guild.id, name, entries),
         }
 
     async def api_playlist_mix(self, request):
@@ -704,6 +825,21 @@ class WebUI:
                 _save_playlist_mix(guild.id, owner, name, record)
             elif action == 'analyze':
                 self._start_mix_analysis(guild.id, name, entries)
+            elif action in ('prepare', 'recompute'):
+                if not stems.enabled():
+                    return web.json_response({'error': 'Stem separation is not installed on this bot.'},
+                                             status=409)
+                key = (str(guild.id), name)
+                job = _prep_jobs.get(key)
+                if job and not job['task'].done():
+                    if action == 'recompute':
+                        job['task'].cancel()
+                    else:
+                        return web.json_response(self._mix_json(guild, name, entries, record))
+                job = {'done': 0, 'total': len(entries), 'failed': [], 'force': action == 'recompute'}
+                job['task'] = asyncio.ensure_future(_prepare_entries(
+                    job, list(entries), _playlist_pin(guild.id, owner, name), force=job['force']))
+                _prep_jobs[key] = job
             elif action == 'reorder':
                 metas = [mixer.cache.get(*_entry_keys(entry)) for entry in entries]
                 known = [i for i, meta in enumerate(metas) if meta]
@@ -1800,6 +1936,7 @@ async def start_web_server(bot):
     app.router.add_get('/api/guilds/{guild_id}/dj', ui.api_dj_state)
     app.router.add_post('/api/guilds/{guild_id}/dj', ui.api_dj_action)
     dj.resolver = _resolve_audio
+    asyncio.ensure_future(_warm_top_songs())
     app.router.add_get('/api/autocomplete', ui.api_autocomplete)
     app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
     os.makedirs(PLAYLIST_COVERS_DIR, exist_ok=True)
@@ -2500,7 +2637,8 @@ function renderPlaylistPage() {
         ? `<span class="mix-progress">⏳ Analysing ${analysis.done}/${analysis.total}</span>`
         : `<span class="mix-progress" title="${esc(failed.join('\n'))}">${analysis.done}/${analysis.total} analysed${failed.length ? ` · ${failed.length} couldn't be analysed (they use a plain fade)` : ''} · <a href="#" onclick="mixAction('analyze');return false">retry</a></span>`;
     const mixButtons = `<button class="mix-toggle ${mixing ? 'on' : ''}" onclick="mixAction('${mixing ? 'disable' : 'enable'}')" title="Mix: DJ-style transitions between songs">⧉ Mix</button>`
-      + (mixing ? `<button onclick="mixAction('reorder')" title="Reorder by BPM and key so transitions flow">✦ Smart reorder</button>` : '') + progress;
+      + (mixing ? `<button onclick="mixAction('reorder')" title="Reorder by BPM and key so transitions flow">✦ Smart reorder</button>` : '') + progress
+      + prepButtonsHTML(mix && mix.prep);
     const editing = mixing && mixEditIndex !== null && mix.transitions[mixEditIndex];
     html = `<section class="card playlist-page"><div class="playlist-hero">
       <div class="playlist-cover-large ${playlist.cover ? '' : 'empty'}" ${cover}>
@@ -2563,6 +2701,18 @@ function transitionChip(transition) {
   return `<div class="transition-row"><button class="transition-chip ${auto ? '' : 'custom'} ${mixEditIndex === transition.index ? 'active' : ''}"
     onclick="openTransition(${transition.index})">${esc(label)}</button></div>`;
 }
+function prepButtonsHTML(prep) {
+  if (!prep || !prep.available || !prep.total) return '';
+  const all = prep.ready >= prep.total;
+  const failed = prep.failed || [];
+  const status = prep.running
+    ? `<span class="mix-progress">⏳ Preparing ${prep.done}/${prep.job_total}…</span>`
+    : failed.length ? `<span class="mix-progress" title="${esc(failed.join('\n'))}">${failed.length} couldn't be prepared</span>` : '';
+  return `<button class="${all ? 'mix-toggle on' : ''}" onclick="mixAction('prepare')" ${prep.running ? 'disabled' : ''}
+      title="Analyse every song and split it into stems (drums, bass, vocals, melody) now, and keep them: the DJ booth, transitions and karaoke then start instantly">${all ? '✓ Prepared' : '⚡ Prepare'} ${prep.ready}/${prep.total}</button>`
+    + `<button onclick="if(confirm('Analyse and split every song in this playlist again, from scratch?'))mixAction('recompute')" title="Redo the analysis and stems for every song">↻ Recompute</button>`
+    + status;
+}
 async function loadMix(name) {
   if (mixLoading === name) return;
   mixLoading = name;
@@ -2575,7 +2725,8 @@ async function loadMix(name) {
 }
 function scheduleMixPoll() {
   clearTimeout(mixPoll);
-  if (mixData && mixData.enabled && mixData.analysis && mixData.analysis.running) {
+  if (mixData && ((mixData.enabled && mixData.analysis && mixData.analysis.running)
+      || (mixData.prep && mixData.prep.running))) {
     mixPoll = setTimeout(() => { if (openPlaylistName) { mixData = null; loadMix(openPlaylistName); } }, 3000);
   }
 }
@@ -2586,6 +2737,7 @@ async function mixAction(action, extra) {
     mixData = await api(basePath + 'api/guilds/' + selected + '/playlists/mix',
       {method:'POST', body:JSON.stringify(Object.assign({action, name:openPlaylistName}, extra || {}))});
     if (action === 'enable') toast('⧉ Mix on — every song now flows into the next.');
+    if (action === 'prepare' || action === 'recompute') toast('⚡ Preparing the playlist in the background. You can leave this page.');
     if (action === 'disable') { toast('Mix off.'); mixEditIndex = null; }
     if (action === 'reorder') {
       toast('✦ Reordered for smoother transitions.');

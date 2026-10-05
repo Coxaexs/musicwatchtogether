@@ -25,9 +25,12 @@ same faders and knobs a person would, which the booth shows as it happens.
 
 import asyncio
 import base64
+import json
 import logging
 import math
+import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -35,6 +38,7 @@ import numpy as np
 from scipy import signal
 
 import mixer
+import stems
 
 logger = logging.getLogger("MusicBot.DJ")
 
@@ -60,7 +64,11 @@ STYLES = {
     "cut": ("Cut on the one", 1),
     "brake": ("Brake stop", 4),
     "spinback": ("Spinback", 4),
+    "stem_swap": ("Stem swap", 32),
+    "acapella": ("Acapella over", 32),
 }
+STEM_STYLES = ("stem_swap", "acapella")
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dj_settings.json")
 SAMPLES = ("horn", "siren", "rewind", "laser", "boom", "clap", "riser", "scratch")
 
 
@@ -430,6 +438,13 @@ class Deck:
         self.loading = None
         self.error = None
         self.load_token = 0
+        # Stems: int16 (3, n, 2) drums/bass/vocals from stems.py, or None.
+        self.stems = None
+        self.stems_status = None    # None | separating | ready | failed
+        self.stem_gain = {name: 1.0 for name in stems.CONTROLS}
+        self.stem_now = dict(self.stem_gain)
+        self.use_stems = True       # the room's STEMS switch
+        self.karaoke = False        # the room's karaoke mode: vocals stay out
         self.reset_track_state()
         # Mixer channel
         self.trim = 0.0
@@ -585,7 +600,8 @@ class Deck:
         frac = (positions - index)[:, None].astype(np.float32)
         a = self.audio[index].astype(np.float32)
         b = self.audio[index + 1].astype(np.float32)
-        out = (a + (b - a) * frac) * (valid[:, None] / 32768.0)
+        out = self._apply_stems(a + (b - a) * frac, index, frac, n)
+        out = out * (valid[:, None] / 32768.0)
         # Slip: the shadow playhead keeps the track's normal time.
         if self.slipping():
             if self.playing:
@@ -606,6 +622,52 @@ class Deck:
                 self.rate_now = 0.0
         self.pos = new_pos
         return out.astype(np.float32)
+
+    @property
+    def has_stems(self):
+        return self.stems is not None and self.use_stems
+
+    def _apply_stems(self, x, index, frac, n):
+        """Mix x (the whole track) with per-stem gains, ramped over the block.
+
+        Only drums, bass and vocals are stored; other = mix - those three. So
+        out = mix * g_other + sum((g_stem - g_other) * stem), which is exactly
+        the original track when every gain is equal.
+        """
+        if not self.use_stems:
+            # Switched off: ramp every part back to full, then let go.
+            self.stem_gain = {name: 1.0 for name in stems.CONTROLS}
+            if self.stems is not None and all(v == 1.0 for v in self.stem_now.values()):
+                self.stems = None
+                self.stems_status = None
+        start, end = self.stem_now, self.stem_gain
+        if self.karaoke and end["vocals"] > stems.KARAOKE_GUIDE:
+            end = dict(end, vocals=stems.KARAOKE_GUIDE)
+        self.stem_now = dict(end)
+        if self.stems is None or all(start[k] == 1.0 and end[k] == 1.0 for k in stems.CONTROLS):
+            return x
+        ramp = (np.arange(1, n + 1, dtype=np.float32) / n)[:, None]
+        g_other = start["other"] + (end["other"] - start["other"]) * ramp
+        out = x * g_other
+        for i, name in enumerate(stems.NAMES):
+            g = start[name] + (end[name] - start[name]) * ramp - g_other
+            if not g.any():
+                continue
+            a = self.stems[i, index].astype(np.float32)
+            b = self.stems[i, index + 1].astype(np.float32)
+            out += (a + (b - a) * frac) * g
+        return out
+
+    def stem_presence(self, name, t0, t1):
+        """How much of the mix stem `name` makes up between t0 and t1 seconds (0..1)."""
+        if self.stems is None:
+            return None
+        i0, i1 = int(max(0, t0) * SR), int(max(0, t1) * SR)
+        stem = self.stems[stems.NAMES.index(name), i0:i1:16].astype(np.float32)
+        mix = self.audio[i0:i1:16].astype(np.float32)
+        if not len(mix):
+            return None
+        return float(np.sqrt((stem ** 2).mean()) / (np.sqrt((mix ** 2).mean()) + 1e-6))
 
     def end_slip(self):
         if self.slip and self.loaded:
@@ -714,6 +776,9 @@ class Deck:
             "xf": self.xf,
             "level": round(min(1.5, self.level), 3),
             "wave_id": self.wave_id,
+            "karaoke": self.karaoke,
+            "stems": {"status": self.stems_status,
+                      "gain": {k: round(v, 3) for k, v in self.stem_gain.items()}},
         }
         if full:
             result["wave"] = self.wave
@@ -766,6 +831,15 @@ def choose_style(out_deck, in_deck):
     keys_ok = mixer.key_distance(out_deck.meta.get("camelot"), in_deck.meta.get("camelot")) <= 1
     energy_out = out_deck.meta.get("energy") or 0.5
     energy_in = in_deck.meta.get("energy") or 0.5
+    if out_deck.has_stems and in_deck.has_stems:
+        # With stems the parts can be traded one at a time, so a vocal on
+        # the outgoing song can ride over the new one's instrumental.
+        if keys_ok and out_deck.bpm:
+            end = out_deck.music_end()
+            vocal = out_deck.stem_presence("vocals", end - 32 * out_deck.beat_seconds, end)
+            if vocal is not None and vocal > 0.3:
+                return "acapella"
+        return "stem_swap"
     if keys_ok and min(energy_out, energy_in) > 0.45:
         return "blend"
     if energy_in - energy_out > 0.25:
@@ -913,6 +987,26 @@ class DJEngine:
                     self.fx.set_on(False, self.clock()[0])
             if p > 0.5:
                 self.xfader = _xfader_toward(side, 0.5 + 0.5 * _smooth((p - 0.5) / 0.5))
+        elif style == "stem_swap":
+            # Bring the new song in part by part: drums, then the music, the
+            # bass on the halfway downbeat, its vocal last. The old song
+            # hands each part over in the same order.
+            self.xfader = _xfader_toward(side, 0.5 * _smooth(p / 0.06) + 0.5 * _smooth((p - 0.9) / 0.1))
+            swap = _smooth((p - 0.48) / 0.04)
+            inn.stem_gain.update(drums=_smooth(p / 0.2), other=_smooth((p - 0.25) / 0.2),
+                                 bass=swap, vocals=_smooth((p - 0.75) / 0.15))
+            out.stem_gain.update(vocals=1 - _smooth((p - 0.2) / 0.25), bass=1 - swap,
+                                 other=1 - _smooth((p - 0.55) / 0.25),
+                                 drums=1 - _smooth((p - 0.7) / 0.2))
+        elif style == "acapella":
+            # The old song's vocal rides on over the new song's instrumental,
+            # then the new vocal takes over at the end.
+            self.xfader = _xfader_toward(side, 0.5 * _smooth(p / 0.3) + 0.5 * _smooth((p - 0.9) / 0.1))
+            swap = _smooth((p - 0.3) / 0.04)
+            inn.stem_gain.update(drums=1.0, other=1.0, bass=swap, vocals=_smooth((p - 0.85) / 0.12))
+            out.stem_gain.update(bass=1 - swap, drums=1 - _smooth((p - 0.3) / 0.12),
+                                 other=1 - _smooth((p - 0.3) / 0.2),
+                                 vocals=1 - _smooth((p - 0.72) / 0.16))
         elif style in ("brake", "spinback"):
             if not inn.playing and tr.elapsed >= tr.in_delay:
                 self._drop_in(inn)
@@ -924,6 +1018,9 @@ class DJEngine:
     def _start_transition(self, tr):
         out, inn = tr.out, tr.inn
         tr.started = True
+        if tr.style in STEM_STYLES and not (out.has_stems and inn.has_stems):
+            tr.style = "blend"         # stems not ready (yet): the EQ version
+            tr.label = STYLES["blend"][0]
         side = inn.xf if inn.xf in ("A", "B") else ("B" if inn.name == "B" else "A")
         inn.fader = 1.0
         inn.eq.update({"hi": 0.0, "mid": 0.0})
@@ -934,6 +1031,10 @@ class DJEngine:
         if tr.style == "filter":
             inn.color_fx = "filter"
             inn.color = -0.8
+        if tr.style == "stem_swap":
+            inn.stem_gain.update(drums=0.0, bass=0.0, other=0.0, vocals=0.0)
+        if tr.style == "acapella":
+            inn.stem_gain.update(drums=1.0, bass=0.0, other=1.0, vocals=0.0)
         if not inn.playing and not tr.in_delay:
             self._drop_in(inn)
         if tr.style == "echo":
@@ -975,6 +1076,8 @@ class DJEngine:
         out.fader = 1.0
         inn.eq.update({"hi": 0.0, "mid": 0.0, "low": 0.0})
         inn.color = 0.0
+        for deck in (out, inn):
+            deck.stem_gain = {name: 1.0 for name in stems.CONTROLS}
         side = inn.xf if inn.xf in ("A", "B") else ("B" if inn.name == "B" else "A")
         self.xfader = _xfader_toward(side, 1.0)
         self.master_name = inn.name
@@ -1088,7 +1191,7 @@ class DiscordCrate:
         song = queue[index]
         del queue[index]
         self.player.history.appendleft(song)  # Smart Autoplay seeds from here
-        return self._item(song)
+        return {**self._item(song), "song": song}
 
     async def add(self, query, requester=None):
         cog = self.player.bot.get_cog("MusicCog")
@@ -1171,8 +1274,15 @@ class DJSession:
         self.started_at = time.time()
         self.notice = None
         self.load_tasks = {}
+        self.stem_tasks = {}
+        self.stems_on = load_settings().get(key, {}).get("stems", True)
+        for deck in self.engine.decks.values():
+            deck.use_stems = self.stems_on
         self.tick_task = None
         self.on_stop = None              # platform clean-up, set by start_*()
+        self.report_on_air = None        # async (info | None), set by start_*()
+        self.karaoke_setting = None      # () -> bool, the room's karaoke mode
+        self.reported = None             # (info, monotonic time) last sent
 
     # ---- loading ----
 
@@ -1199,7 +1309,20 @@ class DJSession:
                         "artist": item.get("artist") or resolved.get("artist"),
                         "thumbnail": item.get("thumbnail") or resolved.get("thumbnail")}
             loop = asyncio.get_running_loop()
-            audio = await loop.run_in_executor(None, decode_track, source)
+            try:
+                audio = await loop.run_in_executor(None, decode_track, source)
+            except Exception as error:
+                # A stream link resolved a while ago (e.g. a queued Huddle
+                # song) expires: YouTube answers 403. Look the song up again.
+                lookup = item.get("query") or item.get("title")
+                if item.get("file") or not item.get("audio_url") or not resolver or not lookup:
+                    raise
+                logger.info("DJ %s: stream for %r failed (%s), resolving it again",
+                            self.key, item.get("title"), str(error)[-80:])
+                resolved = await resolver(lookup)
+                source = resolved["audio_url"]
+                keys.append(mixer.track_key(resolved.get("page_url")))
+                audio = await loop.run_in_executor(None, decode_track, source)
             meta, wave = await loop.run_in_executor(None, analyze_buffer, audio, keys)
         except Exception as error:
             with self.engine.lock:
@@ -1211,11 +1334,15 @@ class DJSession:
             if deck.load_token != token:
                 return
             deck.audio = audio
+            deck.stems = None
+            deck.stems_status = "separating" if self._stems_wanted() else None
             deck.meta = dict(meta)
             deck.wave = wave
             deck.wave_id += 1
             deck.info = {"title": item.get("title"), "artist": item.get("artist"),
-                         "thumbnail": item.get("thumbnail")}
+                         "thumbnail": item.get("thumbnail"),
+                         "song": item.get("song"), "query": item.get("query"),
+                         "keys": keys}
             deck.loading = None
             deck.error = None
             deck.reset_track_state()
@@ -1241,6 +1368,64 @@ class DJSession:
             del self.history[30:]
         logger.info("DJ %s: deck %s loaded %r (%s bpm, %s)", self.key, deck_name,
                     item.get("title"), meta.get("bpm"), meta.get("camelot"))
+        if self._stems_wanted():
+            self.stem_tasks[deck_name] = asyncio.create_task(self._separate(deck, token, audio))
+
+    def _stems_wanted(self):
+        return self.stems_on and stems.enabled()
+
+    def set_stems(self, on):
+        """The room's STEMS switch: split songs (and offer stem mixes) or not."""
+        self.stems_on = bool(on)
+        settings = load_settings()
+        settings.setdefault(self.key, {})["stems"] = self.stems_on
+        save_settings(settings)
+        with self.engine.lock:
+            for deck in self.engine.decks.values():
+                deck.use_stems = self.stems_on
+                if self.stems_on and deck.loaded and deck.stems is None and deck.stems_status != "separating":
+                    if stems.enabled():
+                        deck.stems_status = "separating"
+                        self.stem_tasks[deck.name] = asyncio.create_task(
+                            self._separate(deck, deck.load_token, deck.audio))
+                elif not self.stems_on and deck.stems_status in ("separating", "failed"):
+                    deck.stems_status = None
+            tr = self.engine.transition
+            if not self.stems_on and tr and tr.style in STEM_STYLES:
+                if tr.started:
+                    self.engine.transition = None
+                else:
+                    tr.style, tr.label = "blend", STYLES["blend"][0]
+
+    async def _separate(self, deck, token, audio):
+        """Split the deck's song into stems in the background; it plays meanwhile."""
+        try:
+            # Shielded: a booth closing mid-split still finishes into the cache.
+            result = await asyncio.shield(
+                stems.SEPARATOR.separate(audio, wanted=lambda: deck.load_token == token))
+            if result is not None and result.shape != (len(stems.NAMES),) + audio.shape:
+                raise RuntimeError(f"stems have shape {result.shape}, expected {audio.shape}")
+            if result is not None and deck.info.get("keys"):
+                digest = await asyncio.get_running_loop().run_in_executor(None, stems.track_hash, audio)
+                stems.remember(deck.info["keys"], digest, deck.info.get("title"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("DJ %s: stem separation failed on %s: %s", self.key, deck.name, error)
+            with self.engine.lock:
+                if deck.load_token == token:
+                    deck.stems_status = "failed"
+            return
+        with self.engine.lock:
+            if deck.load_token != token or not deck.use_stems:
+                return
+            if result is None:
+                deck.stems_status = None
+                return
+            deck.stems = result
+            deck.stems_status = "ready"
+            # Fade any gains already set in from the full mix, no jump.
+            deck.stem_now = {name: 1.0 for name in stems.CONTROLS}
 
     def _audible(self, deck):
         return self.engine._channel_gain(deck) * self.engine.master_volume > 0.02
@@ -1290,10 +1475,67 @@ class DJSession:
         except Exception as error:
             logger.debug("DJ autoplay pick failed: %s", error)
             return None
-        return self.crate._item(song) if song else None
+        return {**self.crate._item(song), "song": song} if song else None
+
+    def on_air(self):
+        """The song the room hears now: the master deck, if it is audible."""
+        with self.engine.lock:
+            m = self.engine.master()
+            decks = [m] if m else []
+            decks += sorted((d for d in self.engine.decks.values() if d is not m),
+                            key=self.engine._channel_gain, reverse=True)
+            deck = next((d for d in decks if d.loaded and d.playing and self._audible(d)), None)
+            if not deck:
+                return None            # _report keeps the last song, stopped
+            return {"id": f"dj:{deck.name}:{deck.wave_id}", "title": deck.info.get("title") or "",
+                    "artist": deck.info.get("artist") or "", "thumbnail": deck.info.get("thumbnail"),
+                    "duration": round(deck.duration, 2), "positionMs": round(deck.seconds * 1000),
+                    "paused": not deck.playing}
+
+    async def _report(self):
+        """Tell the room what is on air, when it changes or its clock drifts."""
+        if not self.report_on_air or not self.live:
+            return
+        info = self.on_air()
+        now = time.monotonic()
+        last = self.reported
+        if last:
+            sent, at = last
+            expected = sent and sent["positionMs"] + (0 if sent["paused"] else (now - at) * 1000)
+            if not info and sent:
+                # Nothing audible: keep showing the last song, stopped, rather
+                # than the room's own (paused) track.
+                info = dict(sent, paused=True, positionMs=round(expected))
+            same = info and sent and sent["id"] == info["id"] and sent["paused"] == info["paused"]
+            # A heartbeat every 20 s tells the room the booth is still alive.
+            if same and now - at < 20 and (abs(expected - info["positionMs"]) < 800 or now - at < 1.0):
+                return
+            if not info and not sent:
+                return
+        self.reported = (info, now)
+        try:
+            await self.report_on_air(info)
+        except Exception as error:
+            logger.debug("DJ %s: on-air report failed: %s", self.key, error)
+
+    def _follow_karaoke(self):
+        """Mirror the room's karaoke setting onto the decks (checked every 2 s)."""
+        now = time.monotonic()
+        if now - getattr(self, "_karaoke_at", 0) < 2 or not self.karaoke_setting:
+            return
+        self._karaoke_at = now
+        try:
+            on = bool(self.karaoke_setting())
+        except Exception:
+            return
+        with self.engine.lock:
+            for deck in self.engine.decks.values():
+                deck.karaoke = on
 
     async def _tick(self):
         engine = self.engine
+        self._follow_karaoke()
+        await self._report()
         with engine.lock:
             events, engine.events = engine.events, []
         if not self.auto or not self.live:
@@ -1388,6 +1630,11 @@ class DJSession:
                 raise ValueError("Type a song name or paste a link.")
             title = await self.crate.add(query, requester)
             self.notice = f"Queued {title}"
+            return
+        if op == "stems":
+            if not stems.enabled() and body.get("on"):
+                raise ValueError("Stem separation is not installed on this bot.")
+            self.set_stems(body.get("on", not self.stems_on))
             return
         if op == "auto":
             if "on" in body:
@@ -1541,6 +1788,9 @@ class DJSession:
             if deck.playing and self._audible(deck):
                 raise ValueError(f"Deck {deck.name} is on air.")
             deck.audio = None
+            deck.stems = None
+            deck.stems_status = None
+            deck.load_token += 1
             deck.info = {}
             deck.meta = {}
             deck.wave = None
@@ -1588,10 +1838,14 @@ class DJSession:
     def _set_deck(self, deck, param, value):
         engine = self.engine
         tr = engine.transition
-        if tr and tr.started and deck in (tr.out, tr.inn) and param in (
-                "eq_low", "color", "fader"):
+        if tr and tr.started and deck in (tr.out, tr.inn) and (param in (
+                "eq_low", "color", "fader") or param.startswith("stem_")):
             engine.transition = None  # a human took over
-        if param in ("eq_hi", "eq_mid", "eq_low"):
+        if param.startswith("stem_") and param[5:] in stems.CONTROLS:
+            if not deck.use_stems:
+                raise ValueError("Stems are switched off for this room.")
+            deck.stem_gain[param[5:]] = _clamp(float(value), 0, 1)
+        elif param in ("eq_hi", "eq_mid", "eq_low"):
             deck.eq[param[3:]] = _clamp(float(value), KILL_DB, 6.0)
         elif param == "color":
             deck.color = _clamp(float(value), -1, 1)
@@ -1662,6 +1916,7 @@ class DJSession:
             "kind": self.kind,
             "live": self.live,
             "auto": {"on": self.auto, "style": self.auto_style, "beats": self.auto_beats},
+            "stems": {"on": self.stems_on, "available": stems.enabled()},
             "crate": self.crate.items()[:60],
             "history": self.history[:20],
             "notice": self.notice,
@@ -1674,7 +1929,7 @@ class DJSession:
         self.active = False
         if self.tick_task:
             self.tick_task.cancel()
-        for task in self.load_tasks.values():
+        for task in (*self.load_tasks.values(), *self.stem_tasks.values()):
             task.cancel()
         sessions.pop(self.key, None)
         if self.on_stop:
@@ -1682,6 +1937,32 @@ class DJSession:
                 await self.on_stop()
             except Exception:
                 logger.exception("DJ %s: clean-up failed", self.key)
+
+
+def huddle_karaoke(channel_id):
+    import huddle
+    settings = huddle.settings_for(huddle.PREFIX + channel_id)
+    return bool(settings.get("karaoke_mode") or settings.get("audio_filter") == "karaoke")
+
+
+def load_settings():
+    """Per-room booth settings, e.g. {"<guild key>": {"stems": false}}."""
+    try:
+        with open(SETTINGS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    tmp = SETTINGS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(settings, f, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+    except OSError as error:
+        logger.warning("Could not save DJ settings: %s", error)
 
 
 def catalog():
@@ -1733,7 +2014,7 @@ async def start_discord(player, auto=True):
     carry = None
     if song and (vc.is_playing() or vc.is_paused()):
         # The song on air keeps playing from deck A.
-        carry = {"item": session.crate._item(song),
+        carry = {"item": {**session.crate._item(song), "song": song},
                  "position": player.get_playback_position_seconds(),
                  "play": vc.is_playing()}
 
@@ -1759,10 +2040,42 @@ async def start_discord(player, auto=True):
         # Something else (/skip, /stop, a disconnect) ended the booth's stream.
         if session.active:
             session.on_stop = None
+            player.current = None      # the booth's song already went to history
+            player.reset_playback_clock()
             asyncio.run_coroutine_threadsafe(session.stop(), player.bot.loop)
             asyncio.run_coroutine_threadsafe(player.play_next(), player.bot.loop)
 
+    async def report_on_air(info):
+        """Keep the guild player's "current song" on the booth's on-air deck, so
+        /nowplaying, /lyrics, /lyricsnow, karaoke and the dashboard follow it."""
+        if not info:
+            return
+        deck = session.engine.decks[info["id"].split(":")[1]]
+        song = deck.info.get("song")
+        if song is None:
+            # Loaded from the booth's search: no queue entry to show, make one.
+            song_type = sys.modules[type(player).__module__].Song
+            seconds = int(info["duration"] or 0)
+            song = song_type(title=info["title"] or "Unknown", url=deck.info.get("query") or "",
+                             duration=f"{seconds // 60}:{seconds % 60:02d}",
+                             requester=player.guild.me, source_type="youtube",
+                             thumbnail=info["thumbnail"], artist=info["artist"] or None)
+            deck.info["song"] = song
+        changed = player.current_song_key != info["id"]
+        player.current = song
+        player.current_song_key = info["id"]
+        now = time.monotonic()
+        player.song_started_at = now - info["positionMs"] / 1000
+        player.total_paused_seconds = 0.0
+        player.paused_started_at = now if info["paused"] else None
+        if changed and player.last_message_channel:
+            cog = player.bot.get_cog("MusicCog")
+            if cog:
+                asyncio.create_task(cog._send_now_playing_update(player))
+
     async def on_stop():
+        player.current = None          # the booth's song already went to history
+        player.reset_playback_clock()
         player._suppress_after = True
         try:
             if vc.is_connected() and (vc.is_playing() or vc.is_paused()):
@@ -1773,6 +2086,8 @@ async def start_discord(player, auto=True):
         await player.play_next()
 
     session.on_stop = on_stop
+    session.report_on_air = report_on_air
+    session.karaoke_setting = lambda: player.karaoke_mode
     if carry:
         started = time.monotonic()
 
@@ -1819,8 +2134,16 @@ async def start_huddle(channel_id, auto=True):
         except Exception as error:
             logger.debug("DJ could not pause the Huddle player: %s", error)
 
+    async def report_on_air(info):
+        await huddle._request("POST", "/api/bot/player", {
+            "channelId": channel_id, "action": {"name": "live", "live": info}})
+
     async def on_stop():
         # Hand the room back to its normal player, past the song DJ took.
+        try:
+            await report_on_air(None)
+        except Exception as error:
+            logger.debug("DJ could not clear the on-air track: %s", error)
         try:
             current = (manager.players.get(channel_id) if manager else None) or {}
             if current.get("track") and current["track"].get("id") in session.crate.used:
@@ -1834,6 +2157,8 @@ async def start_huddle(channel_id, auto=True):
 
     session.on_stop = on_stop
     session.pause_hub = pause_hub
+    session.report_on_air = report_on_air
+    session.karaoke_setting = lambda: huddle_karaoke(channel_id)
     if track and track.get("audioUrl") and not player.get("paused"):
         position = float(player.get("positionMs") or 0) / 1000 + max(
             0.0, time.time() - float(player.get("updatedAt") or 0) / 1000)
