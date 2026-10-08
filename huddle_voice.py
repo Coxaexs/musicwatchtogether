@@ -771,11 +771,36 @@ class HuddleVoiceManager:
                                 data.get("error") or f"Huddle returned {response.status}"
                             )
                     await self._sync(data)
+                    delay = self._poll_delay(data)
                 except asyncio.CancelledError:
                     break
                 except Exception as error:
                     logger.warning("Huddle voice state poll failed: %s", error)
-                await asyncio.sleep(1)
+                    delay = 1
+                await asyncio.sleep(delay)
+
+    #: Seconds between polls while someone is in voice or something plays.
+    POLL_ACTIVE = 1
+    #: Seconds between polls while every voice room is empty and silent.
+    POLL_IDLE = 5
+
+    def _poll_delay(self, data: dict) -> float:
+        """Poll every second only while music could start or is playing.
+
+        Music only plays in a voice room someone is in, and /play needs its
+        caller in voice, so while every room is empty nothing can start; the
+        once-a-second poll was ~10,000 requests every three hours to Huddle
+        regardless.
+        """
+        if self.publishers:
+            return self.POLL_ACTIVE
+        for server in data.get("servers") or []:
+            for room in server.get("voiceChannels") or []:
+                if (room.get("player") or {}).get("track"):
+                    return self.POLL_ACTIVE
+                if any(not member.get("bot") for member in room.get("members") or []):
+                    return self.POLL_ACTIVE
+        return self.POLL_IDLE
 
     #: How many queued placeholders to have resolved ahead of time.
     RESOLVE_AHEAD = 2
