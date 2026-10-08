@@ -6,16 +6,15 @@ and publishes the resulting audio as a genuine WebRTC bot participant.
 """
 
 import asyncio
-from array import array
 from fractions import Fraction
 import json
 import logging
-import sys
 import time
 from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
+import numpy as np
 from av import AudioFrame
 import aiortc.codecs
 from aiortc.codecs import OpusEncoder as DefaultOpusEncoder
@@ -31,6 +30,7 @@ import config
 import dj
 import huddle
 import mixer
+from loop_watchdog import LoopWatchdog
 import stems
 
 
@@ -340,16 +340,10 @@ class RoomAudioTrack(MediaStreamTrack):
                 pass
 
         if self._volume < 0.999 and data.strip(b"\0"):
-            samples = array("h")
-            samples.frombytes(data)
-            if sys.byteorder != "little":
-                samples.byteswap()
-            gain = self._volume
-            for index, sample in enumerate(samples):
-                samples[index] = max(-32768, min(32767, int(sample * gain)))
-            if sys.byteorder != "little":
-                samples.byteswap()
-            data = samples.tobytes()
+            # Vectorised: the per-sample Python loop cost ~0.4 ms of every
+            # 20 ms frame on the event loop the sender shares with everything.
+            samples = np.frombuffer(data, dtype="<i2").astype(np.float32)
+            data = np.clip(samples * self._volume, -32768, 32767).astype("<i2").tobytes()
 
         frame = AudioFrame(format="s16", layout="stereo", samples=SAMPLES_PER_FRAME)
         frame.planes[0].update(data)
@@ -737,6 +731,9 @@ class HuddleVoiceManager:
         self.task = None
 
     async def start(self):
+        # Logs where the loop was stuck whenever a stall makes audio drop out.
+        if getattr(self, "watchdog", None) is None:
+            self.watchdog = LoopWatchdog.maybe_start()
         global MANAGER
         if not config.HUDDLE_BASE_URL or not config.HUDDLE_BOT_TOKEN:
             logger.info("Huddle WebRTC publisher disabled (not configured)")
