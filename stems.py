@@ -68,6 +68,37 @@ def gpu_ok():
     return ok
 
 
+_temp_checked = (0.0, None)
+GPU_HOT = 78
+
+
+def gpu_temperature():
+    """GPU temperature in °C (checked at most every 30 s), or None."""
+    global _temp_checked
+    at, temp = _temp_checked
+    if time.monotonic() - at > 30:
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            temp = int(out.split()[0])
+        except Exception:
+            temp = None
+        _temp_checked = (time.monotonic(), temp)
+    return temp
+
+
+#: () -> bool, set by dj.py: True while a DJ set is on air. Background work
+#: (playlist prep, top songs) waits then, so the live mix keeps the CPU.
+pause_background = lambda: False  # noqa: E731
+
+
+def background_should_wait():
+    if pause_background():
+        return True
+    temp = gpu_temperature()
+    return temp is not None and temp >= GPU_HOT
+
+
 def track_hash(audio):
     return hashlib.blake2b(np.ascontiguousarray(audio).data, digest_size=16).hexdigest()
 
@@ -174,6 +205,57 @@ def pinned():
     return set(load_index()["pins"])
 
 
+_library_cache = (None, [])
+
+
+def library():
+    """Every song with stems on disk, most recently used first.
+
+    One entry per separated song: {"hash", "title", "youtube" (video id or
+    None), "keys", "seconds", "karaoke" (instrumental ready), "pinned",
+    "used" (epoch of last use)}. Songs whose stems file was pruned are left
+    out. Reading this never touches the files, so browsing the list doesn't
+    change what the cache keeps.
+    """
+    global _library_cache
+    try:
+        stamp = (os.path.getmtime(_index_file()), os.path.getmtime(CACHE_DIR))
+    except OSError:
+        return []
+    if _library_cache[0] == stamp:
+        return [dict(item) for item in _library_cache[1]]
+    data = load_index()
+    songs = {}
+    for key, info in data["tracks"].items():
+        digest = (info or {}).get("hash")
+        if not digest:
+            continue
+        song = songs.setdefault(digest, {"hash": digest, "title": None, "youtube": None, "keys": []})
+        song["keys"].append(key)
+        song["title"] = song["title"] or (info or {}).get("title")
+        if key.startswith("yt:") and not song["youtube"]:
+            song["youtube"] = key[3:]
+    out = []
+    for digest, song in songs.items():
+        path = stems_path(digest)
+        try:
+            used = os.path.getmtime(path)
+            frames = np.load(path, mmap_mode="r").shape[1]
+        except (OSError, ValueError, IndexError):
+            continue
+        song.update(
+            title=song["title"] or "Unknown",
+            seconds=int(frames / SR),
+            karaoke=os.path.exists(instrumental_path(digest)),
+            pinned=digest in data["pins"],
+            used=used,
+        )
+        out.append(song)
+    out.sort(key=lambda song: song["used"], reverse=True)
+    _library_cache = (stamp, out)
+    return [dict(item) for item in out]
+
+
 def forget(keys):
     """Drop a song's stems and instrumental (a "recompute" starts from scratch)."""
     digest = lookup(keys)
@@ -230,7 +312,9 @@ def decode(source):
     """Whole track as int16 (n, 2) at 48 kHz (same as the DJ deck's audio)."""
     command = ["ffmpeg", "-nostdin", "-loglevel", "error"]
     if str(source).startswith(("http://", "https://")):
-        command += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3"]
+        # A stalled stream fails after 20 s instead of hanging to the timeout.
+        command += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3",
+                    "-rw_timeout", "20000000"]
     command += ["-i", str(source), "-vn", "-t", str(MAX_SECONDS),
                 "-f", "s16le", "-ac", "2", "-ar", str(SR), "pipe:1"]
     result = subprocess.run(command, capture_output=True, timeout=300)
@@ -240,6 +324,30 @@ def decode(source):
         detail = result.stderr.decode(errors="replace").strip()[-200:]
         raise RuntimeError(detail or "The track has no audio.")
     return audio
+
+
+def local_audio(keys):
+    """(audio, stems) of a song rebuilt entirely from the cache, or None.
+
+    The karaoke instrumental is the mix minus the vocal stem, so adding the
+    vocal back gives the original track: a prepared song plays without
+    fetching it from YouTube again (stream links expire and get throttled).
+    """
+    digest = lookup(keys)
+    if not digest or not os.path.exists(instrumental_path(digest)):
+        return None
+    try:
+        stems = _load(stems_path(digest))
+        inst = decode(instrumental_path(digest))
+    except Exception as error:
+        logger.warning("Could not rebuild %s from the cache: %s", digest, error)
+        return None
+    n = stems.shape[1]
+    if len(inst) < n:
+        inst = np.pad(inst, ((0, n - len(inst)), (0, 0)))
+    vocals = stems[NAMES.index("vocals")].astype(np.int32) * (1 - KARAOKE_GUIDE)
+    audio = np.clip(inst[:n].astype(np.int32) + vocals, -32768, 32767).astype(np.int16)
+    return audio, stems
 
 
 def write_instrumental(audio, stems, digest):
@@ -347,8 +455,10 @@ class Separator:
         if os.path.exists(path):
             return await loop.run_in_executor(None, _load, path)
         if background:
-            while self.interactive_waiting or self.lock.locked():
-                await asyncio.sleep(1)
+            # Yield to listeners, to a live DJ set, and to a hot GPU (whose
+            # jobs would otherwise fall back to the CPU).
+            while self.interactive_waiting or self.lock.locked() or background_should_wait():
+                await asyncio.sleep(5 if background_should_wait() else 1)
         else:
             self.interactive_waiting += 1
         try:

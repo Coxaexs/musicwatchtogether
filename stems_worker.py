@@ -66,13 +66,17 @@ def gpu_temperature():
         return None
 
 
-def use_cpu(model):
-    """Run on the CPU, gently: the bot renders live audio on the same cores."""
+def be_gentle():
+    """Few threads, low priority: the bot renders live audio on the same
+    cores, and a CPU job (no GPU, or the GPU cooling off) must not starve it."""
     torch.set_num_threads(CPU_THREADS)
     try:
         os.nice(10)
     except OSError:
         pass
+
+
+def use_cpu(model):
     return model.to("cpu"), "cpu"
 
 
@@ -82,7 +86,9 @@ def main():
     out = os.fdopen(os.dup(1), "w", buffering=1)
     os.dup2(2, 1)
     sys.stdout = sys.stderr
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    be_gentle()
+    # GPU is off by default: the passive Tesla P4 overheats without a fan.
+    device = "cuda" if os.environ.get("DJ_STEMS_ALLOW_GPU") == "1" and torch.cuda.is_available() else "cpu"
     started = time.monotonic()
     model = get_model(MODEL)
     model.eval()

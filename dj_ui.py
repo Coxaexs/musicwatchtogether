@@ -43,6 +43,7 @@ body:not([data-mode=simple]) .simple-only{display:none!important}
 .pill.auto.on{background:var(--orange);border-color:var(--orange);color:#1a0d00;box-shadow:0 0 16px #ff8a1c66}
 .pill.stemsw.on{background:#ff4fa3;border-color:#ff4fa3;color:#2a0016;box-shadow:0 0 16px #ff4fa366}
 .pill.stemsw:disabled{opacity:.35;cursor:not-allowed}
+.pill.real.on{background:linear-gradient(90deg,#ff3d5a,#ff8a1c);border-color:#ff5a3d;color:#fff;box-shadow:0 0 16px #ff3d5a77}
 .pill.end:hover{border-color:var(--red);color:var(--red)}
 @keyframes blink{50%{opacity:.35}}
 
@@ -160,6 +161,14 @@ input[type=range]::-moz-range-thumb{background:linear-gradient(90deg,#8d939c,#e9
 .loadbar .btn{flex:1}
 .deck .status{grid-column:1/-1;color:var(--muted);font-size:12px;min-height:16px}
 .deck .status.err{color:var(--red)}
+.modeseg{display:flex;margin:4px 0 10px}.modeseg button{flex:1;padding:8px 6px;font-weight:800;letter-spacing:.1em;font-size:11px}
+.modeseg button[data-v=real].on{background:linear-gradient(90deg,#ff3d5a,#ff8a1c);color:#fff;box-shadow:0 0 14px #ff3d5a66}
+.realinfo{font-size:12px;color:var(--muted);line-height:1.5;margin-bottom:8px}.realinfo b{color:var(--text)}
+.realinfo .meter{height:5px;border-radius:3px;background:#161a20;overflow:hidden;margin:4px 0 2px}.realinfo .meter i{display:block;height:100%;background:linear-gradient(90deg,#2fe07a,#ffb020,#ff3d5a)}
+body.realmode .smoothonly{display:none!important}
+body:not(.realmode) .realonly{display:none!important}
+.vibeseg button.on[data-v=chill]{background:#1f6bff;color:#fff}.vibeseg button.on[data-v=club]{background:#ff8a1c;color:#1a0d00}
+.vibeseg button.on[data-v=hype]{background:linear-gradient(90deg,#ff3d5a,#ff4fa3);color:#fff;box-shadow:0 0 14px #ff3d5a66}
 .stems{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
 .stem{position:relative;overflow:hidden;border-radius:8px;padding:9px 4px 11px;font-weight:800;font-size:10px;letter-spacing:.1em;background:#0d0f12;border:1px solid #000;box-shadow:0 1px 0 #ffffff10 inset;color:var(--dim)}
 .stem i{position:absolute;left:0;bottom:0;height:3px;width:calc(var(--g,1)*100%);background:var(--pc);transition:width .2s}
@@ -264,7 +273,8 @@ input[type=range]::-moz-range-thumb{background:linear-gradient(90deg,#8d939c,#e9
   </div>
   <div class="onair" id="onair"><i></i>OFF AIR</div>
   <button class="pill stemsw" id="stemsTop" title="Split songs into drums, bass, vocals and melody for stem controls and stem mixes">STEMS</button>
-  <button class="pill auto" id="autoTop" title="Auto DJ mixes the queue for you">AUTO DJ</button>
+  <button class="pill auto" id="autoTop" title="Auto DJ mixes the queue for you, in order">AUTO DJ</button>
+  <button class="pill real" id="realTop" title="Real DJ performs a set: picks songs from the queue, plays their best part, mashups, loop rolls and drops">REAL DJ</button>
   <button class="pill end" id="endBtn">END SET</button>
 </header>
 
@@ -456,8 +466,11 @@ function build(){
   for(const k of DECKS)$('.deck-'+k).innerHTML=deckHTML(k);
   $('#mixer').innerHTML=mixerHTML();
   $('#autodj').innerHTML=`<div class="headline"><div><div class="label">AUTO DJ</div><div style="font-weight:800;font-size:15px">Let the booth mix</div></div><button class="switch" id="autoSwitch" aria-label="Auto DJ"></button></div>
-    <div class="label">Transition</div><div class="chips" id="styleChips"></div>
-    <div class="row between med"><span class="label">Length</span><select id="autoBeats" style="padding:4px 6px"><option value="">Style default</option><option value="4">1 bar</option><option value="8">2 bars</option><option value="16">4 bars</option><option value="32">8 bars</option><option value="64">16 bars</option></select></div>
+    <div class="seg modeseg" id="autoMode" title="Auto DJ: plays the queue in order, smooth mixes. Real DJ: performs a set — picks songs, plays their best part, mashups and drops."><button data-v="auto">AUTO DJ</button><button data-v="real">REAL DJ</button></div>
+    <div class="seg modeseg vibeseg realonly" id="vibeSeg" title="How much Real DJ plays the decks: loops, effects, sampler, drops"><button data-v="chill">CHILL</button><button data-v="club">CLUB</button><button data-v="hype">HYPE</button></div>
+    <div class="realinfo" id="realInfo"></div>
+    <div class="smoothonly"><div class="label">Transition</div><div class="chips" id="styleChips"></div></div>
+    <div class="row between med smoothonly"><span class="label">Length</span><select id="autoBeats" style="padding:4px 6px"><option value="">Style default</option><option value="4">1 bar</option><option value="8">2 bars</option><option value="16">4 bars</option><option value="32">8 bars</option><option value="64">16 bars</option></select></div>
     <div class="next" id="nextUp">…</div>`;
   $('#sampler').innerHTML=`<div class="row between"><div class="label">SAMPLER</div>${knob({param:'sampler',label:'VOL',min:0,max:1,def:0.7,kind:'uni',cls:'adv'})}</div><div class="sgrid" id="sgrid"></div>`;
   $('#browser').innerHTML=`<div class="tabs"><button data-tab="queue" class="on">QUEUE</button><button data-tab="search">SEARCH</button><button data-tab="history">HISTORY</button></div>
@@ -558,7 +571,16 @@ function wire(){
   $('#mixBtn').onclick=()=>api({op:'mix',style:$('#mixStyle').value});
   $('#mixStyle').onchange=()=>api({op:'auto',style:$('#mixStyle').value});
   $('#stemsTop').onclick=()=>api({op:'stems',on:!S?.stems?.on}).then(r=>r&&toast(S?.stems?.on?'Stems on: songs get split into parts.':'Stems off.'));
-  $('#autoSwitch').onclick=$('#autoTop').onclick=()=>api({op:'auto',on:!S?.auto?.on});
+  $('#autoSwitch').onclick=()=>api({op:'auto',on:!S?.auto?.on});
+  // AUTO DJ and REAL DJ: press one to run it, press the lit one again to stop.
+  const modeBtn=(mode,msg)=>()=>{const a=S?.auto||{};const lit=a.on&&(a.mode||'auto')===mode;
+    if(lit)return api({op:'auto',on:false});
+    api({op:'auto',mode,on:true}).then(r=>r&&toast(msg))};
+  const VIBE_MSG={chill:'Chill: long smooth blends, few tricks.',club:'Club: loops, effects and drops most phrases.',hype:'Hype: tricks all the time, drops, sampler.'};
+  $$('#vibeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',vibe:b.dataset.v}).then(r=>r&&toast(VIBE_MSG[b.dataset.v])));
+  $('#autoTop').onclick=modeBtn('auto','Auto DJ: the queue in order, smooth mixes.');
+  $('#realTop').onclick=modeBtn('real','Real DJ: picking songs and playing their best parts.');
+  $$('#autoMode button').forEach(b=>b.onclick=()=>api({op:'auto',mode:b.dataset.v}).then(r=>r&&toast(b.dataset.v==='real'?'Real DJ: picking songs and playing the best parts.':'Auto DJ: the queue in order.')));
   $('#autoBeats').onchange=()=>api({op:'auto',beats:$('#autoBeats').value?+$('#autoBeats').value:null});
   $('#endBtn').onclick=()=>{if(confirm('End the DJ set? The room goes back to its normal queue.'))api({op:'stop'})};
   $$('#browser .tabs button').forEach(b=>b.onclick=()=>{$$('#browser .tabs button').forEach(x=>x.classList.toggle('on',x===b));$$('#browser [data-panel]').forEach(p=>p.classList.toggle('hide',p.dataset.panel!==b.dataset.tab))});
@@ -755,7 +777,7 @@ function renderMixer(){
   btn.disabled=!(other&&S.decks[other].loaded)||!!tr;
   btn.textContent=tr?(tr.started?'MIXING…':'ARMED'):(other?`MIX ${playing[0]} ▶ ${other}`:'MIX ▶');
   $('#trText').innerHTML=tr?`<b>${esc(tr.label)}</b> ${tr.from} → ${tr.to} · ${tr.started?Math.round(tr.progress*100)+'%':'starts in '+Math.max(0,Math.ceil(tr.starts_in_beats??0))+' beats'}`:
-    (S.auto.on?'<b>Auto DJ</b> is on. It mixes the next song in on a phrase.':'Load a song on each deck, then hit <b>MIX</b> or ride the crossfader.');
+    (S.auto.on?(S.auto.mode==='real'?'<b>Real DJ</b> is on. It plays each song\'s best part and mixes into the next one\'s big moment.':'<b>Auto DJ</b> is on. It mixes the next song in on a phrase.'):'Load a song on each deck, then hit <b>MIX</b> or ride the crossfader.');
   $('#trBar').style.width=tr&&tr.started?(tr.progress*100)+'%':'0';
   $('#trRight').textContent=tr?'':'';
   // Simple mode: hold-to-use FX pads on the master.
@@ -772,7 +794,18 @@ function renderMixer(){
 }
 function renderAuto(){
   const a=S.auto;
-  $('#autoSwitch').classList.toggle('on',a.on);$('#autoTop').classList.toggle('on',a.on);
+  const real=a.mode==='real';
+  document.body.classList.toggle('realmode',real);
+  $$('#autoMode button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.mode||'auto')));
+  $$('#vibeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.vibe||'club')));
+
+  const ri=$('#realInfo');
+  if(real&&a.real){const pl=a.real.plan;const lbl=pl?(pl.label||(CAT?.styles||[]).find(x=>x.id===pl.style)?.label||pl.style):null;
+    const html=`<div>Set energy now <b>${Math.round(a.real.energy_target*100)}%</b></div><div class="meter"><i style="width:${Math.round(a.real.energy_target*100)}%"></i></div>`
+      +(pl?`<div>Next mix: <b>${esc(lbl)}</b>${pl.ride?` · tempo ride ${pl.ride>0?'+':''}${pl.ride.toFixed(1)}%`:''}</div>${pl.why?`<div style="opacity:.7;font-size:12px">${esc(pl.why.replace(/ \(keys .*$/,''))}</div>`:''}`:(a.real.next?`<div>Loading <b>${esc(a.real.next)}</b>…</div>`:'<div>Picks the next song from the queue by tempo, key and mood, and plays its best part.</div>'));
+    if(ri._h!==html){ri._h=html;ri.innerHTML=html}}
+  else if(ri._h!==''){ri._h='';ri.innerHTML=''}
+  $('#autoSwitch').classList.toggle('on',a.on);$('#autoTop').classList.toggle('on',a.on&&!real);$('#realTop').classList.toggle('on',a.on&&real);
   const chips=$('#styleChips');
   if(CAT&&!chips.children.length){chips.innerHTML=CAT.styles.map(s=>`<button data-style="${s.id}">${esc(s.label)}</button>`).join('');
     $$('button',chips).forEach(b=>b.onclick=()=>api({op:'auto',style:b.dataset.style}))}
@@ -781,6 +814,7 @@ function renderAuto(){
   const next=S.crate[0];
   const tr=S.transition;
   let html=tr?`Mixing into <b>${esc(S.decks[tr.to].title||'deck '+tr.to)}</b>`:
+    real?(S.crate.length?`${S.crate.length} songs in the crate. Real DJ picks from all of them.`:'The crate is empty. Queue a playlist and Real DJ picks from it.'):
     (next?`Up next: <b>${esc(next.title||next.query)}</b>`:'The queue is empty. Add songs with <b>/play</b> or the search tab'+(S.kind==='discord'&&a.on?', or Smart Autoplay picks one.':'.'));
   $('#nextUp').innerHTML=html;
   const sg=$('#sgrid');

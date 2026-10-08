@@ -483,9 +483,10 @@ class RoomPublisher:
             except Exception:
                 # The queued song's stream link may have expired (403).
                 lookup = track.get("pageUrl") or track.get("query") or track.get("title")
-                if not (dj.resolver and lookup):
+                resolve = dj.fallback_resolver or dj.resolver
+                if not (resolve and lookup):
                     raise
-                resolved = await dj.resolver(lookup)
+                resolved = await resolve(lookup)
                 await stems.prepare(resolved["audio_url"], _mix_keys(track), track.get("title"),
                                     instrumental=True)
         except Exception as error:
@@ -822,6 +823,8 @@ class HuddleVoiceManager:
 
     #: How many queued placeholders to have resolved ahead of time.
     RESOLVE_AHEAD = 2
+    #: A placeholder that could not be found is not looked up again for this long.
+    RESOLVE_RETRY_SECONDS = 600
 
     def _resolve_upcoming(self, channel_id: str, player: dict):
         """Look up playlist placeholders just before they are needed."""
@@ -832,6 +835,10 @@ class HuddleVoiceManager:
             track_id = track.get("id")
             task = self.resolve_tasks.get(track_id)
             if task and not task.done():
+                continue
+            failures = self.__dict__.setdefault("resolve_failed", {})
+            if (index > 0 and time.monotonic() - failures.get(track_id, -1e9)
+                    < self.RESOLVE_RETRY_SECONDS):
                 continue
             self.resolve_tasks[track_id] = asyncio.create_task(
                 self._resolve_track(channel_id, track, current=index == 0)
@@ -845,6 +852,11 @@ class HuddleVoiceManager:
             await huddle.resolve(channel_id, track["id"])
         except Exception as error:
             logger.warning("Could not resolve %r: %s", track.get("title"), error)
+            failures = self.__dict__.setdefault("resolve_failed", {})
+            failures[track.get("id")] = time.monotonic()
+            if len(failures) > 200:
+                for key in sorted(failures, key=failures.get)[:100]:
+                    failures.pop(key, None)
             if current:
                 # Don't sit silently on a song that cannot be found.
                 try:

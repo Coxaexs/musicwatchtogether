@@ -30,6 +30,7 @@ import config
 import dj
 import huddle
 import mixer
+import stem_mixes
 import stems
 from music import Song, get_autocomplete_suggestions, state_store
 from security import SlidingWindowLimiter, client_identity
@@ -184,6 +185,15 @@ async def _entry_audio(entry, attempts=2):
                 raise
 
 
+async def _resolve_direct(query):
+    """A fresh link from the bot's own yt-dlp, skipping the helper.
+
+    Used for retries: links that stall or crawl come from the helper, while
+    yt-dlp's own links are not throttled.
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, _resolve_with_bot, query)
+
+
 #: entry key -> why it could not be analysed (shown in the editor)
 _mix_failures = {}
 
@@ -217,17 +227,20 @@ def _playlist_pin(guild_id, owner, name):
     return f'playlist:{guild_id}:{owner}:{name}'
 
 
-async def _prepare_entry(entry, force=False, pin_reason=None):
+async def _prepare_entry(entry, force=False, pin_reason=None, background=True):
     """Analysis (BPM, key, beat grid) plus stems and karaoke instrumental."""
     keys = _entry_keys(entry)
     if force:
         mixer.cache.drop(*keys)
         stems.forget(keys)
     for attempt in range(2):
-        source, _meta = await _entry_audio(entry)
+        if attempt:
+            source = (await _resolve_direct(huddle._playlist_track(entry)['query']))['audio_url']
+        else:
+            source, _meta = await _entry_audio(entry)
         try:
             await stems.prepare(source, keys, entry.get('title'), instrumental=True,
-                                pin_reason=pin_reason, background=True)
+                                pin_reason=pin_reason, background=background)
             return
         except Exception:
             # A throttled or expired stream link: drop it and fetch a fresh one.
@@ -250,6 +263,151 @@ async def _prepare_entries(job, entries, pin_reason, force=False):
         job['done'] += 1
     # Pins follow the playlist as it is now: removed songs are let go.
     stems.set_pins(pin_reason, [d for d in (stems.lookup(_entry_keys(e)) for e in entries) if d])
+
+
+#: Songs someone added to "Stemmed songs": track key -> {"title", "status"},
+#: status being queued, separating or failed. One song separates at a time.
+_stem_requests = {}
+_stem_queue = None
+STEMS_PIN = 'stems-playlist'
+
+
+async def _stem_worker():
+    while True:
+        entry, background = await _stem_queue.get()
+        key = _entry_keys(entry)[1]
+        request = _stem_requests.get(key)
+        if request:
+            request['status'] = 'separating'
+        try:
+            # Someone asked for these, so they don't wait behind a live DJ set;
+            # songs a stem mix borrowed do.
+            await _prepare_entry(entry, pin_reason=STEMS_PIN, background=background)
+            _stem_requests.pop(key, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(f"Could not separate {entry.get('title')!r}: {error}")
+            if request:
+                request['status'] = 'failed'
+        finally:
+            _stem_queue.task_done()
+
+
+def request_stems(entries, background=False):
+    """Queue songs for separation. Returns (queued, already had stems)."""
+    global _stem_queue
+    if _stem_queue is None:
+        _stem_queue = asyncio.Queue()
+        asyncio.ensure_future(_stem_worker())
+    queued = ready = 0
+    for entry in entries:
+        keys = _entry_keys(entry)
+        digest = stems.lookup(keys)
+        if digest and os.path.exists(stems.instrumental_path(digest)):
+            stems.pin(digest, STEMS_PIN)
+            ready += 1
+            continue
+        current = _stem_requests.get(keys[1])
+        if current and current['status'] != 'failed':
+            continue
+        _stem_requests[keys[1]] = {'title': entry.get('title') or 'Unknown', 'status': 'queued'}
+        _stem_queue.put_nowait((entry, background))
+        queued += 1
+    return queued, ready
+
+
+def _known_songs():
+    """(title, url) of songs people saved or played: playlists, favourites and
+    play history (skipping anything over 15 minutes, which isn't a song)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get('url') and node.get('title'):
+                found.append((node['title'], node['url']))
+            else:
+                for value in node.values():
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for name in ('playlists.json', 'favorites.json'):
+        try:
+            with open(os.path.join(here, name), encoding='utf-8') as handle:
+                walk(json.load(handle))
+        except (OSError, ValueError):
+            pass
+    try:
+        with open(os.path.join(here, 'stats.jsonl'), encoding='utf-8') as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get('url') and entry.get('title') and (entry.get('seconds') or 0) <= 15 * 60:
+                    found.append((entry['title'], entry['url']))
+    except OSError:
+        pass
+    return found
+
+
+def stem_mix_pool(library):
+    """Songs for stem_mixes.build: every stemmed song with an analysis, plus
+    analysed songs people saved or played that have no stems yet."""
+    pool, seen = [], set()
+    for song in library:
+        seen.update(song['keys'])
+        meta = mixer.cache.get(*song['keys']) or {}
+        if not song.get('youtube') or not meta.get('bpm'):
+            continue
+        pool.append({
+            'title': song['title'], 'url': f"https://www.youtube.com/watch?v={song['youtube']}",
+            'bpm': meta.get('bpm'), 'camelot': meta.get('camelot'), 'energy': meta.get('energy'),
+            'duration': meta.get('duration') or song['seconds'], 'stemmed': True, 'karaoke': song['karaoke'],
+        })
+    for title, url in _known_songs():
+        key = mixer.track_key(url)
+        if not key or not key.startswith('yt:') or key in seen:
+            continue
+        seen.add(key)
+        meta = mixer.cache.get(key) or {}
+        if not meta.get('bpm') or (meta.get('duration') or 0) > 10 * 60:
+            continue
+        pool.append({
+            'title': title, 'url': f"https://www.youtube.com/watch?v={key[3:]}",
+            'bpm': meta.get('bpm'), 'camelot': meta.get('camelot'), 'energy': meta.get('energy'),
+            'duration': meta.get('duration') or 0, 'stemmed': False, 'karaoke': False,
+        })
+    return pool
+
+
+def stem_mix_entries(mix):
+    """A stem mix as playlist entries; songs without stems yet are marked."""
+    return [{
+        'title': song['title'], 'url': song['url'], 'duration': _duration_text(song['duration']),
+        'source_type': 'youtube', 'thumbnail': _thumbnail_from_url(song['url']),
+        'karaoke': bool(song['karaoke']), 'stems': 'ready' if song['stemmed'] else 'pending',
+    } for song in mix['songs']]
+
+
+def _start_index(body, entries):
+    """Where a playlist starts playing: the double-clicked song, else the top.
+
+    The page sends the song's position and title; if the list moved since the
+    page drew it (a song finished separating, say), the title finds it again."""
+    try:
+        start = int(body.get('start') or 0)
+    except (TypeError, ValueError):
+        start = 0
+    if not 0 <= start < len(entries):
+        start = 0
+    title = body.get('start_title')
+    if title and entries and entries[start].get('title') != title:
+        start = next((i for i, entry in enumerate(entries) if entry.get('title') == title), 0)
+    return start
 
 
 def _prep_json(guild_id, name, entries):
@@ -347,6 +505,36 @@ def _duration_to_seconds(duration):
     return seconds
 
 
+STEMS_PLAYLIST = 'Stemmed songs'
+
+
+def _duration_text(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f'{hours}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes}:{seconds:02d}'
+
+
+def stems_playlist_entries(library):
+    """The automatic "Stemmed songs" playlist: every song that has stems and a
+    YouTube link to play it from, most recently used first. Songs only known by
+    a search (no YouTube id in the stems index) are left out, since there is
+    nothing exact to queue."""
+    entries = []
+    for song in library:
+        if not song.get('youtube'):
+            continue
+        url = f"https://www.youtube.com/watch?v={song['youtube']}"
+        entries.append({
+            'title': song['title'],
+            'url': url,
+            'duration': _duration_text(song['seconds']),
+            'source_type': 'youtube',
+            'thumbnail': _thumbnail_from_url(url),
+            'karaoke': bool(song.get('karaoke')),
+        })
+    return entries[:200]
+
+
 def _thumbnail_from_url(url, thumbnail=None):
     """Return stored art, or derive a stable YouTube thumbnail for older playlists."""
     if thumbnail:
@@ -431,8 +619,10 @@ class WebUI:
     def _supplied_token(request):
         # The DJ booth also sends its link token as a header, so it keeps
         # working where the SameSite cookie is not sent (embedded frames).
-        return (request.cookies.get('mb_session')
-                or request.headers.get('X-MB-Session', '').strip() or '')
+        # The header wins: a stale cookie from another room's link must not
+        # override the token of the page that is open now.
+        return (request.headers.get('X-MB-Session', '').strip()
+                or request.cookies.get('mb_session') or '')
 
     @staticmethod
     def _set_session_cookie(request, response, token):
@@ -1562,7 +1752,67 @@ class WebUI:
 
         items = {name: playlist_json(name, entries, 'shared', True) for name, entries in shared.items()}
         items.update({name: playlist_json(name, entries, str(user_id), False) for name, entries in own.items()})
-        return [items[name] for name in sorted(items, key=str.lower)]
+        result = [items[name] for name in sorted(items, key=str.lower) if name != STEMS_PLAYLIST]
+        stem_entries = stems_playlist_entries(self._stems_library)
+        pending = [dict(request) for request in _stem_requests.values()]
+        if stem_entries or pending or stems.enabled():
+            result.insert(0, {
+                'name': STEMS_PLAYLIST,
+                'count': len(stem_entries),
+                'cover': stem_entries[0]['thumbnail'] if stem_entries else None,
+                'custom_cover': False,
+                'shared': True,
+                'auto': 'stems',
+                'description': 'every song split into vocals, drums and bass for karaoke and the DJ booth, '
+                               'most recently used first',
+                'tracks': [dict(track_json(entry), karaoke=entry['karaoke']) for entry in stem_entries],
+                'pending': pending,
+            })
+            for offset, mix in enumerate(self._stem_mixes, 1):
+                entries = stem_mix_entries(mix)
+                result.insert(offset, {
+                    'name': mix['name'],
+                    'count': len(entries),
+                    'cover': entries[0]['thumbnail'] if entries else None,
+                    'custom_cover': False,
+                    'shared': True,
+                    'auto': 'mix',
+                    'description': mix['description'] + ' Made from your stems, new every day.',
+                    'tracks': [dict(track_json(entry), karaoke=entry['karaoke'], stems=entry['stems'])
+                               for entry in entries],
+                })
+        return result
+
+    #: Last read of stems.library(); refreshed off the event loop (it reads
+    #: every stems file header, which takes seconds on a cold disk).
+    _stems_library = []
+
+    #: The day's stem mixes, and what they were built from (rebuilt when the
+    #: library changes, the day turns, or every 10 minutes).
+    _stem_mixes = []
+    _stem_mixes_for = None
+
+    async def _refresh_stems_library(self):
+        loop = asyncio.get_running_loop()
+        try:
+            self._stems_library = await loop.run_in_executor(None, stems.library)
+        except Exception:
+            logger.warning('Could not read the stems library', exc_info=True)
+        stamp = (len(self._stems_library), time.strftime('%Y-%m-%d'), int(time.time() // 600))
+        if stamp != self._stem_mixes_for:
+            self._stem_mixes_for = stamp
+            try:
+                library = self._stems_library
+                self._stem_mixes = await loop.run_in_executor(
+                    None, lambda: stem_mixes.build(stem_mix_pool(library)))
+                # Songs a mix borrowed without stems get separated in the background.
+                missing = [entry for mix in self._stem_mixes for entry in stem_mix_entries(mix)
+                           if entry['stems'] == 'pending']
+                if missing and stems.enabled():
+                    request_stems(missing, background=True)
+            except Exception:
+                logger.warning('Could not build the stem mixes', exc_info=True)
+        return self._stems_library
 
     async def api_lyrics_search(self, request):
         """Lyrics for an arbitrary track, so Huddle rooms can show them too."""
@@ -1600,6 +1850,7 @@ class WebUI:
         })
 
     async def api_playlists(self, request):
+        await self._refresh_stems_library()
         requested = request.match_info.get('guild_id', '')
         if huddle.is_huddle_id(requested):
             user_id = self._get_acting_user_id(request)
@@ -1607,6 +1858,30 @@ class WebUI:
         guild, _player = self._get_guild_and_player(request)
         user_id = self._get_acting_user_id(request)
         return web.json_response({'playlists': self._playlist_json(guild.id, user_id)})
+
+    async def _search_songs(self, body, guild):
+        """Songs for a search, a YouTube/Spotify link or a playlist link, or an
+        error response to send back."""
+        query = (body.get('query') or '').strip()
+        if not query:
+            return web.json_response({'error': 'Search for a song first.'}, status=400)
+        try:
+            if 'spotify.com' in query or query.startswith('spotify:'):
+                if 'playlist' in query or 'album' in query:
+                    songs, _total = await self.cog.process_spotify_playlist_fast(query, guild.me)
+                else:
+                    songs = await self.cog.process_spotify(query, guild.me)
+            elif 'list=' in query:
+                songs, _total = await self.cog.process_youtube_playlist_fast(query, guild.me)
+            else:
+                song = await self.cog.process_youtube(query, guild.me)
+                songs = [song] if song else []
+        except Exception as error:
+            logger.error(f"Playlist search failed for {query!r}: {error}", exc_info=True)
+            return web.json_response({'error': str(error)}, status=500)
+        if not songs:
+            return web.json_response({'error': 'No songs found.'}, status=404)
+        return songs
 
     async def api_playlist_action(self, request):
         async with self._playlist_lock():
@@ -1653,6 +1928,55 @@ class WebUI:
         found_owner = cog.resolve_playlist_owner(data, guild.id, user_id, name)
         found_lists = cog._bucket_for(guild_data, found_owner) if found_owner else None
         imported_name = None
+
+        # The day's stem mixes play and queue like any playlist, and are never edited.
+        if name.startswith(stem_mixes.PREFIX):
+            if action not in ('load', 'play'):
+                return web.json_response({'error': f"{name} is made from your stems every day, so it can't be changed."},
+                                         status=400)
+            await self._refresh_stems_library()
+            mix = next((m for m in self._stem_mixes if m['name'] == name), None)
+            if not mix:
+                return web.json_response({'error': f'{name} is gone; today has new mixes.'}, status=404)
+            found_owner = 'shared'
+            found_lists = {name: stem_mix_entries(mix)}
+        # "Stemmed songs" builds itself: it can be played and queued, not edited.
+        if name == STEMS_PLAYLIST:
+            if action == 'add_song':
+                if not stems.enabled():
+                    return web.json_response({'error': 'Stem separation is off on this server.'}, status=409)
+                songs = await self._search_songs(body, guild)
+                if isinstance(songs, web.Response):
+                    return songs
+                queued, ready = request_stems([{
+                    'title': song.title,
+                    'url': song.url,
+                    'duration': song.duration,
+                    'source_type': song.source_type,
+                    'thumbnail': _thumbnail_from_url(song.url, song.thumbnail),
+                } for song in songs[:50]])
+                if queued == 1:
+                    message = f'Separating {songs[0].title}. It shows up in {STEMS_PLAYLIST} when it is ready.'
+                elif queued:
+                    message = f'Separating {queued} songs. Each shows up in {STEMS_PLAYLIST} when it is ready.'
+                elif ready:
+                    message = f'{songs[0].title} already has stems.' if ready == 1 else 'Those songs already have stems.'
+                else:
+                    message = 'Already separating that.'
+                return web.json_response({
+                    'message': message,
+                    'imported_name': None,
+                    'playlists': self._playlist_json(guild.id, user_id),
+                    'state': (await huddle.room_state(requested) if is_huddle
+                              else self._guild_state(guild, player)),
+                })
+            if action not in ('load', 'play'):
+                return web.json_response(
+                    {'error': f"{STEMS_PLAYLIST} fills itself with every song that has stems, so it can't be changed."},
+                    status=400,
+                )
+            found_owner = 'shared'
+            found_lists = {name: stems_playlist_entries(await self._refresh_stems_library())}
 
         if action == 'import_spotify':
             url = str(body.get('url') or '').strip()[:500]
@@ -1702,6 +2026,8 @@ class WebUI:
                 message += f' of {payload["total"]}'
             message += f' from Spotify as {imported_name}.'
         elif action == 'create':
+            if name.startswith(stem_mixes.PREFIX):
+                return web.json_response({'error': 'That name is kept for the daily stem mixes.'}, status=400)
             if found_owner:
                 return web.json_response({'error': f'A playlist named {name} already exists.'}, status=409)
             own_lists[name] = []
@@ -1743,25 +2069,9 @@ class WebUI:
             entries = found_lists.get(name) if found_lists is not None else None
             if entries is None:
                 return web.json_response({'error': f'No playlist named {name}.'}, status=404)
-            query = (body.get('query') or '').strip()
-            if not query:
-                return web.json_response({'error': 'Search for a song first.'}, status=400)
-            try:
-                if 'spotify.com' in query or query.startswith('spotify:'):
-                    if 'playlist' in query or 'album' in query:
-                        songs, _total = await self.cog.process_spotify_playlist_fast(query, guild.me)
-                    else:
-                        songs = await self.cog.process_spotify(query, guild.me)
-                elif 'list=' in query:
-                    songs, _total = await self.cog.process_youtube_playlist_fast(query, guild.me)
-                else:
-                    song = await self.cog.process_youtube(query, guild.me)
-                    songs = [song] if song else []
-            except Exception as error:
-                logger.error(f"Playlist search failed for {query!r}: {error}", exc_info=True)
-                return web.json_response({'error': str(error)}, status=500)
-            if not songs:
-                return web.json_response({'error': 'No songs found.'}, status=404)
+            songs = await self._search_songs(body, guild)
+            if isinstance(songs, web.Response):
+                return songs
             room = max(0, 200 - len(entries))
             songs = songs[:room]
             if not songs:
@@ -1795,14 +2105,17 @@ class WebUI:
             cover = cog.playlist_cover_url(guild.id, found_owner, name, entries)
             if cover and cover.startswith('/'):
                 cover = config.WEB_SERVER_URL.rstrip('/') + '/musicbot' + cover
+            specs = playlist_mix_specs(guild.id, found_owner, name, entries)
+            start = _start_index(body, entries)
             try:
-                await huddle.play_many(requested, entries, name, cover,
+                await huddle.play_many(requested, entries[start:], name, cover,
                                        start_now=action == 'play',
-                                       mixes=playlist_mix_specs(guild.id, found_owner, name, entries))
+                                       mixes=specs[start:] if specs else specs)
             except (KeyError, ValueError, RuntimeError) as error:
                 return web.json_response({'error': str(error) or 'Huddle room not found.'},
                                          status=400)
-            message = ('Playing' if action == 'play' else 'Added') + f' {name} ({len(entries)} songs).'
+            message = (f"Playing {name} from {entries[start].get('title', 'that song')}." if start
+                       else ('Playing' if action == 'play' else 'Added') + f' {name} ({len(entries)} songs).')
         elif action in ('load', 'play'):
             entries = found_lists.get(name) if found_lists is not None else None
             if entries is None:
@@ -1826,7 +2139,8 @@ class WebUI:
                 player.web_playlist_cover = cog.playlist_cover_url(guild.id, found_owner, name, entries)
                 player.web_playlist_started_at = time.time()
             specs = playlist_mix_specs(guild.id, found_owner, name, entries) or []
-            for index, entry in enumerate(entries):
+            start = _start_index(body, entries)
+            for index, entry in enumerate(entries[start:], start):
                 player.queue.append(Song(
                     title=entry.get('title', 'Unknown'),
                     url=entry['url'],
@@ -1847,7 +2161,8 @@ class WebUI:
                 vc.stop()
             elif not vc.is_playing() and not vc.is_paused():
                 await player.play_next()
-            message = ('Playing' if action == 'play' else 'Added') + f' {name} ({len(entries)} songs).'
+            message = (f"Playing {name} from {entries[start].get('title', 'that song')}." if start
+                       else ('Playing' if action == 'play' else 'Added') + f' {name} ({len(entries)} songs).')
         else:
             return web.json_response({'error': f'unknown playlist action {action!r}'}, status=400)
 
@@ -1955,6 +2270,7 @@ async def start_web_server(bot):
     app.router.add_get('/api/guilds/{guild_id}/dj', ui.api_dj_state)
     app.router.add_post('/api/guilds/{guild_id}/dj', ui.api_dj_action)
     dj.resolver = _resolve_audio
+    dj.fallback_resolver = _resolve_direct
     asyncio.ensure_future(_warm_top_songs())
     app.router.add_get('/api/autocomplete', ui.api_autocomplete)
     app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
@@ -2216,7 +2532,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .track-head, .playlist-track { display:grid; grid-template-columns:34px minmax(220px,2fr) minmax(120px,1fr) 90px 42px;
     gap:12px; align-items:center; padding:10px 8px; }
   .track-head { color:var(--muted); font-size:12px; border-bottom:1px solid var(--border2); }
-  .playlist-track { border-radius:9px; }
+  .playlist-track { border-radius:9px; user-select:none; }
+  .playlist-track.pending { opacity:.75; }
   .playlist-track:hover { background:var(--panel2); }
   .track-main { display:flex; align-items:center; gap:11px; min-width:0; }
   .track-art { position:relative; flex:0 0 44px; width:44px; height:44px; display:grid; place-items:center;
@@ -2591,11 +2908,11 @@ function playlistCardsHTML() {
     return `<article class="playlist-card ${playlist.cover ? '' : 'no-cover'}" tabindex="0" onclick="openPlaylist(${index})" onkeydown="if(event.key==='Enter')openPlaylist(${index})">
       <div class="playlist-disc"><div class="cover"${cover}></div></div>
       <div class="playlist-name">${esc(playlist.name)}</div>
-      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'}${playlist.shared ? ' · shared' : ''}</div>
+      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'}${playlist.auto ? ' · automatic' : playlist.shared ? ' · shared' : ''}</div>
       <div class="playlist-actions">
         <button class="primary" onclick="event.stopPropagation();playlistByIndex('play',${index})">▶ Play</button>
         <button onclick="event.stopPropagation();playlistByIndex('load',${index})">＋ Queue</button>
-        <button class="danger" onclick="event.stopPropagation();deletePlaylist(${index})" title="Delete playlist">✕</button>
+        ${playlist.auto ? '' : `<button class="danger" onclick="event.stopPropagation();deletePlaylist(${index})" title="Delete playlist">✕</button>`}
       </div></article>`;
   }).join('');
 }
@@ -2628,27 +2945,34 @@ function renderPlaylistPage() {
       <div class="playlist-grid">${playlistCardsHTML()}</div></section>`;
   } else {
     const cover = playlist.cover ? `style="background-image:url('${cssUrl(mediaUrl(playlist.cover))}')"` : '';
-    if (!mixData || mixData.name !== playlist.name) loadMix(playlist.name);
+    if (!playlist.auto && (!mixData || mixData.name !== playlist.name)) loadMix(playlist.name);
     const mix = mixData && mixData.name === playlist.name ? mixData : null;
     const mixing = Boolean(mix && mix.enabled);
     const rows = playlist.tracks.length ? playlist.tracks.map((track, index) => {
       const info = mixing ? (mix.tracks[index] || {}) : null;
       const middle = mixing
         ? `<div class="bpm">${info.bpm || '···'}</div><div>${camelotBadge(info.camelot)}</div>`
-        : `<div class="track-source">${esc(track.source_type === 'spotify' ? 'Spotify' : 'YouTube')}</div>`;
-      const row = `<div class="playlist-track${mixing ? ' mixed' : ''}">
+        : playlist.auto
+          ? `<div class="track-source">${track.stems === 'pending' ? '⏳ Stems on the way' : track.karaoke ? '🎤 Karaoke ready' : 'Stems'}</div>`
+          : `<div class="track-source">${esc(track.source_type === 'spotify' ? 'Spotify' : 'YouTube')}</div>`;
+      const row = `<div class="playlist-track${mixing ? ' mixed' : ''}" ondblclick="playFromTrack(${index})" title="Double-click to play from here">
       <div class="track-number">${index + 1}</div>
       <div class="track-main"><span class="track-art ${track.thumbnail ? '' : 'missing'}">${track.thumbnail ? `<img src="${esc(mediaUrl(track.thumbnail))}" alt="" onerror="this.parentElement.classList.add('missing');this.remove()">` : ''}</span><div class="track-title">${esc(track.title)}</div></div>
       ${middle}
       <div class="track-duration">${esc(track.duration)}</div>
-      <button class="danger" onclick="removePlaylistSong(${index})" title="Remove song">✕</button>
+      ${playlist.auto ? '<span></span>' : `<button class="danger" onclick="removePlaylistSong(${index})" title="Remove song">✕</button>`}
     </div>`;
       const transition = mixing && mix.transitions[index] ? transitionChip(mix.transitions[index]) : '';
       return row + transition;
     }).join('') : '<div class="empty">This playlist is empty. Search above to add its first song.</div>';
+    const pendingRows = playlist.auto ? (playlist.pending || []).map(item => `<div class="playlist-track pending">
+      <div class="track-number">·</div>
+      <div class="track-main"><span class="track-art missing"></span><div class="track-title">${esc(item.title)}</div></div>
+      <div class="track-source">${item.status === 'separating' ? '⏳ Separating…' : item.status === 'failed' ? "⚠ Couldn't separate" : 'Queued'}</div>
+      <div class="track-duration"></div><span></span></div>`).join('') : '';
     const head = mixing
       ? '<div class="track-head mixed"><span>#</span><span>Title</span><span>BPM</span><span>Key</span><span>Duration</span><span></span></div>'
-      : '<div class="track-head"><span>#</span><span>Title</span><span>Source</span><span>Duration</span><span></span></div>';
+      : `<div class="track-head"><span>#</span><span>Title</span><span>${playlist.auto ? 'Stems' : 'Source'}</span><span>Duration</span><span></span></div>`;
     const analysis = mix && mix.analysis;
     const failed = (analysis && analysis.failed) || [];
     const progress = !mixing || !analysis || analysis.done >= analysis.total ? ''
@@ -2661,20 +2985,21 @@ function renderPlaylistPage() {
     const editing = mixing && mixEditIndex !== null && mix.transitions[mixEditIndex];
     html = `<section class="card playlist-page"><div class="playlist-hero">
       <div class="playlist-cover-large ${playlist.cover ? '' : 'empty'}" ${cover}>
-        <label class="cover-upload">▣ Change photo<input type="file" accept="image/png,image/jpeg,image/webp" onchange="uploadPlaylistCover(this.files[0])"></label>
-      </div><div><div class="playlist-eyebrow">Playlist</div><h2>${esc(playlist.name)}</h2>
-      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'} · ${playlist.shared ? 'shared with the server' : 'your library'}</div></div></div>
+        ${playlist.auto ? '' : '<label class="cover-upload">▣ Change photo<input type="file" accept="image/png,image/jpeg,image/webp" onchange="uploadPlaylistCover(this.files[0])"></label>'}
+      </div><div><div class="playlist-eyebrow">${playlist.auto ? 'Automatic playlist' : 'Playlist'}</div><h2>${esc(playlist.name)}</h2>
+      <div class="playlist-meta">${playlist.count} song${playlist.count === 1 ? '' : 's'} · ${playlist.auto ? esc(playlist.description || '') : playlist.shared ? 'shared with the server' : 'your library'}</div></div></div>
       <div class="playlist-body"><div class="playlist-toolbar">
         <button class="playlist-play" onclick="playlistAction('play',openPlaylistName)" title="Play playlist">▶</button>
         <button onclick="playlistAction('load',openPlaylistName)">＋ Add to queue</button>
         <button onclick="openPlaylistName=null;render()">← Library</button>
-        ${mixButtons}
-        <div class="playlist-add"><input id="playlistSongSearch" list="playlistSuggestions" placeholder="Search a song or paste a Spotify / YouTube link" oninput="handleAutocomplete(this.value,'playlistSuggestions')" onkeydown="if(event.key==='Enter')addSongToPlaylist()">
-          <datalist id="playlistSuggestions"></datalist><button class="primary" onclick="addSongToPlaylist()">＋ Add song</button></div>
-      </div><div class="mix-layout${editing ? ' editing' : ''}"><div>${head}${rows}</div>${editing ? mixEditorHTML(mix) : ''}</div></div>
+        ${playlist.auto ? '' : mixButtons}
+        ${playlist.auto === 'mix' ? '' : `<div class="playlist-add"><input id="playlistSongSearch" list="playlistSuggestions" placeholder="${playlist.auto ? 'Add a song to split it into stems' : 'Search a song or paste a Spotify / YouTube link'}" oninput="handleAutocomplete(this.value,'playlistSuggestions')" onkeydown="if(event.key==='Enter')addSongToPlaylist()">
+          <datalist id="playlistSuggestions"></datalist><button class="primary" onclick="addSongToPlaylist()">＋ Add song</button></div>`}
+      </div><div class="mix-layout${editing ? ' editing' : ''}"><div>${head}${pendingRows}${rows}</div>${editing ? mixEditorHTML(mix) : ''}</div></div>
     </section>`;
   }
   content.innerHTML = html + playerControlsHTML(state);
+  scheduleStemsPoll(playlist);
   const restored = document.getElementById('playlistSongSearch');
   if (restored) { restored.value = oldValue; if (wasFocused) restored.focus(); }
   const restoredSpotify = document.getElementById('spotifyImportUrl');
@@ -2934,6 +3259,25 @@ function addSongToPlaylist() {
   if (!query) { toast('Search for a song first.'); if (input) input.focus(); return; }
   toast('⏳ Finding that song…');
   playlistAction('add_song', openPlaylistName, {query});
+}
+function playFromTrack(index) {
+  if (window.getSelection) window.getSelection().removeAllRanges();
+  const playlist = playlists.find(item => item.name === openPlaylistName);
+  const track = playlist && playlist.tracks[index];
+  playlistAction('play', openPlaylistName, {start: index, start_title: track ? track.title : undefined});
+}
+// While songs added to "Stemmed songs" are separating, refresh it every few seconds.
+let stemsPoll = null;
+function scheduleStemsPoll(playlist) {
+  clearTimeout(stemsPoll);
+  if (!playlist || !playlist.auto || !(playlist.pending || []).some(item => item.status !== 'failed')) return;
+  stemsPoll = setTimeout(async () => {
+    try {
+      const res = await api(basePath + 'api/guilds/' + selected + '/playlists');
+      playlists = res.playlists || playlists;
+      if (openPlaylistName === playlist.name) renderPlaylistPage();
+    } catch (e) {}
+  }, 4000);
 }
 function removePlaylistSong(index) {
   playlistAction('remove_song', openPlaylistName, {index});

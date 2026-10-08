@@ -38,6 +38,7 @@ import numpy as np
 from scipy import signal
 
 import mixer
+import realdj
 import stems
 
 logger = logging.getLogger("MusicBot.DJ")
@@ -66,8 +67,20 @@ STYLES = {
     "spinback": ("Spinback", 4),
     "stem_swap": ("Stem swap", 32),
     "acapella": ("Acapella over", 32),
+    "drum_bridge": ("Drum bridge", 32),
+    "mashup": ("Mashup", 64),
+    "loop_roll": ("Loop roll drop", 8),
 }
-STEM_STYLES = ("stem_swap", "acapella")
+STEM_STYLES = ("stem_swap", "acapella", "drum_bridge", "mashup")
+# Styles where both songs play over each other for a while; Auto DJ tries to
+# place these where the outgoing song has no vocal.
+OVERLAP_STYLES = ("blend", "fade", "filter", "stem_swap", "drum_bridge")
+# A routine is a transition scripted as keyframes (Real DJ's back and forth,
+# hook teases): it isn't in STYLES because only a plan can supply the script.
+ROUTINE = "routine"
+SCRIPT_CONTROLS = ("xf",) + tuple(f"{side}.{stem}" for side in ("out", "in") for stem in stems.CONTROLS)
+SCRIPT_START = dict({"xf": 0.0}, **{f"out.{stem}": 1.0 for stem in stems.CONTROLS},
+                    **{f"in.{stem}": 0.0 for stem in stems.CONTROLS})
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dj_settings.json")
 SAMPLES = ("horn", "siren", "rewind", "laser", "boom", "clap", "riser", "scratch")
 
@@ -379,7 +392,9 @@ def decode_track(source):
     """Whole track as int16 (n, 2) at 48 kHz."""
     command = ["ffmpeg", "-nostdin", "-loglevel", "error"]
     if str(source).startswith(("http://", "https://")):
-        command += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3"]
+        # A stalled stream fails after 20 s instead of hanging to the timeout.
+        command += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3",
+                    "-rw_timeout", "20000000"]
     command += ["-i", str(source), "-vn", "-t", str(MAX_TRACK_SECONDS),
                 "-f", "s16le", "-ac", "2", "-ar", str(SR), "pipe:1"]
     result = subprocess.run(command, capture_output=True, timeout=240)
@@ -802,8 +817,11 @@ class Transition:
         self.elapsed = 0.0             # beats since the start
         self.done = False
         self.label = STYLES.get(style, (style,))[0]
+        self.samples = {}              # sampler hits: {"start": name, "drop": name}
+        self.script = None             # keyframes, for a routine
         # Brake/spinback stop the old track before the new one drops.
-        self.in_delay = 2 if style in ("brake", "spinback") else 0
+        self.in_delay = (2 if style in ("brake", "spinback")
+                         else self.beats if style == "loop_roll" else 0)
 
     @property
     def progress(self):
@@ -815,6 +833,26 @@ class Transition:
                 "progress": round(self.progress, 3),
                 "starts_in_beats": (None if self.started or self.start_beat is None
                                     else round(self.start_beat - self.out.beat_at(self.out.seconds), 2))}
+
+
+def script_at(script, beat):
+    """Every routine control at `beat` beats into a script.
+
+    A script is a list of keyframes {"at": beat, "ramp": beats, "set": {control:
+    value}} in time order. Controls are "xf" (0 = all outgoing, 1 = all
+    incoming) and "out.<stem>" / "in.<stem>" stem levels; they start at
+    SCRIPT_START. Each keyframe glides its controls from wherever they were to
+    the new value over `ramp` beats (an S-curve), starting at `at`.
+    """
+    values = dict(SCRIPT_START)
+    for frame in script:
+        if beat < frame["at"]:
+            break
+        ramp = frame.get("ramp") or 0
+        q = 1.0 if ramp <= 0 else _smooth((beat - frame["at"]) / ramp)
+        for control, target in frame["set"].items():
+            values[control] = values[control] + (target - values[control]) * q
+    return values
 
 
 def _xfader_toward(side_in, q):
@@ -832,9 +870,12 @@ def choose_style(out_deck, in_deck):
     energy_out = out_deck.meta.get("energy") or 0.5
     energy_in = in_deck.meta.get("energy") or 0.5
     if out_deck.has_stems and in_deck.has_stems:
-        # With stems the parts can be traded one at a time, so a vocal on
-        # the outgoing song can ride over the new one's instrumental.
-        if keys_ok and out_deck.bpm:
+        # With stems the parts can be traded one at a time.
+        if not keys_ok:
+            # Clashing keys: only the drums (which have no key) overlap.
+            return "drum_bridge"
+        if out_deck.bpm:
+            # A vocal on the outgoing song can ride over the new instrumental.
             end = out_deck.music_end()
             vocal = out_deck.stem_presence("vocals", end - 32 * out_deck.beat_seconds, end)
             if vocal is not None and vocal > 0.3:
@@ -842,9 +883,48 @@ def choose_style(out_deck, in_deck):
         return "stem_swap"
     if keys_ok and min(energy_out, energy_in) > 0.45:
         return "blend"
-    if energy_in - energy_out > 0.25:
+    if energy_in - energy_out > 0.25 or not keys_ok:
         return "filter"
     return "fade"
+
+
+def auto_beats(style, out_deck, in_deck):
+    """Transition length: a key clash without stems is kept short."""
+    beats = STYLES[style][1]
+    clash = mixer.key_distance(out_deck.meta.get("camelot"), in_deck.meta.get("camelot")) > 1
+    if clash and style in ("fade", "filter", "blend"):
+        return min(beats, 8)
+    return beats
+
+
+def mix_out_beat(out_deck, style, beats, end_beat, current):
+    """Where (in beats) Auto DJ starts the mix: on a phrase, quietest vocals.
+
+    Without stems: the last 8-beat phrase that leaves room for the
+    transition before the music ends (what it always did). With stems, the
+    candidate phrases in the last ~64 beats are scored by how much the
+    outgoing vocal sings over the transition, so two singers don't overlap.
+    """
+    tail = beats if style not in ("echo", "cut", "brake", "spinback") else max(2, beats // 2)
+    latest = math.floor((end_beat - tail) / 8) * 8
+    if style not in OVERLAP_STYLES or not out_deck.has_stems or not out_deck.bpm:
+        return latest
+    best, best_score = latest, None
+    for back in range(0, 72, 8):
+        start = latest - back
+        if start <= current + 4:
+            break
+        t0 = out_deck.time_of_beat(start)
+        vocal = out_deck.stem_presence("vocals", t0, t0 + beats * out_deck.beat_seconds)
+        if vocal is None:
+            continue
+        # Each phrase earlier costs a little: don't cut a song short for nothing.
+        score = vocal + back * 0.004
+        if best_score is None or score < best_score - 1e-6:
+            best, best_score = start, score
+        if vocal < 0.12 and back == 0:
+            break
+    return best
 
 
 # --------------------------------------------------------------------------
@@ -866,6 +946,10 @@ class DJEngine:
         self.transition = None
         self.tempo_release = None    # (deck, pitch at start, beats, elapsed)
         self.events = []             # ("ended", deck) / ("transition_done", tr) for Auto DJ
+        # Beat-timed touches (Real DJ): [deck name, start beat, end beat,
+        # on(), off(), state] run on that deck's own beat clock.
+        self.automations = []
+        self.timers = []             # [audio time due, fn]: schedule_after()
         self.frames = 0
         self.last_render = 0.0
 
@@ -983,6 +1067,8 @@ class DJEngine:
             # the repeats ring out over the new track's first bars.
             if tr.elapsed >= 0.75 and out.fader:
                 out.fader = 0.0
+                if tr.samples.get("drop"):
+                    self.play_sample(tr.samples["drop"])
                 if self.fx.on and self.fx.target == out.name:
                     self.fx.set_on(False, self.clock()[0])
             if p > 0.5:
@@ -998,6 +1084,16 @@ class DJEngine:
             out.stem_gain.update(vocals=1 - _smooth((p - 0.2) / 0.25), bass=1 - swap,
                                  other=1 - _smooth((p - 0.55) / 0.25),
                                  drums=1 - _smooth((p - 0.7) / 0.2))
+        elif style == "drum_bridge":
+            # Keys clash, so the melodies never overlap: the new drums come in
+            # under the old song, the old music and vocal leave, the bass
+            # swaps on the halfway downbeat, then the new music and vocal.
+            self.xfader = _xfader_toward(side, 0.5 * _smooth(p / 0.06) + 0.5 * _smooth((p - 0.9) / 0.1))
+            swap = _smooth((p - 0.48) / 0.04)
+            inn.stem_gain.update(drums=_smooth(p / 0.2), bass=swap,
+                                 other=_smooth((p - 0.55) / 0.2), vocals=_smooth((p - 0.8) / 0.15))
+            out.stem_gain.update(other=1 - _smooth((p - 0.2) / 0.28), vocals=1 - _smooth((p - 0.15) / 0.3),
+                                 bass=1 - swap, drums=1 - _smooth((p - 0.65) / 0.25))
         elif style == "acapella":
             # The old song's vocal rides on over the new song's instrumental,
             # then the new vocal takes over at the end.
@@ -1007,18 +1103,109 @@ class DJEngine:
             out.stem_gain.update(bass=1 - swap, drums=1 - _smooth((p - 0.3) / 0.12),
                                  other=1 - _smooth((p - 0.3) / 0.2),
                                  vocals=1 - _smooth((p - 0.72) / 0.16))
+        elif style == "mashup":
+            # A long acapella-over: the new instrumental comes up under the
+            # old vocal and they ride together, then the new vocal takes over.
+            self.xfader = _xfader_toward(side, 0.5 * _smooth(p / 0.2) + 0.5 * _smooth((p - 0.9) / 0.1))
+            swap = _smooth((p - 0.25) / 0.03)
+            inn.stem_gain.update(drums=_smooth(p / 0.12), other=_smooth((p - 0.06) / 0.15), bass=swap,
+                                 vocals=_smooth((p - 0.86) / 0.1))
+            out.stem_gain.update(bass=1 - swap, drums=1 - _smooth((p - 0.22) / 0.1),
+                                 other=1 - _smooth((p - 0.18) / 0.15),
+                                 vocals=1 - _smooth((p - 0.8) / 0.1))
+        elif style == "loop_roll":
+            # The old song is caught in a loop that halves every couple of
+            # beats while a high-pass opens up; the new song drops on the one.
+            if out.loop_in is not None and out.playing:
+                left = tr.beats - tr.elapsed
+                size = 4 if left > 6 else 2 if left > 4 else 1 if left > 2 else 0.5 if left > 1 else 0.25
+                out.loop_out = out.loop_in + size * out.beat_seconds
+                out.loop_on = True
+            out.color_fx = "filter"
+            out.color = 0.9 * _smooth(p)
+            if tr.elapsed >= tr.beats - 0.5 and not self.fx.on:
+                self.fx.type, self.fx.beat, self.fx.level, self.fx.target = "echo", 2, 0.6, out.name
+                self.fx.set_on(True, self.clock()[0])
+            if not inn.playing and tr.elapsed >= tr.in_delay:
+                out.playing = False
+                self.fx.set_on(False, self.clock()[0])
+                self._drop_in(inn)
+                self.xfader = _xfader_toward(side, 1.0)
+                if tr.samples.get("drop"):
+                    self.play_sample(tr.samples["drop"])
         elif style in ("brake", "spinback"):
             if not inn.playing and tr.elapsed >= tr.in_delay:
                 self._drop_in(inn)
                 self.xfader = _xfader_toward(side, 1.0)
+        elif style == ROUTINE:
+            self._apply_script(tr, side, tr.elapsed)
         # "cut" happens entirely in _start_transition
         if p >= 1:
             self._finish_transition(tr)
 
+    def _apply_script(self, tr, side, beat):
+        values = script_at(tr.script or [], beat)
+        self.xfader = _xfader_toward(side, values["xf"])
+        for deck, prefix in ((tr.out, "out."), (tr.inn, "in.")):
+            deck.stem_gain.update({stem: _clamp(values[prefix + stem], 0.0, 1.0) for stem in stems.CONTROLS})
+
+    def schedule(self, deck_name, start_beat, end_beat, on, off):
+        """Run on() when deck_name reaches start_beat and off() at end_beat."""
+        self.automations.append([deck_name, start_beat, end_beat, on, off, "waiting"])
+
+    def schedule_after(self, seconds, fn):
+        """Run fn after this many seconds of rendered audio."""
+        self.timers.append([self.frames * BLOCK / SR + seconds, fn])
+
+    def _run_timers(self):
+        if not self.timers:
+            return
+        now = self.frames * BLOCK / SR
+        due = [t for t in self.timers if t[0] <= now]
+        self.timers = [t for t in self.timers if t[0] > now]
+        for _at, fn in due:
+            fn()
+
+    def play_sample(self, name):
+        bank = sample_bank()
+        if name in bank:
+            self.voices.append([bank[name], 0])
+            self.voices = self.voices[-6:]
+
+    def _run_automations(self):
+        if not self.automations:
+            return
+        keep = []
+        for item in self.automations:
+            name, start, end, on, off, state = item
+            deck = self.decks[name]
+            if not deck.loaded or not deck.playing:
+                if state == "on":
+                    off()
+                continue                # its song left the air: drop it
+            beat = deck.beat_at(deck.seconds)
+            if state == "waiting" and beat >= start:
+                if beat < end:
+                    on()
+                    item[5] = state = "on"
+                else:
+                    continue            # missed it (a seek): skip
+            if state == "on" and beat >= end:
+                off()
+                continue
+            keep.append(item)
+        self.automations = keep
+
     def _start_transition(self, tr):
         out, inn = tr.out, tr.inn
         tr.started = True
-        if tr.style in STEM_STYLES and not (out.has_stems and inn.has_stems):
+        if tr.samples.get("start"):
+            self.play_sample(tr.samples["start"])
+        if tr.samples.get("drop") and tr.style == "cut":
+            self.play_sample(tr.samples["drop"])
+        if (tr.style in STEM_STYLES or tr.style == ROUTINE) and not (out.has_stems and inn.has_stems):
+            if tr.style == ROUTINE:
+                tr.beats = 32
             tr.style = "blend"         # stems not ready (yet): the EQ version
             tr.label = STYLES["blend"][0]
         side = inn.xf if inn.xf in ("A", "B") else ("B" if inn.name == "B" else "A")
@@ -1031,13 +1218,23 @@ class DJEngine:
         if tr.style == "filter":
             inn.color_fx = "filter"
             inn.color = -0.8
-        if tr.style == "stem_swap":
+        if tr.style in ("stem_swap", "drum_bridge"):
             inn.stem_gain.update(drums=0.0, bass=0.0, other=0.0, vocals=0.0)
         if tr.style == "acapella":
             inn.stem_gain.update(drums=1.0, bass=0.0, other=1.0, vocals=0.0)
+        if tr.style == "mashup":
+            inn.stem_gain.update(drums=0.0, bass=0.0, other=0.0, vocals=0.0)
+        if tr.style == "loop_roll":
+            out.loop_in = out.snap(out.seconds, force=True)
+            out.loop_out = out.loop_in + 4 * out.beat_seconds
+            out.loop_on = True
+        if tr.style == ROUTINE:
+            self._apply_script(tr, side, 0.0)
         if not inn.playing and not tr.in_delay:
             self._drop_in(inn)
-        if tr.style == "echo":
+        if tr.style == ROUTINE:
+            pass
+        elif tr.style == "echo":
             self.fx.set_on(False, self.clock()[0])
             self.fx.tail = 0
             self.fx.type = "echo"
@@ -1098,6 +1295,8 @@ class DJEngine:
             beat_step = BLOCK / SR / beat_seconds
             self._run_transition(beat_step)
             self._run_tempo_release(beat_step)
+            self._run_automations()
+            self._run_timers()
             mix = np.zeros((BLOCK, 2), np.float32)
             fx_target = self.fx.target
             for deck in self.decks.values():
@@ -1161,8 +1360,13 @@ class DJEngine:
 
 #: guild key (str(guild.id) or "huddle:<channel>") -> DJSession
 sessions = {}
+# Background stem work waits while any booth is on air.
+stems.pause_background = lambda: any(s.live and s.active for s in list(sessions.values()))
+
 #: async (query) -> {"audio_url", "page_url", "title"?, ...}; set by webui
 resolver = None
+#: same, but straight from the bot's yt-dlp; used to retry a failed link
+fallback_resolver = None
 
 
 class DiscordCrate:
@@ -1266,6 +1470,9 @@ class DJSession:
         self.crate = crate
         self.engine = DJEngine()
         self.auto = auto
+        self.mode = "auto"               # auto (smooth queue) | real (Real DJ set)
+        self.real = None                 # realdj.RealDJ while mode == "real"
+        self.vibe = "club"               # Real DJ: chill | club | hype
         self.auto_style = "auto"
         self.auto_beats = None           # None = the style's default
         self.history = []
@@ -1296,10 +1503,20 @@ class DJSession:
             deck.loading = item.get("title") or item.get("query") or "Loading"
             deck.error = None
         started = started or time.monotonic()
+        cached_stems = None
         try:
             source = item.get("file") or item.get("audio_url")
             keys = [k for k in (item.get("keys") or []) if k]
-            if not source:
+            loop = asyncio.get_running_loop()
+            local = None
+            if keys and not item.get("file") and stems.enabled() and self.stems_on:
+                local = await loop.run_in_executor(None, stems.local_audio, keys)
+            if local:
+                # Prepared song: rebuilt from the stems cache, no download.
+                audio, cached_stems = local
+                source = None
+                logger.info("DJ %s: %r rebuilt from the stems cache", self.key, item.get("title"))
+            elif not source:
                 if not resolver:
                     raise RuntimeError("Song lookup is not available.")
                 resolved = await resolver(item.get("query") or item.get("title"))
@@ -1308,18 +1525,18 @@ class DJSession:
                 item = {**item, "title": item.get("title") or resolved.get("title") or item.get("query"),
                         "artist": item.get("artist") or resolved.get("artist"),
                         "thumbnail": item.get("thumbnail") or resolved.get("thumbnail")}
-            loop = asyncio.get_running_loop()
             try:
-                audio = await loop.run_in_executor(None, decode_track, source)
+                if source is not None:
+                    audio = await loop.run_in_executor(None, decode_track, source)
             except Exception as error:
-                # A stream link resolved a while ago (e.g. a queued Huddle
-                # song) expires: YouTube answers 403. Look the song up again.
+                # Stream links expire (YouTube answers 403) or get throttled:
+                # look the song up again and try once more.
                 lookup = item.get("query") or item.get("title")
-                if item.get("file") or not item.get("audio_url") or not resolver or not lookup:
+                if item.get("file") or not resolver or not lookup:
                     raise
                 logger.info("DJ %s: stream for %r failed (%s), resolving it again",
                             self.key, item.get("title"), str(error)[-80:])
-                resolved = await resolver(lookup)
+                resolved = await (fallback_resolver or resolver)(lookup)
                 source = resolved["audio_url"]
                 keys.append(mixer.track_key(resolved.get("page_url")))
                 audio = await loop.run_in_executor(None, decode_track, source)
@@ -1334,8 +1551,9 @@ class DJSession:
             if deck.load_token != token:
                 return
             deck.audio = audio
-            deck.stems = None
-            deck.stems_status = "separating" if self._stems_wanted() else None
+            deck.stems = cached_stems
+            deck.stems_status = ("ready" if cached_stems is not None
+                                 else "separating" if self._stems_wanted() else None)
             deck.meta = dict(meta)
             deck.wave = wave
             deck.wave_id += 1
@@ -1368,7 +1586,7 @@ class DJSession:
             del self.history[30:]
         logger.info("DJ %s: deck %s loaded %r (%s bpm, %s)", self.key, deck_name,
                     item.get("title"), meta.get("bpm"), meta.get("camelot"))
-        if self._stems_wanted():
+        if self._stems_wanted() and cached_stems is None:
             self.stem_tasks[deck_name] = asyncio.create_task(self._separate(deck, token, audio))
 
     def _stems_wanted(self):
@@ -1540,6 +1758,11 @@ class DJSession:
             events, engine.events = engine.events, []
         if not self.auto or not self.live:
             return
+        if self.mode == "real":
+            if self.real is None:
+                self.real = realdj.RealDJ(self, vibe=self.vibe)
+            await self.real.tick()
+            return
         with engine.lock:
             decks = engine.decks
             playing = [d for d in decks.values() if d.playing]
@@ -1577,15 +1800,14 @@ class DJSession:
             style = self.auto_style
             if style == "auto":
                 style = choose_style(m, other)
-            beats = self.auto_beats or STYLES[style][1]
+            beats = self.auto_beats or auto_beats(style, m, other)
             if other.bpm and m.bpm:
                 ratio = mixer.tempo_ratio(m.live_bpm(), other.bpm)
                 other.sync = bool(ratio and abs(ratio - 1) <= 0.08)
             if m.bpm:
                 end_beat = m.beat_at(m.music_end())
-                tail = beats if style not in ("echo", "cut", "brake", "spinback") else max(2, beats // 2)
-                start_beat = math.floor((end_beat - tail) / 8) * 8
                 current = m.beat_at(m.seconds)
+                start_beat = mix_out_beat(m, style, beats, end_beat, current)
                 if m.loop_on:
                     return  # the DJ is holding a loop; wait for them
                 if start_beat <= current:
@@ -1637,6 +1859,18 @@ class DJSession:
             self.set_stems(body.get("on", not self.stems_on))
             return
         if op == "auto":
+            if body.get("mode") in ("auto", "real") and body["mode"] != self.mode:
+                self.mode = body["mode"]
+                self.real = realdj.RealDJ(self, vibe=self.vibe) if self.mode == "real" else None
+                if self.mode == "real":
+                    self.auto = True
+                with engine.lock:
+                    if engine.transition and not engine.transition.started:
+                        engine.transition = None   # replanned by the new mode
+            if body.get("vibe") in realdj.VIBES:
+                self.vibe = body["vibe"]
+                if self.real:
+                    self.real.vibe = self.vibe
             if "on" in body:
                 self.auto = bool(body["on"])
             if body.get("style") in STYLES:
@@ -1900,7 +2134,7 @@ class DJSession:
         style = body.get("style") if body.get("style") in STYLES else self.auto_style
         if style == "auto":
             style = choose_style(out, inn)
-        beats = int(body.get("beats") or self.auto_beats or STYLES[style][1])
+        beats = int(body.get("beats") or self.auto_beats or auto_beats(style, out, inn))
         if inn.bpm and out.bpm and not inn.playing:
             ratio = mixer.tempo_ratio(out.live_bpm(), inn.bpm)
             inn.sync = bool(ratio and abs(ratio - 1) <= 0.08)
@@ -1915,7 +2149,9 @@ class DJSession:
             "active": True,
             "kind": self.kind,
             "live": self.live,
-            "auto": {"on": self.auto, "style": self.auto_style, "beats": self.auto_beats},
+            "auto": {"on": self.auto, "style": self.auto_style, "beats": self.auto_beats,
+                     "mode": self.mode, "vibe": self.vibe,
+                     "real": self.real.state() if self.real else None},
             "stems": {"on": self.stems_on, "available": stems.enabled()},
             "crate": self.crate.items()[:60],
             "history": self.history[:20],
