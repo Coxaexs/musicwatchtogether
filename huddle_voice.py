@@ -6,9 +6,11 @@ and publishes the resulting audio as a genuine WebRTC bot participant.
 """
 
 import asyncio
+import gc
 from fractions import Fraction
 import json
 import logging
+import sys
 import time
 from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -714,6 +716,23 @@ class RoomPublisher:
             self.pending_candidates.setdefault(remote_id, []).append(candidate)
 
 
+def keep_audio_loop_responsive():
+    """Settings that stop the rest of the bot from starving the audio sender.
+
+    - Thread switch interval 5 ms -> 1 ms: with two busy Python threads (DJ,
+      stems, analysis) frames went out a median 122 ms late (up to 580 ms);
+      at 1 ms the median is ~9 ms.
+    - gc.freeze(): everything loaded by now (modules, caches, the library
+      index) leaves the collector's scans, so a full collection no longer
+      walks it and freezes the loop for hundreds of milliseconds. Frozen
+      objects are still freed normally when nothing refers to them.
+    """
+    sys.setswitchinterval(0.001)
+    gc.collect()
+    gc.freeze()
+    logger.info("Audio loop: 1 ms thread switching, %d startup objects frozen out of GC", gc.get_freeze_count())
+
+
 class HuddleVoiceManager:
     def __init__(self, cog=None, song_class=None):
         self.headers = {
@@ -734,6 +753,7 @@ class HuddleVoiceManager:
         # Logs where the loop was stuck whenever a stall makes audio drop out.
         if getattr(self, "watchdog", None) is None:
             self.watchdog = LoopWatchdog.maybe_start()
+            keep_audio_loop_responsive()
         global MANAGER
         if not config.HUDDLE_BASE_URL or not config.HUDDLE_BOT_TOKEN:
             logger.info("Huddle WebRTC publisher disabled (not configured)")

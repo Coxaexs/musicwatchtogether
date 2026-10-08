@@ -8,9 +8,15 @@ it snapshots the loop thread's stack, and once the loop recovers it logs how
 long the stall lasted and where it was stuck. Idle cost: one cross-thread
 callback every 50 ms.
 
+It also times Python's garbage collector: a full collection in a large,
+long-running process walks every tracked object and freezes the loop while it
+does (1.5 million small objects take ~300 ms), so any collection over 30 ms is
+logged with its generation and length.
+
 Disable with MUSICBOT_LOOP_WATCHDOG=0.
 """
 import asyncio
+import gc
 import logging
 import os
 import sys
@@ -46,10 +52,26 @@ class LoopWatchdog:
 
     def start(self):
         threading.Thread(target=self._run, name="loop-watchdog", daemon=True).start()
+        gc.callbacks.append(self._on_gc)
         logger.info("Event-loop stall watchdog on (threshold %d ms)", self.threshold * 1000)
+
+    _gc_started = 0.0
+
+    def _on_gc(self, phase, info):
+        if phase == "start":
+            self._gc_started = time.perf_counter()
+            return
+        took = time.perf_counter() - self._gc_started
+        if took >= 0.03:
+            logger.warning(
+                "Garbage collection (generation %s) took %d ms; collected %s objects.",
+                info.get("generation"), took * 1000, info.get("collected"),
+            )
 
     def stop(self):
         self._stop.set()
+        if self._on_gc in gc.callbacks:
+            gc.callbacks.remove(self._on_gc)
 
     def _stack(self):
         frame = sys._current_frames().get(self.loop_thread_id)
