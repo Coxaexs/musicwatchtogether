@@ -11,6 +11,7 @@ Config (via .env / config.py):
 """
 
 import asyncio
+import concurrent.futures
 from types import SimpleNamespace
 import hashlib
 import json
@@ -45,9 +46,27 @@ WEB_TOKEN_TTL = 24 * 3600
 LOGIN_LIMITER = SlidingWindowLimiter(10, 5 * 60)
 
 
+def _write_tokens(tokens):
+    state_store.save('web_tokens', tokens)
+    save_json(TOKENS_FILE, tokens, logger)
+
+
+# One thread, so saves land in order.
+_token_writer = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='web-tokens')
+
+
 def _save_tokens():
-    state_store.save('web_tokens', temp_tokens)
-    save_json(TOKENS_FILE, temp_tokens, logger)
+    """Saves the login tokens. Both writes fsync, which on the bot's disk can
+    take ~100 ms, so from the event loop they run on a thread: blocking the
+    loop that long makes the Huddle audio stutter. Tokens are checked from
+    memory, so a login works before the save lands."""
+    snapshot = dict(temp_tokens)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        _write_tokens(snapshot)
+        return
+    _token_writer.submit(_write_tokens, snapshot)
 
 
 temp_tokens = state_store.load('web_tokens', {}, TOKENS_FILE)
