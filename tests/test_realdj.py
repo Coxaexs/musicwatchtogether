@@ -159,6 +159,7 @@ class RealDJTests(unittest.TestCase):
         self.assertAlmostEqual(deck.seconds, expected, delta=0.05)
 
     def test_loop_roll_drop_fires_the_sampler(self):
+        dj.sample_bank(wait=True)          # built in the background: wait for it
         session = dj.DJSession("t", "test", Crate([]))
         asyncio.run(session.load("A", {"title": "a", "file": self.files[0], "keys": [self.files[0]]}))
         asyncio.run(session.load("B", {"title": "b", "file": self.files[1], "keys": [self.files[1]]}))

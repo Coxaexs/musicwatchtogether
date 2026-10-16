@@ -73,6 +73,18 @@ class SlidingWindowLimiter:
         events.append(now)
         return True
 
+    def blocked(self, key):
+        """Whether `key` is over its limit, without counting this check."""
+        now = time.monotonic()
+        events = self._events[key]
+        cutoff = now - self.window_seconds
+        while events and events[0] <= cutoff:
+            events.popleft()
+        return len(events) >= self.limit
+
+    def record(self, key):
+        self._events[key].append(time.monotonic())
+
     def discard(self, key):
         self._events.pop(key, None)
 

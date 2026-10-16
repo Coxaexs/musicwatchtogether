@@ -34,10 +34,11 @@ _CACHE_TTL = 2.0
 _session = None
 _cache = {'at': 0.0, 'servers': []}
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-_SETTINGS_FILE = os.path.join(_BOT_DIR, 'guild_settings.json')
-_DISLIKES_FILE = os.path.join(_BOT_DIR, 'dislikes.json')
-_FAVORITES_FILE = os.path.join(_BOT_DIR, 'favorites.json')
-_STATS_FILE = os.path.join(_BOT_DIR, 'stats.jsonl')
+_DATA_DIR = os.getenv("DATA_DIR") or _BOT_DIR
+_SETTINGS_FILE = os.path.join(_DATA_DIR, 'guild_settings.json')
+_DISLIKES_FILE = os.path.join(_DATA_DIR, 'dislikes.json')
+_FAVORITES_FILE = os.path.join(_DATA_DIR, 'favorites.json')
+_STATS_FILE = os.path.join(_DATA_DIR, 'stats.jsonl')
 
 _DEFAULT_SETTINGS = {
     'autoplay': False,

@@ -56,7 +56,7 @@ MEDIA_EXT = ('.mp4', '.m3u8', '.mpd', '.webm', '.ts', '.m4s', '.mp3', '.m4a',
 MEDIA_MAX = 60
 # request headers worth replaying when downloading sniffed media
 KEEP_HEADERS = ('referer', 'user-agent', 'cookie', 'origin')
-PROFILE_ROOT = os.path.expanduser('~/snap/firefox/common/wt-rooms')
+PROFILE_ROOT = os.getenv('COBROWSER_PROFILE_ROOT', os.path.expanduser('~/snap/firefox/common/wt-rooms'))
 ADGUARD_XPI = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'webstatic', 'adguard.xpi')
 ADGUARD_ID = 'adguardadblocker@adguard.com'

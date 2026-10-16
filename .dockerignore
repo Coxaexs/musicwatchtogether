@@ -1,0 +1,79 @@
+# Git and GitHub
+.git
+.github
+
+# Virtual environments
+.venv
+env
+venv
+stems-env
+
+# Python artifacts and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Secrets and local configs (NEVER bake into image)
+.env
+.env.*
+*.key
+*.pem
+friend.conf
+friend*.conf
+env config
+youtube-cookies.txt
+
+# Logs and backups
+logs/
+*.log
+*.log.*
+backups/
+
+# Media files and downloaded caches
+musics/
+lyrics/
+watch_cache/
+reels_cache/
+stems_cache/
+playlist_covers/
+dj_brain/
+*.mp3
+*.m4a
+*.opus
+*.webm
+*.mp4
+*.mkv
+*.ts
+
+# Local runtime state files
+musicbot.sqlite3*
+mix_analysis.json
+wrapped_state.json
+player_state.json
+guild_settings.json
+watch_tokens.json
+web_tokens.json
+reels_profiles.json
+room_playlists.json
+room_settings.json
+favorites.json
+playlists.json
+playlist_meta.json
+dislikes.json
+audio_features.json
+autoplay_transitions.json
+dj_settings.json
+dj_sessions.json
+stats.jsonl
+.cache
+.restart

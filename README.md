@@ -30,7 +30,57 @@ A Discord music bot (`music.py`) with a browser-based control dashboard and a
 - Rooms work with **or without** Discord — `deeppixel.online/watch` creates a
   shareable room directly.
 
-## Setup
+## Quick Start with Docker (GHCR)
+
+The fastest way to run the bot is with Docker using the prebuilt image from the GitHub Container Registry:
+
+### Using Docker Compose (Recommended)
+
+1. Use the provided [docker-compose.yml](file:///mnt/harddisk/data/bot/musicbot-main/docker-compose.yml):
+
+```yaml
+services:
+  musicbot:
+    image: ghcr.io/coxaexs/musicwatchtogether:latest
+    container_name: musicbot
+    restart: unless-stopped
+    ports:
+      - "8722:8722"
+    environment:
+      - DISCORD_TOKEN=your_discord_bot_token_here
+      - WEB_UI_PASSWORD=your_dashboard_password_here
+      - WEB_SERVER_URL=https://your-domain-or-ip:8722
+      - DJ_ROLE_NAME=DJ
+      # Optional: Spotify credentials
+      # - SPOTIFY_CLIENT_ID=your_id
+      # - SPOTIFY_CLIENT_SECRET=your_secret
+    volumes:
+      - ./data:/data
+```
+
+2. Start the container:
+
+```bash
+docker compose up -d
+```
+
+All persistent data (database, playlists, settings, caches, and downloaded tracks) is automatically stored in `./data`.
+
+### Using `docker run`
+
+```bash
+docker run -d \
+  --name musicbot \
+  --restart unless-stopped \
+  -p 8722:8722 \
+  -e DISCORD_TOKEN="your_discord_bot_token_here" \
+  -e WEB_UI_PASSWORD="your_dashboard_password_here" \
+  -e WEB_SERVER_URL="https://your-domain-or-ip:8722" \
+  -v $(pwd)/data:/data \
+  ghcr.io/coxaexs/musicwatchtogether:latest
+```
+
+## Manual Setup (Without Docker)
 
 Python 3.11 or newer is required.
 

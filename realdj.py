@@ -32,6 +32,7 @@ cancels the current transition, like in Auto DJ).
 
 import asyncio
 import base64
+import os
 import logging
 import math
 import random
@@ -39,10 +40,11 @@ import time
 
 import numpy as np
 
+import djbrain
 import mixer
 import stems
 
-SR = 48_000                    # dj.SR (dj imports this module, so not from there)
+SR = 48_000                   # dj.SR (dj imports this module, so not from there)
 
 logger = logging.getLogger("MusicBot.RealDJ")
 
@@ -87,9 +89,55 @@ def structure(deck):
     cached = getattr(deck, "_structure", None)
     if cached and cached[0] == key:
         return cached[1]
-    result = _structure(deck)
+    result = _with_brain(deck, _structure(deck))
     deck._structure = (key, result)
     return result
+
+
+EXIT_WEIGHTS = {"safe": 2.0, "energetic": 2.5, "creative": 1.0}
+
+
+def _with_brain(deck, s):
+    """Leave the song at one of Gemini's exit options instead of the built-in spot, when one is trustworthy.
+
+    One option is picked per load and kept (structure() is recomputed when the stems arrive, and the song must not
+    change its mind halfway). An option is only used if the song then plays between roughly MIN_PLAY and
+    MAX_PLAY; anything else keeps the built-in exit. Never raises.
+    """
+    if not s:
+        return s
+    try:
+        options = djbrain.exits((getattr(deck, "info", None) or {}).get("keys"))
+        if not options:
+            return s
+        phrases, count = s["phrases"], len(s["phrases"])
+        start_t = phrases[s["entry"]]["start"]
+        usable = []
+        for option in options:
+            phrase = int(round(deck.beat_at(option["at"]) / PHRASE))
+            length = deck.time_of_beat(phrase * PHRASE) - start_t
+            if s["entry"] + 2 <= phrase <= count and MIN_PLAY * 0.75 <= length <= MAX_PLAY * 1.6:
+                usable.append((option, phrase))
+        if not usable:
+            return s
+        chosen = getattr(deck, "_brain_exit", None)
+        if not chosen or chosen[0] != deck.wave_id:
+            total = sum(EXIT_WEIGHTS.get(o["character"], 1.0) for o, _ in usable)
+            pick = random.random() * total
+            option, phrase = usable[-1]
+            for candidate in usable:
+                pick -= EXIT_WEIGHTS.get(candidate[0]["character"], 1.0)
+                if pick <= 0:
+                    option, phrase = candidate
+                    break
+            chosen = deck._brain_exit = (deck.wave_id, option["at"])
+        for option, phrase in usable:
+            if option["at"] == chosen[1]:
+                return dict(s, exit=phrase, exit_beat=phrase * PHRASE,
+                            brain_exit={"character": option["character"], "styles": option["styles"], "why": option["why"]})
+    except Exception:
+        logger.debug("Gemini exit options skipped", exc_info=True)
+    return s
 
 
 def _structure(deck):
@@ -156,6 +204,15 @@ def _structure(deck):
             "first_big_beat": first_big * PHRASE}
 
 
+def _suggested_touches(m, boundary):
+    """Kinds of touch Gemini put in the 8 beats up to this phrase end (and just after), or an empty set."""
+    try:
+        keys = (getattr(m, "info", None) or {}).get("keys")
+        return {x["type"] for x in djbrain.moves(keys, m.time_of_beat(boundary - 8), m.time_of_beat(boundary + 1))}
+    except Exception:
+        return set()
+
+
 # --------------------------------------------------------------------------
 # Choosing the next song
 # --------------------------------------------------------------------------
@@ -187,11 +244,17 @@ def score_candidate(meta, out_meta, target, recent_artists):
     return tempo + key + mood
 
 
+def sound_similarity(out, inn):
+    """How alike two loaded decks sound (djbrain cosine; random pair ~0.5), or None when the brain has no opinion."""
+    return djbrain.similarity((getattr(out, "info", None) or {}).get("keys"), (getattr(inn, "info", None) or {}).get("keys"))
+
+
 def pick_next(items, out_deck, minutes, history, rng=random):
     """Index of the crate item to play next (or None for an empty crate)."""
     if not items:
         return None
     out_meta = dict(out_deck.meta or {}, live_bpm=out_deck.live_bpm()) if out_deck else {}
+    out_keys = (getattr(out_deck, "info", None) or {}).get("keys") if out_deck else None
     target = energy_target(minutes)
     played = {(h.get("title") or "").lower() for h in history[:40]}
     recent = [(h.get("artist") or "").lower() for h in history[:2]]
@@ -206,6 +269,8 @@ def pick_next(items, out_deck, minutes, history, rng=random):
             score += 0.8
         if stems.enabled() and stems.lookup(item.get("keys") or []):
             score -= 0.25           # stems ready: the fancy transitions are possible
+        if out_keys:                # offline analysis: songs that sound like what is playing flow better
+            score += djbrain.vibe_bonus(djbrain.similarity(out_keys, item.get("keys")))
         score += index * 0.004 + rng.random() * 0.15   # a hint of the queue's order, a hint of chance
         if best is None or score < best[0]:
             best = (score, index)
@@ -273,6 +338,15 @@ def choose_style(out, inn, so, si, last_styles, rng=random, vibe="club"):
         if e_in >= 0.45:
             options += [("loop_roll", v["drop_weight"]), ("cut", v["cut"]),
                         ("echo", v["drop_weight"] * 0.4)]
+    brain_exit = (so or {}).get("brain_exit")
+    if brain_exit:                                       # Gemini's suggestion for the exit it chose
+        boost = {style: 3.0 if rank == 0 else 1.8 for rank, style in enumerate(brain_exit["styles"][:2])}
+        options = [(s, w * boost.get(s, 1.0)) for s, w in options]
+    sim = sound_similarity(out, inn)
+    if sim is not None and sim >= djbrain.SIM_HIGH:       # sounds alike: long blends and swaps sit well
+        options = [(s, w * (1.4 if s in ("blend", "stem_swap", "mashup", "fade") else 1.0)) for s, w in options]
+    elif sim is not None and sim <= djbrain.SIM_LOW:      # a different world: make the change an event
+        options = [(s, w * (1.5 if s in DROP_STYLES else 0.7 if s in ("blend", "fade") else 1.0)) for s, w in options]
     if vibe == "chill":
         options = [(s, w * (0.3 if s in ("loop_roll", "cut", "spinback", "brake") else 1.0))
                    for s, w in options]
@@ -329,6 +403,9 @@ def plan_transition(out, inn, current_beat, last_styles, rng=random, vibe="club"
         needed = (want * factor - 1) * 100
         ride = max(-RIDE_MAX, min(RIDE_MAX, needed * 0.6))
     why = f"{style}: tempo gap {gap * 100:.0f}%, keys {out.meta.get('camelot')}→{inn.meta.get('camelot')}"
+    sim = sound_similarity(out, inn)
+    if sim is not None:
+        why += f", sound {sim:.2f}"
     return Plan(style, beats, start, in_cue, ride, why)
 
 
@@ -603,6 +680,39 @@ def tease_script(clash, acappella_at=16):
     return frames, P + 2
 
 
+def classic_script(style, beats):
+    """The classic stem moves (dj.py's mashup, stem swap, a cappella and drum
+    bridge) as keyframes, for predicting how loud they'll be. They mirror the
+    engine's curves: each (start, width) there is (at, ramp) here."""
+    B = beats
+
+    def f(start, width, **values):
+        return _frame(start * B, width * B, **values)
+    if style == "mashup":
+        frames = [f(0, 0.2, xf=0.5), f(0, 0.12, in_drums=1.0), f(0.06, 0.15, in_other=1.0),
+                  f(0.18, 0.15, out_other=0.0), f(0.22, 0.1, out_drums=0.0),
+                  f(0.25, 0.03, in_bass=1.0, out_bass=0.0), f(0.8, 0.1, out_vocals=0.0),
+                  f(0.86, 0.1, in_vocals=1.0), f(0.9, 0.1, xf=1.0)]
+    elif style == "stem_swap":
+        frames = [f(0, 0.06, xf=0.5), f(0, 0.2, in_drums=1.0), f(0.2, 0.25, out_vocals=0.0),
+                  f(0.25, 0.2, in_other=1.0), f(0.48, 0.04, in_bass=1.0, out_bass=0.0),
+                  f(0.55, 0.25, out_other=0.0), f(0.7, 0.2, out_drums=0.0),
+                  f(0.75, 0.15, in_vocals=1.0), f(0.9, 0.1, xf=1.0)]
+    elif style == "acapella":
+        frames = [f(0, 0, in_drums=1.0, in_other=1.0), f(0, 0.3, xf=0.5),
+                  f(0.3, 0.04, in_bass=1.0, out_bass=0.0), f(0.3, 0.12, out_drums=0.0),
+                  f(0.3, 0.2, out_other=0.0), f(0.72, 0.16, out_vocals=0.0),
+                  f(0.85, 0.12, in_vocals=1.0), f(0.9, 0.1, xf=1.0)]
+    elif style == "drum_bridge":
+        frames = [f(0, 0.06, xf=0.5), f(0, 0.2, in_drums=1.0), f(0.15, 0.3, out_vocals=0.0),
+                  f(0.2, 0.28, out_other=0.0), f(0.48, 0.04, in_bass=1.0, out_bass=0.0),
+                  f(0.55, 0.2, in_other=1.0), f(0.65, 0.25, out_drums=0.0),
+                  f(0.8, 0.15, in_vocals=1.0), f(0.9, 0.1, xf=1.0)]
+    else:
+        return None
+    return sorted(frames, key=lambda frame: frame["at"])
+
+
 ROUTINE_LABELS = {"trade": "Back and forth", "tease": "Hook tease"}
 
 # How much each vibe likes each move (multiplies its score).
@@ -675,6 +785,14 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
         score += rng.random() * 0.2
         candidates.append((score, move, start, cue, why, extra))
 
+    def classic(move, start, overlap, landing, base, why):
+        """A classic stem move, if it wouldn't leave a hole."""
+        cue, _ = _landing(si, landing)
+        beats = STYLES[move][1]
+        drop = predicted_drop(classic_script(move, beats), beats, prof_out, prof_in, start * P, cue * P)
+        if drop > -14:
+            consider(move, start, overlap, landing, base + loudness_score(drop), why)
+
     for start in range(earliest, count):
         b0 = start * P
         # How much the old song actually sings: in the phrase it starts on, and the next.
@@ -705,13 +823,13 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
                 if drop > -14:
                     consider("trade", start, 3, 3, base + hook_bonus + loudness_score(drop), why,
                              variant=variant, hook=build_hook, script=script)
-            consider("mashup", start, 2, 2, 1.0 + 0.9 * (sing0 + sing1) / 2,
-                     "mashup: the old vocal over the new instrumental")
-            consider("acapella", start, 1, 1, 0.8 + 0.9 * sing0, "the old vocal a cappella over the new song")
-            consider("stem_swap", start, 1, 1, 1.0 + 0.6 * (1 - sing0),
-                     "stem swap: the parts change hands one by one")
+            classic("mashup", start, 2, 2, 1.0 + 0.9 * (sing0 + sing1) / 2,
+                    "mashup: the old vocal over the new instrumental")
+            classic("acapella", start, 1, 1, 0.8 + 0.9 * sing0, "the old vocal a cappella over the new song")
+            classic("stem_swap", start, 1, 1, 1.0 + 0.6 * (1 - sing0),
+                    "stem swap: the parts change hands one by one")
         else:
-            consider("drum_bridge", start, 1, 1, 1.4, "keys clash: only the drums overlap")
+            classic("drum_bridge", start, 1, 1, 1.4, "keys clash: only the drums overlap")
         tease_hook = _hook_in(hooks, b0 + 8, b0 + P - 6)
         if tease_hook:
             cue, _ = _landing(si, 1)
@@ -779,13 +897,19 @@ class RealDJ:
         self.flourish_at = {}          # deck name -> last phrase given a flourish
         self.next_title = None
         self.ride_from = None
+        self.rewound = set()           # (deck, wave id): songs already pulled up once
+        self.three = getattr(session, "three", False)   # 3 songs: layer a third song
+        self.layer = None              # the third song in play: {"for", "title", "stage", ...}
+        self.layered = set()           # (deck, wave id): songs that had (or tried) a layer
+        self.teased = None             # the layered song's crate item: it plays next
 
     def minutes(self):
         return (time.monotonic() - self.started_at) / 60
 
     def state(self):
         return {"plan": self.plan.json() if self.plan else None, "next": self.next_title,
-                "vibe": self.vibe,
+                "vibe": self.vibe, "three": self.three,
+                "layer": ({"title": self.layer["title"], "stage": self.layer["stage"]} if self.layer else None),
                 "energy_target": round(energy_target(self.minutes()), 2)}
 
     async def tick(self):
@@ -812,6 +936,7 @@ class RealDJ:
             return
         if not other.loaded or session._loading(other.name):
             return
+        await self._third_song(m)
         plan_key = (other.name, other.wave_id, other.has_stems, m.has_stems)
         fresh = None
         if self.plan_for != plan_key or self.plan is None:
@@ -870,7 +995,7 @@ class RealDJ:
         if style == "cut":
             return {"drop": "boom"}
         if style == "spinback":
-            return {"start": "rewind"}
+            return {}                   # the spinback itself is the real thing
         if style == "echo" and self.vibe == "hype":
             return {"drop": "clap"}
         return {}
@@ -907,7 +1032,7 @@ class RealDJ:
         from dj import _xfader_toward, DECKS
         session = self.session
         engine = session.engine
-        ready = next((d for d in engine.decks.values() if d.loaded and not d.ended), None)
+        ready = next((d for d in engine.decks.values() if d.name in DECKS and d.loaded and not d.ended), None)
         if ready:
             with engine.lock:
                 s = structure(ready)
@@ -937,6 +1062,12 @@ class RealDJ:
 
     async def _load_next(self, deck, out):
         session = self.session
+        if self.teased:
+            # 3 songs: the song we teased over the last one plays next.
+            item, self.teased = self.teased, None
+            self.next_title = item.get("title")
+            session.load_in_background(deck.name, item)
+            return
         items = session.crate.items()
         index = pick_next(items, out, self.minutes(), session.history, self.rng)
         if index is None:
@@ -973,7 +1104,8 @@ class RealDJ:
             return
         self.flourish_at[(m.name, m.wave_id)] = phrase
         v = VIBES[self.vibe]
-        if self.rng.random() > v["flourish"]:
+        suggested = _suggested_touches(m, boundary)
+        if self.rng.random() > (max(v["flourish"], 0.75) if suggested else v["flourish"]):
             return
         phrases = s["phrases"]
         here = phrases[phrase] if phrase < len(phrases) else None
@@ -990,6 +1122,15 @@ class RealDJ:
             hook = _hook_in(find_hooks(m, s), boundary + 1, min(boundary + PHRASE - 4, plan.start_beat - 8))
         if hook:
             options += [("hook_repeat", 4 if self.vibe == "hype" else 3)]
+        word = None
+        if self.vibe != "chill":
+            sung = _hook_in(find_hooks(m, s), boundary - PHRASE + 4, boundary - 3) if m.has_stems else None
+            word = sung["time"] if sung else (m.time_of_beat(boundary - 4) if here and (here["vocals"] or 0) > 0.25 else None)
+            if word is not None:
+                options += [("scratch", 2.5 if self.vibe == "hype" else 1.2)]
+        pull_up = self._pull_up_point(m, s, phrase, boundary, plan)
+        if pull_up is not None:
+            options += [("rewind", 1.2 if self.vibe == "hype" else 0.45)]
         if into_big:
             options += [("roll", 3), ("slip_loop", 3), ("sweep", 1)]
             if v["samples"]:
@@ -1000,6 +1141,12 @@ class RealDJ:
             options += [("flanger", 2)]
         options += [("sweep", 1.5), ("slip_loop", 1 if self.vibe != "chill" else 0)]
         options = [(k, w) for k, w in options if w > 0]
+        if suggested:       # a DJ listened to this song and put a touch here: favour it (if the engine can do it now)
+            have = {k for k, _ in options}
+            options = [(k, w * 6 if k in suggested else w) for k, w in options]
+            options += [(k, 6) for k in suggested
+                        if k not in have and (k in ("roll", "echo", "sweep", "slip_loop", "flanger")
+                                              or (k == "riser" and v["samples"]))]
         total = sum(w for _, w in options)
         pick = self.rng.random() * total
         kind = options[-1][0]
@@ -1008,7 +1155,11 @@ class RealDJ:
             if pick <= 0:
                 kind = name
                 break
-        if kind == "hook_repeat":
+        if kind == "scratch":
+            self._fl_scratch(m, boundary, word)
+        elif kind == "rewind":
+            self._fl_rewind(m, boundary, pull_up)
+        elif kind == "hook_repeat":
             self._hook_loop(m, hook["beat"], hook["length"], 3 if hook["length"] == 1 else 2,
                             drop_drums=True, at=hook.get("time"))
         else:
@@ -1054,6 +1205,171 @@ class RealDJ:
         engine = self.session.engine
         engine.schedule(m.name, boundary - 8, boundary - 7.5, lambda: self._sample("riser"), lambda: None)
         engine.schedule(m.name, boundary, boundary + 0.5, lambda: self._sample("boom"), lambda: None)
+
+    # ---- 3 songs ----------------------------------------------------------
+
+    def _fits_as_layer(self, m, keys, meta):
+        """Ready in the stems cache, within 3% in tempo (its vocal stays in key
+        once synced) and in a key that fits: (score, lower is better) or None."""
+        digest = stems.lookup(keys) if keys else None
+        if not digest or not os.path.exists(stems.instrumental_path(digest)):
+            return None
+        ratio = mixer.tempo_ratio(m.live_bpm(), (meta or {}).get("bpm"))
+        if not ratio or abs(math.log(ratio)) > 0.03:
+            return None
+        steps = mixer.key_distance(m.meta.get("camelot"), meta.get("camelot"))
+        if steps > 1:
+            return None
+        return abs(math.log(ratio)) * 10 + steps + abs((meta.get("energy") or 0.5) - (m.meta.get("energy") or 0.5))
+
+    def _upcoming_item(self, m):
+        """The song waiting on the other deck, if it can be teased over this one
+        (what a DJ does: a taste of the next tune before mixing into it)."""
+        other = self.session.engine.decks["B" if m.name == "A" else "A"]
+        if not other.loaded or other.playing:
+            return None
+        keys = [k for k in other.info.get("keys") or [] if k]
+        meta = dict(other.meta or {}, bpm=other.bpm)
+        if self._fits_as_layer(m, keys, meta) is None:
+            return None
+        return {"title": other.info.get("title"), "artist": other.info.get("artist"), "keys": keys,
+                "query": other.info.get("query"), "thumbnail": other.info.get("thumbnail")}
+
+    def _pick_third(self, m):
+        """Index of a crate song to layer over m: it must be ready to load from
+        the stems cache, within 3% in tempo (so its vocal stays in key once
+        synced) and in a key that fits."""
+        best = None
+        for index, item in enumerate(self.session.crate.items()[:60]):
+            keys = [k for k in item.get("keys") or [] if k]
+            score = self._fits_as_layer(m, keys, mixer.cache.get(*keys) or {} if keys else {})
+            if score is None:
+                continue
+            if best is None or score < best[0]:
+                best = (score, index)
+        return best[1] if best else None
+
+    async def _third_song(self, m):
+        """3 songs: in a coming chorus of the playing song, its own vocal steps
+        out and a third song's best sung phrase rides its beat (deck C, synced),
+        then the third song plays next. One layer per song."""
+        from dj import LAYER
+        if not self.three or self.plan is None or not m.has_stems or not m.bpm:
+            return
+        session, engine = self.session, self.session.engine
+        key = (m.name, m.wave_id)
+        layer = self.layer
+        if layer and layer["for"] != key:
+            layer = self.layer = None
+        if layer is None:
+            if key in self.layered:
+                return
+            s = structure(m)
+            current = m.beat_at(m.seconds)
+            target = next((i for i, p in enumerate(s["phrases"]) if p["big"] and i * PHRASE >= current + 24
+                           and (i + 1) * PHRASE + 8 <= self.plan.start_beat), None) if s else None
+            if target is None:
+                return
+            self.layered.add(key)
+            item = self._upcoming_item(m)
+            if item is None:
+                # Not the next song: another one from the queue, which then plays next.
+                index = self._pick_third(m)
+                if index is None:
+                    return
+                item = await session.crate.take(index)
+                if not item:
+                    logger.info("Real DJ %s: third song: the crate changed, no layer", session.key)
+                    return
+                self.teased = item
+            self.layer = {"for": key, "phrase": target, "title": item.get("title"), "stage": "loading"}
+            session.load_in_background(LAYER, item)
+            logger.info("Real DJ %s: third song %r for phrase %d of %r", session.key, item.get("title"),
+                        target, m.info.get("title"))
+            return
+        if layer["stage"] != "loading" or session._loading(LAYER):
+            return
+        c = engine.decks[LAYER]
+        sc = structure(c) if c.loaded else None
+        prof = beat_profile(c) if c.loaded else None
+        k = layer["phrase"]
+        if not sc or prof is None or m.beat_at(m.seconds) > k * PHRASE - 2:
+            layer["stage"] = "skipped"
+            logger.info("Real DJ %s: third song %r skipped (%s)", session.key, layer["title"],
+                        "no stems or beat grid" if not sc or prof is None else "its phrase went by while loading")
+            return
+        # Its best sung phrase: the most singing, a chorus if it can.
+        best = max(range(len(sc["phrases"])), key=lambda j: vocal_coverage(prof, j * PHRASE, (j + 1) * PHRASE)
+                   + (0.2 if sc["phrases"][j]["big"] else 0.0))
+        if vocal_coverage(prof, best * PHRASE, (best + 1) * PHRASE) < 0.5:
+            layer["stage"] = "skipped"
+            logger.info("Real DJ %s: third song %r skipped (not enough singing)", session.key, layer["title"])
+            return
+
+        def on():
+            c.seek(c.time_of_beat(best * PHRASE))
+            c.xf, c.fader, c.sync, c.phase_snap = "THRU", 1.0, True, True
+            c.stem_gain.update(drums=0.0, bass=0.0, other=0.0, vocals=1.0)
+            c.playing = True
+            m.stem_gain["vocals"] = 0.0
+            layer["stage"] = "on air"
+            logger.info("Real DJ %s: third song %r sings over %r", session.key, layer["title"], m.info.get("title"))
+
+        def off():
+            m.stem_gain["vocals"] = 1.0
+            engine.unload(LAYER)
+            layer["stage"] = "done"
+        with engine.lock:
+            engine.schedule(m.name, k * PHRASE, (k + 1) * PHRASE, on, off)
+        layer["stage"] = "ready"
+        self.touches = (self.touches + ["third_song"])[-20:]
+        logger.info("Real DJ %s: third song %r set for phrase %d (its phrase %d)", session.key,
+                    layer["title"], k, best)
+
+    def _pull_up_point(self, m, s, phrase, boundary, plan):
+        """Where a pull-up rewind would restart the song (seconds), or None.
+
+        Once per song, in its first big section (we're in it and it carries
+        on), when the next mix is far enough off to hear the chorus again.
+        """
+        if self.vibe == "chill" or (m.name, m.wave_id) in self.rewound:
+            return None
+        phrases = s["phrases"]
+        if phrase + 1 >= len(phrases) or not phrases[phrase]["big"] or not phrases[phrase + 1]["big"]:
+            return None
+        first = phrase
+        while first > 0 and phrases[first - 1]["big"]:
+            first -= 1
+        if s["big"] and first != s["big"][0]:
+            return None                  # only the first chorus
+        replay = boundary - first * PHRASE
+        if plan.start_beat - boundary < replay + 2 * PHRASE:
+            return None
+        return m.time_of_beat(first * PHRASE)
+
+    def _fl_scratch(self, m, boundary, word):
+        """Two beats of baby scratches on a word from this phrase (on the vocal
+        alone when there are stems), landing back on the one."""
+        from dj import scratch_gesture
+        engine = self.session.engine
+
+        def on():
+            if engine.transition is None:
+                engine.start_gesture(scratch_gesture(m, beats=2, at=word, vocals_only=m.has_stems))
+        engine.schedule(m.name, boundary - 2, boundary - 1.9, on, lambda: None)
+
+    def _fl_rewind(self, m, boundary, to_seconds):
+        """A pull-up: spin the record back and play the chorus again (hype:
+        with an air horn as it drops back in)."""
+        from dj import rewind_gesture
+        engine = self.session.engine
+        self.rewound.add((m.name, m.wave_id))
+        horn = (lambda: self._sample("horn")) if VIBES[self.vibe]["horn"] else None
+
+        def on():
+            if engine.transition is None:
+                engine.start_gesture(rewind_gesture(m, to_seconds, on_restart=horn))
+        engine.schedule(m.name, boundary - 0.25, boundary - 0.15, on, lambda: None)
 
     def _hook_loop(self, deck, beat, length, repeats, drop_drums=False, at=None):
         """Loop `length` beats from the word at `at` seconds (else from grid

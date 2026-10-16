@@ -31,7 +31,10 @@ MODEL = os.environ.get("DJ_STEMS_MODEL", "htdemucs")
 # Above this the GPU is left alone for a job (a passively cooled card in a
 # desktop case can overheat and drop off the bus).
 GPU_MAX_TEMP = int(os.environ.get("DJ_STEMS_GPU_MAX_TEMP", "80"))
-CPU_THREADS = int(os.environ.get("DJ_STEMS_CPU_THREADS", "2"))
+MAX_STEM_SECONDS = int(os.environ.get("DJ_STEMS_MAX_SECONDS", str(6 * 60)))  # 6 minutes max
+CORES = os.cpu_count() or 4
+# Strict max 25% of CPU cores (e.g. 1 thread on 4 cores):
+CPU_THREADS = max(1, int(os.environ.get("DJ_STEMS_CPU_THREADS", str(CORES // 4))))
 
 
 def log(*parts):
@@ -66,29 +69,45 @@ def gpu_temperature():
         return None
 
 
-def be_gentle():
-    """Few threads, low priority: the bot renders live audio on the same
-    cores, and a CPU job (no GPU, or the GPU cooling off) must not starve it."""
+def use_cpu(model):
+    """Run on the CPU, gently: cap to max 25% CPU and lowest possible priority."""
     torch.set_num_threads(CPU_THREADS)
+    torch.set_num_interop_threads(1)
+    os.environ["OMP_NUM_THREADS"] = str(CPU_THREADS)
+    os.environ["MKL_NUM_THREADS"] = str(CPU_THREADS)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(CPU_THREADS)
     try:
-        os.nice(10)
+        os.nice(19)  # Lowest possible CPU priority
     except OSError:
         pass
-
-
-def use_cpu(model):
+    try:
+        if hasattr(os, "SCHED_IDLE"):
+            os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
+        elif hasattr(os, "SCHED_BATCH"):
+            os.sched_setscheduler(0, os.SCHED_BATCH, os.sched_param(0))
+    except (AttributeError, OSError, PermissionError):
+        pass
     return model.to("cpu"), "cpu"
 
 
 def main():
+    try:
+        os.nice(19)
+    except OSError:
+        pass
+    try:
+        if hasattr(os, "SCHED_IDLE"):
+            os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
+        elif hasattr(os, "SCHED_BATCH"):
+            os.sched_setscheduler(0, os.SCHED_BATCH, os.sched_param(0))
+    except (AttributeError, OSError, PermissionError):
+        pass
     # The protocol gets its own copy of stdout; anything libraries print
     # (download notices, warnings) goes to stderr, i.e. the worker log.
     out = os.fdopen(os.dup(1), "w", buffering=1)
     os.dup2(2, 1)
     sys.stdout = sys.stderr
-    be_gentle()
-    # GPU is off by default: the passive Tesla P4 overheats without a fan.
-    device = "cuda" if os.environ.get("DJ_STEMS_ALLOW_GPU") == "1" and torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     started = time.monotonic()
     model = get_model(MODEL)
     model.eval()
@@ -107,6 +126,12 @@ def main():
             started = time.monotonic()
             pcm = np.fromfile(job["input"], dtype="<i2")
             pcm = pcm[: len(pcm) // 2 * 2].reshape(-1, 2)
+            duration = len(pcm) / SR
+            if duration > MAX_STEM_SECONDS:
+                log(f"Track is {duration:.1f}s (> {MAX_STEM_SECONDS}s / 6m); skipping stem separation.")
+                reply.update(ok=False, error=f"Track duration {duration:.1f}s exceeds 6-minute limit ({MAX_STEM_SECONDS}s)")
+                print(json.dumps(reply), file=out, flush=True)
+                continue
             if device == "cuda":
                 temp = gpu_temperature()
                 if temp is not None and temp >= GPU_MAX_TEMP:

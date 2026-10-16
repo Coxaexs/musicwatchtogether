@@ -30,6 +30,7 @@ import config
 import dj
 import huddle
 import mixer
+import songlib
 import stem_mixes
 import stems
 from music import Song, get_autocomplete_suggestions, state_store
@@ -39,8 +40,9 @@ from storage import save_bytes_atomic, save_json
 logger = logging.getLogger('MusicBot.WebUI')
 
 # Tokens persist to disk so /web links survive bot restarts
-TOKENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web_tokens.json')
-PLAYLIST_COVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'playlist_covers')
+DATA_DIR = os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+TOKENS_FILE = os.path.join(DATA_DIR, 'web_tokens.json')
+PLAYLIST_COVERS_DIR = os.path.join(DATA_DIR, 'playlist_covers')
 
 
 WEB_TOKEN_TTL = 24 * 3600
@@ -621,8 +623,17 @@ class WebUI:
         # working where the SameSite cookie is not sent (embedded frames).
         # The header wins: a stale cookie from another room's link must not
         # override the token of the page that is open now.
-        return (request.headers.get('X-MB-Session', '').strip()
-                or request.cookies.get('mb_session') or '')
+        header_val = ""
+        if hasattr(request, "headers") and hasattr(request.headers, "get"):
+            raw = request.headers.get("X-MB-Session", "")
+            if isinstance(raw, str):
+                header_val = raw.strip()
+        cookie_val = ""
+        if hasattr(request, "cookies") and hasattr(request.cookies, "get"):
+            raw_c = request.cookies.get("mb_session")
+            if isinstance(raw_c, str):
+                cookie_val = raw_c
+        return header_val or cookie_val
 
     @staticmethod
     def _set_session_cookie(request, response, token):
@@ -685,12 +696,13 @@ class WebUI:
             return web.json_response({'error': 'unauthorized'}, status=401)
         # Huddle rooms skip _get_guild_and_player, so hold a room-scoped link
         # to its own room here.
-        requested = (request.match_info.get('guild_id')
-                     or request.query.get('guild_id', ''))
-        if huddle.is_huddle_id(requested):
-            allowed = self._get_allowed_guild_id(request)
-            if allowed is not None and str(allowed) != requested:
-                return web.json_response({'error': 'forbidden'}, status=403)
+        if request.path.startswith('/api/'):
+            requested = (request.match_info.get('guild_id')
+                         or request.query.get('guild_id', ''))
+            if huddle.is_huddle_id(requested):
+                allowed = self._get_allowed_guild_id(request)
+                if allowed is not None and str(allowed) != requested:
+                    return web.json_response({'error': 'forbidden'}, status=403)
         return await handler(request)
 
     # ---------- helpers ----------
@@ -770,7 +782,9 @@ class WebUI:
 
     async def api_session(self, request):
         peer = client_identity(request)
-        if not LOGIN_LIMITER.allow(peer):
+        # Only wrong passwords and bad links count, so a correct login is never
+        # throttled (Huddle signs in for admins, mods and everyone else).
+        if LOGIN_LIMITER.blocked(peer):
             return web.json_response({'error': 'too many login attempts'}, status=429)
         try:
             body = await request.json()
@@ -781,6 +795,7 @@ class WebUI:
             info = _valid_token_info(invitation)
             guild_id = str(body.get('guild_id') or '')
             if not info or str(info.get('guild_id')) != guild_id:
+                LOGIN_LIMITER.record(peer)
                 return web.json_response({'error': 'invalid or expired link'}, status=401)
             response = web.json_response({'ok': True})
             self._set_session_cookie(request, response, invitation)
@@ -788,6 +803,7 @@ class WebUI:
         password = str(body.get('password') or '')
         configured = config.WEB_UI_PASSWORD
         if not configured or not secrets.compare_digest(password, configured):
+            LOGIN_LIMITER.record(peer)
             return web.json_response({'error': 'invalid password'}, status=401)
         token = secrets.token_urlsafe(24)
         temp_tokens[token] = {
@@ -1711,7 +1727,8 @@ class WebUI:
             'artist': (cog._format_artist_display(lyrics_data.get('artist'))
                        if hasattr(cog, '_format_artist_display')
                        else lyrics_data.get('artist')),
-            'lines': lyrics_data.get('lines') # list of [timestamp, text]
+            'lines': lyrics_data.get('lines'), # list of [timestamp, text]
+            'loose': bool(lyrics_data.get('loose')),
         }
         self.lyrics_cache[cache_key] = res
         return web.json_response(res)
@@ -1814,6 +1831,60 @@ class WebUI:
                 logger.warning('Could not build the stem mixes', exc_info=True)
         return self._stems_library
 
+    async def api_library_songs(self, request):
+        """Downloaded songs matching ?q=, for the admin panel's song library."""
+        query = (request.query.get('q') or '').strip()[:100]
+        loop = asyncio.get_running_loop()
+        songs = await loop.run_in_executor(None, songlib.search, query)
+        return web.json_response({'songs': songs})
+
+    async def api_library_delete(self, request):
+        """Delete a song's file, stems and analysis so the next play starts from scratch."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        vid = str(body.get('id') or '').strip()
+        for session in list(dj.sessions.values()):
+            try:
+                for deck in session.engine.decks.values():
+                    if deck.playing and f'yt:{vid}' in (deck.info.get('keys') or []):
+                        return web.json_response({'error': 'That song is playing in the DJ booth right now.'}, status=409)
+            except Exception:
+                continue
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(None, songlib.delete, vid)
+        except ValueError as error:
+            return web.json_response({'error': str(error)}, status=400)
+        except LookupError as error:
+            return web.json_response({'error': str(error)}, status=404)
+        except Exception as error:
+            logger.warning('Could not delete song %s', vid, exc_info=True)
+            return web.json_response({'error': str(error)}, status=500)
+        return web.json_response(result)
+
+    async def api_stems_status(self, request):
+        """What the stem separator is doing: the song in progress with its
+        percent, how many are waiting, and how many were made this session."""
+        data = stems.status() if stems.enabled() else {'current': None, 'finished': 0, 'failed': 0,
+                                                      'average_seconds': None, 'library': 0}
+        queued = [r['title'] for r in _stem_requests.values() if r['status'] == 'queued']
+        preps = [{'name': key[1], 'done': job['done'], 'total': job['total']}
+                 for key, job in _prep_jobs.items() if not job['task'].done()]
+        running = 1 if data['current'] else 0
+        waiting = len(queued) + sum(max(0, p['total'] - p['done']) for p in preps) - running
+        data.update(
+            enabled=stems.enabled(),
+            queued=queued[:8],
+            preps=preps,
+            waiting=max(0, waiting),
+            failed_titles=[r['title'] for r in _stem_requests.values() if r['status'] == 'failed'][:5],
+        )
+        avg = data.get('average_seconds')
+        data['eta_all'] = round(avg * (data['waiting'] + running)) if avg and (data['waiting'] or running) else None
+        return web.json_response(data)
+
     async def api_lyrics_search(self, request):
         """Lyrics for an arbitrary track, so Huddle rooms can show them too."""
         query = (request.query.get('q') or '').strip()[:200]
@@ -1836,9 +1907,10 @@ class WebUI:
                 'artist': synced.get('artist'),
                 'lines': synced.get('lines') or [],
                 'synced': True,
+                'loose': bool(synced.get('loose')),
             })
 
-        plain = await cog._fetch_lyrics(query, artist)
+        plain = await cog._fetch_lyrics(query, artist, duration)
         if not plain:
             return web.json_response({'track': None, 'lines': [], 'lyrics': None})
         return web.json_response({
@@ -1847,6 +1919,7 @@ class WebUI:
             'lines': [],
             'lyrics': plain.get('lyrics'),
             'synced': False,
+            'loose': bool(plain.get('loose')),
         })
 
     async def api_playlists(self, request):
@@ -2265,23 +2338,32 @@ async def start_web_server(bot):
     app.router.add_get('/api/guilds/{guild_id}/playlists/mix', ui.api_playlist_mix)
     app.router.add_post('/api/guilds/{guild_id}/playlists/mix', ui.api_playlist_mix_action)
     app.router.add_get('/api/guilds/{guild_id}/playlists/mix/preview', ui.api_playlist_mix_preview)
-    app.router.add_post('/api/guilds/{guild_id}/playlist-cover', ui.api_playlist_cover)
-    app.router.add_get('/dj/', ui.dj_page)
-    app.router.add_get('/api/guilds/{guild_id}/dj', ui.api_dj_state)
-    app.router.add_post('/api/guilds/{guild_id}/dj', ui.api_dj_action)
-    dj.resolver = _resolve_audio
-    dj.fallback_resolver = _resolve_direct
+    if getattr(config, 'DJ_ENABLED', True):
+        app.router.add_get('/dj/', ui.dj_page)
+        app.router.add_get('/api/guilds/{guild_id}/dj', ui.api_dj_state)
+        app.router.add_post('/api/guilds/{guild_id}/dj', ui.api_dj_action)
+        dj.resolver = _resolve_audio
+        dj.fallback_resolver = _resolve_direct
+    else:
+        logger.info("DJ booth disabled by configuration (DJ_ENABLED=0)")
+
     asyncio.ensure_future(_warm_top_songs())
     app.router.add_get('/api/autocomplete', ui.api_autocomplete)
     app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
+    app.router.add_get('/api/stems/status', ui.api_stems_status)
+    app.router.add_get('/api/library/songs', ui.api_library_songs)
+    app.router.add_post('/api/library/delete', ui.api_library_delete)
     os.makedirs(PLAYLIST_COVERS_DIR, exist_ok=True)
     app.router.add_static('/playlist-covers/', PLAYLIST_COVERS_DIR)
 
-    try:
-        import watchtogether
-        watchtogether.setup(app, bot)
-    except Exception as e:
-        logger.error(f"Watch Together failed to mount (dashboard still works): {e}", exc_info=True)
+    if getattr(config, 'WATCHTOGETHER_ENABLED', True):
+        try:
+            import watchtogether
+            watchtogether.setup(app, bot)
+        except Exception as e:
+            logger.error(f"Watch Together failed to mount (dashboard still works): {e}", exc_info=True)
+    else:
+        logger.info("Watch Together disabled by configuration (WATCHTOGETHER_ENABLED=0)")
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -2449,6 +2531,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
   #login input { width: 100%; margin: 12px 0; background: var(--panel2); border: 1px solid var(--border);
                  color: var(--text); border-radius: 8px; padding: 10px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+  #stemsPanel { position: fixed; left: 14px; bottom: 14px; z-index: 50; width: 280px; display: none;
+                background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
+                padding: 10px 12px; font-size: 12px; box-shadow: 0 4px 18px rgba(0,0,0,.35); }
+  #stemsPanel .sp-head { display: flex; justify-content: space-between; color: var(--muted); margin-bottom: 4px; }
+  #stemsPanel .sp-title { color: var(--text); font-size: 13px; white-space: nowrap; overflow: hidden;
+                          text-overflow: ellipsis; margin-bottom: 6px; }
+  #stemsPanel .sp-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  #stemsPanel .sp-bar > div { height: 100%; width: 0; background: #f59e0b; transition: width .6s linear; }
+  #stemsPanel .sp-meta { display: flex; justify-content: space-between; color: var(--muted); margin-top: 6px; }
   .lyric-line {
     padding: 8px 0;
     font-size: 15px;
@@ -3962,6 +4053,38 @@ requestAnimationFrame(deckFrame);
 setInterval(refreshGuilds, 10000);
 setInterval(()=>{if(!liveSocket||liveSocket.readyState!==1)refreshState()},15000);
 setInterval(tickProgress, 500);
+
+function fmtSecs(n) {
+  if (n == null) return '…';
+  const m = Math.floor(n / 60);
+  return m ? `${m}m ${String(n % 60).padStart(2, '0')}s` : `${n}s`;
+}
+async function refreshStemsPanel() {
+  let panel = document.getElementById('stemsPanel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'stemsPanel';
+    document.body.appendChild(panel);
+  }
+  let d;
+  try { d = await api(basePath + 'api/stems/status'); } catch (_) { return; }
+  const busy = d.enabled && (d.current || d.waiting > 0);
+  panel.style.display = busy ? 'block' : 'none';
+  if (!busy) return;
+  const cur = d.current;
+  const prep = d.preps && d.preps[0];
+  const left = d.waiting;
+  panel.innerHTML = `
+    <div class="sp-head"><span>✂️ Splitting stems${cur && cur.device ? ' · ' + esc(cur.device) : ''}</span>
+      <span>${cur ? cur.percent + '%' : 'waiting…'}</span></div>
+    <div class="sp-title" title="${esc(cur ? cur.title : '')}">${cur ? esc(cur.title) : 'Starting the separator…'}</div>
+    <div class="sp-bar"><div style="width:${cur ? cur.percent : 0}%"></div></div>
+    <div class="sp-meta"><span>${cur ? fmtSecs(cur.elapsed) + ' in' + (cur.eta != null ? ' · ~' + fmtSecs(cur.eta) + ' left' : '') : ''}</span>
+      <span>${d.finished} done · ${left} left${d.failed ? ' · ' + d.failed + ' failed' : ''}</span></div>
+    ${prep ? `<div class="sp-meta"><span>${esc(prep.name)}</span><span>${prep.done}/${prep.total}</span></div>` : ''}
+    ${d.eta_all ? `<div class="sp-meta"><span>All done in about</span><span>${fmtSecs(d.eta_all)}</span></div>` : ''}`;
+}
+setInterval(refreshStemsPanel, 2000);
 exchangeLinkToken().then(async ok=>{if(ok){await refreshGuilds();connectLive()}});
 </script>
 </body>

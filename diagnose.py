@@ -96,21 +96,43 @@ def check_ytdlp():
         return False
 
 def check_env():
-    if not os.path.exists('.env'):
-        print("⚠ .env file not found")
-        print("  Create .env with: DISCORD_TOKEN=your_token_here")
-        return False
-    
-    from dotenv import load_dotenv
-    load_dotenv()
+    data_dir = os.getenv("DATA_DIR", "")
+    if os.path.exists('.env'):
+        from dotenv import load_dotenv
+        load_dotenv()
+    elif data_dir and os.path.exists(os.path.join(data_dir, '.env')):
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(data_dir, '.env'))
     
     token = os.getenv('DISCORD_TOKEN')
     if token:
         print(f"✓ DISCORD_TOKEN is set (length: {len(token)} chars)")
         return True
     else:
-        print("✗ DISCORD_TOKEN not set in .env!")
+        print("✗ DISCORD_TOKEN not set!")
+        print("  Set DISCORD_TOKEN in environment or .env file")
         return False
+
+def check_features():
+    try:
+        import config
+        features = [
+            ("DJ Booth", getattr(config, "DJ_ENABLED", True)),
+            ("Watch Together", getattr(config, "WATCHTOGETHER_ENABLED", True)),
+            ("Stems Separation", getattr(config, "STEMS_ENABLED", True)),
+            ("Shared Co-Browser", getattr(config, "COBROWSER_ENABLED", True)),
+            ("Web Dashboard", getattr(config, "WEB_UI_ENABLED", True)),
+            ("Autoplay", getattr(config, "AUTOPLAY_ENABLED", True)),
+            ("Lyrics", getattr(config, "LYRICS_ENABLED", True)),
+            ("Huddle Integration", getattr(config, "HUDDLE_ENABLED", True)),
+        ]
+        for name, enabled in features:
+            status = "✓ Enabled" if enabled else "○ Disabled"
+            print(f"  {status}: {name}")
+        return True
+    except Exception as e:
+        print(f"⚠ Could not inspect feature flags: {e}")
+        return True
 
 def main():
     print("=" * 60)
@@ -125,6 +147,7 @@ def main():
         ("Discord.py", check_discord),
         ("yt-dlp", check_ytdlp),
         ("Environment", check_env),
+        ("Features", check_features),
     ]
     
     results = []

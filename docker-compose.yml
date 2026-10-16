@@ -1,0 +1,46 @@
+services:
+  musicbot:
+    image: ghcr.io/coxaexs/musicwatchtogether:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: musicbot
+    restart: unless-stopped
+    ports:
+      - "8722:8722"
+    environment:
+      # Discord Bot Token (Required)
+      - DISCORD_TOKEN=${DISCORD_TOKEN:-}
+
+      # Feature Toggles (1 = enabled, 0 = disabled)
+      - DJ_ENABLED=${DJ_ENABLED:-1}
+      - WATCHTOGETHER_ENABLED=${WATCHTOGETHER_ENABLED:-1}
+      - STEMS_ENABLED=${STEMS_ENABLED:-1}
+      - COBROWSER_ENABLED=${COBROWSER_ENABLED:-1}
+      - WEB_UI_ENABLED=${WEB_UI_ENABLED:-1}
+      - AUTOPLAY_ENABLED=${AUTOPLAY_ENABLED:-1}
+      - LYRICS_ENABLED=${LYRICS_ENABLED:-1}
+      - HUDDLE_ENABLED=${HUDDLE_ENABLED:-1}
+
+      # Web dashboard & Watch Together network configuration
+      - WEB_SERVER_URL=${WEB_SERVER_URL:-http://localhost:8722}
+      - WEB_UI_HOST=0.0.0.0
+      - WEB_UI_PORT=8722
+      - WEB_UI_PASSWORD=${WEB_UI_PASSWORD:-}
+
+      # Role allowed to manage/skip songs without voting (Default: DJ)
+      - DJ_ROLE_NAME=${DJ_ROLE_NAME:-DJ}
+
+      # Spotify API credentials (Optional)
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+
+      # Persistent storage directory
+      - DATA_DIR=/data
+    volumes:
+      # Persistent storage for SQLite DB, playlists, settings, caches, and music files
+      - ./data:/data
+    # Optionally load environment variables from .env file
+    env_file:
+      - path: .env
+        required: false

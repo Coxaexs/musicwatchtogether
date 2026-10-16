@@ -22,6 +22,8 @@ lyrics/
 watch_cache/
 stems_cache/
 dj_settings.json
+dj_sessions.json
+data/
 .restart
 reels_cache/
 *.mp3

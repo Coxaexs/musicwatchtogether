@@ -466,8 +466,10 @@ function build(){
   for(const k of DECKS)$('.deck-'+k).innerHTML=deckHTML(k);
   $('#mixer').innerHTML=mixerHTML();
   $('#autodj').innerHTML=`<div class="headline"><div><div class="label">AUTO DJ</div><div style="font-weight:800;font-size:15px">Let the booth mix</div></div><button class="switch" id="autoSwitch" aria-label="Auto DJ"></button></div>
+    <button class="pill" id="pauseSet" title="Pause the whole set (both decks and the mix in progress); resume carries on exactly there">⏸ PAUSE SET</button>
     <div class="seg modeseg" id="autoMode" title="Auto DJ: plays the queue in order, smooth mixes. Real DJ: performs a set — picks songs, plays their best part, mashups and drops."><button data-v="auto">AUTO DJ</button><button data-v="real">REAL DJ</button></div>
     <div class="seg modeseg vibeseg realonly" id="vibeSeg" title="How much Real DJ plays the decks: loops, effects, sampler, drops"><button data-v="chill">CHILL</button><button data-v="club">CLUB</button><button data-v="hype">HYPE</button></div>
+    <div class="seg modeseg realonly" id="threeSeg" title="3 songs: Real DJ also lays a third song's vocal over the playing beat for a phrase, then plays that song next"><button data-v="2">2 SONGS</button><button data-v="3">3 SONGS</button></div>
     <div class="realinfo" id="realInfo"></div>
     <div class="smoothonly"><div class="label">Transition</div><div class="chips" id="styleChips"></div></div>
     <div class="row between med smoothonly"><span class="label">Length</span><select id="autoBeats" style="padding:4px 6px"><option value="">Style default</option><option value="4">1 bar</option><option value="8">2 bars</option><option value="16">4 bars</option><option value="32">8 bars</option><option value="64">16 bars</option></select></div>
@@ -578,6 +580,8 @@ function wire(){
     api({op:'auto',mode,on:true}).then(r=>r&&toast(msg))};
   const VIBE_MSG={chill:'Chill: long smooth blends, few tricks.',club:'Club: loops, effects and drops most phrases.',hype:'Hype: tricks all the time, drops, sampler.'};
   $$('#vibeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',vibe:b.dataset.v}).then(r=>r&&toast(VIBE_MSG[b.dataset.v])));
+  $('#pauseSet').onclick=()=>api({op:S&&S.paused?'resume':'pause'});
+  $$('#threeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',three:b.dataset.v==='3'}).then(r=>r&&toast(b.dataset.v==='3'?'3 songs: a third song sings over the beat for a phrase, then plays next.':'2 songs: back to back.')));
   $('#autoTop').onclick=modeBtn('auto','Auto DJ: the queue in order, smooth mixes.');
   $('#realTop').onclick=modeBtn('real','Real DJ: picking songs and playing their best parts.');
   $$('#autoMode button').forEach(b=>b.onclick=()=>api({op:'auto',mode:b.dataset.v}).then(r=>r&&toast(b.dataset.v==='real'?'Real DJ: picking songs and playing the best parts.':'Auto DJ: the queue in order.')));
@@ -798,10 +802,12 @@ function renderAuto(){
   document.body.classList.toggle('realmode',real);
   $$('#autoMode button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.mode||'auto')));
   $$('#vibeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.vibe||'club')));
+  $$('#threeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.three?'3':'2')));
+  {const pb=$('#pauseSet');const t=S.paused?'▶ RESUME SET':'⏸ PAUSE SET';if(pb.textContent!==t)pb.textContent=t;pb.classList.toggle('on',!!S.paused)}
 
   const ri=$('#realInfo');
   if(real&&a.real){const pl=a.real.plan;const lbl=pl?(pl.label||(CAT?.styles||[]).find(x=>x.id===pl.style)?.label||pl.style):null;
-    const html=`<div>Set energy now <b>${Math.round(a.real.energy_target*100)}%</b></div><div class="meter"><i style="width:${Math.round(a.real.energy_target*100)}%"></i></div>`
+    const html=(a.real.layer?`<div>Third song: <b>${esc(a.real.layer.title||'')}</b> · ${esc(a.real.layer.stage)}</div>`:'')+`<div>Set energy now <b>${Math.round(a.real.energy_target*100)}%</b></div><div class="meter"><i style="width:${Math.round(a.real.energy_target*100)}%"></i></div>`
       +(pl?`<div>Next mix: <b>${esc(lbl)}</b>${pl.ride?` · tempo ride ${pl.ride>0?'+':''}${pl.ride.toFixed(1)}%`:''}</div>${pl.why?`<div style="opacity:.7;font-size:12px">${esc(pl.why.replace(/ \(keys .*$/,''))}</div>`:''}`:(a.real.next?`<div>Loading <b>${esc(a.real.next)}</b>…</div>`:'<div>Picks the next song from the queue by tempo, key and mood, and plays its best part.</div>'));
     if(ri._h!==html){ri._h=html;ri.innerHTML=html}}
   else if(ri._h!==''){ri._h='';ri.innerHTML=''}

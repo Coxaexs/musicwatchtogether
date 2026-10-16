@@ -178,6 +178,8 @@ class FakeBot:
 
 
 class FakeRequest:
+    match_info = {"guild_id": "1"}
+
     async def json(self):
         return {
             "action": "import_spotify",

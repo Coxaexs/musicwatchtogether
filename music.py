@@ -34,7 +34,8 @@ from storage import SQLiteDocumentStore, load_json, save_json
 
 # Setup musics folder for downloaded songs
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-MUSICS_FOLDER = os.path.join(BOT_DIR, 'musics')
+DATA_DIR = os.getenv("DATA_DIR") or BOT_DIR
+MUSICS_FOLDER = os.path.join(DATA_DIR, 'musics')
 TEMP_DOWNLOAD_FOLDER = os.path.join(tempfile.gettempdir(), 'musicbot-downloads')
 
 logging.basicConfig(
@@ -42,13 +43,13 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.handlers.RotatingFileHandler(
-            'musicbot.log', maxBytes=10 * 1024 * 1024, backupCount=3, encoding='utf-8'
+            os.path.join(DATA_DIR, 'musicbot.log'), maxBytes=10 * 1024 * 1024, backupCount=3, encoding='utf-8'
         ),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('MusicBot')
-STATE_DB_FILE = os.path.join(BOT_DIR, 'musicbot.sqlite3')
+STATE_DB_FILE = os.path.join(DATA_DIR, 'musicbot.sqlite3')
 state_store = SQLiteDocumentStore(STATE_DB_FILE, logger)
 
 try:
@@ -3278,7 +3279,7 @@ class FakeInteraction:
 class MusicCog(commands.Cog):
     """Music commands cog"""
 
-    SETTINGS_FILE = os.path.join(BOT_DIR, 'guild_settings.json')
+    SETTINGS_FILE = os.path.join(DATA_DIR, 'guild_settings.json')
     
     def __init__(self, bot):
         self.bot = bot
@@ -5122,46 +5123,27 @@ class MusicCog(commands.Cog):
                 return result
         return None
 
-    async def _fetch_lyrics(self, query: str, artist: Optional[str] = None) -> Optional[dict]:
+    async def _fetch_lyrics(self, query: str, artist: Optional[str] = None,
+                            duration_seconds: Optional[int] = None) -> Optional[dict]:
         """Fetch lyrics from lrclib using free public search API."""
-        track_query, artist = self._lyrics_search_context(query, artist)
-        search_query = f'{artist} {track_query}' if artist else track_query
-        url = f"https://lrclib.net/api/search?q={quote(search_query)}"
-        timeout = aiohttp.ClientTimeout(total=12)
-
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers={'User-Agent': 'MusicBot/1.0'}) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json()
-        except Exception:
-            return None
-
-        if not isinstance(data, list):
-            return None
-
-        for item in data:
-            if not self._is_query_match(track_query, item.get('trackName', '')):
+        for text, track, rung_artist, loose in self._lyrics_search_rungs(query, artist):
+            data = await self._lrclib_search(text)
+            item = self._pick_lyrics_item(data, track, rung_artist, duration_seconds, loose, False)
+            if not item:
                 continue
-            if not self._lyrics_artist_matches(artist, item.get('artistName', '')):
-                continue
-            lyrics = item.get('plainLyrics') or item.get('syncedLyrics')
-            if not lyrics:
-                continue
-
+            lyrics = item.get('plainLyrics') or item.get('syncedLyrics') or ''
             # Remove sync timestamps like [01:23.45] if only synced lyrics exist.
             lyrics = re.sub(r'^\[\d{1,2}:\d{2}(?:\.\d{1,2})?\]\s*', '', lyrics, flags=re.MULTILINE).strip()
             if not lyrics:
                 continue
-
-            return {
-                'track': item.get('trackName') or track_query,
-                'artist': self._format_artist_display(
-                    item.get('artistName') or 'Unknown'),
+            result = {
+                'track': item.get('trackName') or track,
+                'artist': self._format_artist_display(item.get('artistName') or 'Unknown'),
                 'lyrics': lyrics,
             }
-
+            if loose:
+                result['loose'] = True
+            return result
         return None
 
     def _parse_synced_lyrics(self, synced_lyrics: str) -> list[tuple[float, str]]:
@@ -5193,8 +5175,7 @@ class MusicCog(commands.Cog):
         sanitized = re.sub(r'[^a-zA-Z0-9_\-\s]', '', cache_key)
         sanitized = re.sub(r'[\s_]+', '_', sanitized).strip('_')
         sanitized = sanitized[:100]
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(base_dir, "lyrics", f"{sanitized.lower()}.json")
+        return os.path.join(DATA_DIR, "lyrics", f"{sanitized.lower()}.json")
 
     def _read_cached_lyrics(self, cache_path: str) -> Optional[dict]:
         """Cached-lyrics file read with an mtime-keyed memory cache.
@@ -5216,39 +5197,62 @@ class MusicCog(commands.Cog):
         self._lyrics_file_cache[cache_path] = (mtime, data)
         return data
 
-    async def _fetch_synced_lyrics(self, query: str, artist: Optional[str] = None,
-                                   duration_seconds: Optional[int] = None) -> Optional[dict]:
-        track_query, artist = self._lyrics_search_context(query, artist)
-        # Check local cache first
-        cache_path = self._get_lyrics_cache_path(track_query, artist)
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, 'r', encoding='utf-8') as f:
-                    cached_data = self._normalize_lyrics_result(json.load(f))
-                    if cached_data is None:
-                        return None
-                    return cached_data
-            except Exception as e:
-                logger.error(f"Error reading lyrics cache for {query}: {e}")
+    def _clean_lyrics_query_hard(self, query: str) -> str:
+        """Last-resort title cleanup: drop every bracketed tag and feat. credit."""
+        text = re.sub(r'\s*[\[(][^\])]*[\])]', '', query or '')
+        text = re.sub(r'\s+(?:ft\.?|feat\.?|featuring)\s+.*$', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*[-|]\s*(?:official|lyrics?|video|audio|live|hd|4k|topic)\b.*$', '',
+                      text, flags=re.IGNORECASE)
+        return re.sub(r'\s+', ' ', text).strip(' -–—|')
 
-        search_query = f'{artist} {track_query}' if artist else track_query
-        url = f"https://lrclib.net/api/search?q={quote(search_query)}"
+    def _lyrics_search_rungs(self, query: str, artist: Optional[str]) -> list[tuple]:
+        """Search attempts from strictest to loosest: (text, track, artist, loose).
+
+        Artist + song first; then the same with every bracket tag stripped;
+        then the "Artist - Song" halves of the title; finally the song name
+        alone, which the caller marks as a loose match.
+        """
+        track, artist = self._lyrics_search_context(query, artist)
+        hard = self._clean_lyrics_query_hard(track)
+        rungs = []
+        if artist:
+            rungs.append((f'{artist} {track}', track, artist, False))
+            if hard and hard != track:
+                rungs.append((f'{artist} {hard}', hard, artist, False))
+        else:
+            rungs.append((track, track, None, False))
+        parts = re.split(r'\s+[-–—|]\s+', hard or track, maxsplit=1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            left, right = parts[0].strip(), parts[1].strip()
+            rungs.append((f'{left} {right}', right, left, False))
+            rungs.append((right, right, None, True))
+        else:
+            rungs.append((hard or track, hard or track, None, True))
+        seen, out = set(), []
+        for rung in rungs:
+            key = (rung[0].casefold(), (rung[2] or '').casefold(), rung[3])
+            if rung[0] and key not in seen:
+                seen.add(key)
+                out.append(rung)
+        return out
+
+    async def _lrclib_search(self, text: str) -> list:
+        url = f"https://lrclib.net/api/search?q={quote(text)}"
         timeout = aiohttp.ClientTimeout(total=12)
-
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url, headers={'User-Agent': 'MusicBot/1.0'}) as resp:
                     if resp.status != 200:
-                        return None
+                        return []
                     data = await resp.json()
         except Exception:
-            return None
+            return []
+        return data if isinstance(data, list) else []
 
-        if not isinstance(data, list):
-            return None
-
-        result = None
-        def duration_distance(item):
+    def _pick_lyrics_item(self, data: list, track: str, artist: Optional[str],
+                          duration_seconds: Optional[int], loose: bool,
+                          synced: bool) -> Optional[dict]:
+        def distance(item):
             try:
                 return abs(float(item.get('duration')) - duration_seconds) \
                     if duration_seconds and item.get('duration') else 10_000
@@ -5257,32 +5261,63 @@ class MusicCog(commands.Cog):
 
         ranked = sorted(data, key=lambda item: (
             not self._lyrics_artist_matches(artist, item.get('artistName', '')),
-            duration_distance(item),
+            distance(item),
         ))
         for item in ranked:
-            if not self._is_query_match(track_query, item.get('trackName', '')):
+            if not self._is_query_match(track, item.get('trackName', '')):
                 continue
-            if not self._lyrics_artist_matches(artist, item.get('artistName', '')):
+            if artist and not self._lyrics_artist_matches(artist, item.get('artistName', '')):
                 continue
-            synced = item.get('syncedLyrics')
-            if not synced:
+            # By song name alone only a song of about the same length counts.
+            if loose and duration_seconds and distance(item) > 8:
                 continue
+            if synced and not item.get('syncedLyrics'):
+                continue
+            if not synced and not (item.get('plainLyrics') or item.get('syncedLyrics')):
+                continue
+            return item
+        return None
 
-            parsed_lines = self._parse_synced_lyrics(synced)
+    async def _fetch_synced_lyrics(self, query: str, artist: Optional[str] = None,
+                                   duration_seconds: Optional[int] = None) -> Optional[dict]:
+        track_query, artist = self._lyrics_search_context(query, artist)
+        cache_path = self._get_lyrics_cache_path(track_query, artist)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    cached_data = self._normalize_lyrics_result(json.load(f))
+                # Older builds cached misses as null; those searches were
+                # narrower than today's, so look again.
+                if cached_data:
+                    return cached_data
+            except Exception as e:
+                logger.error(f"Error reading lyrics cache for {query}: {e}")
+        misses = self.__dict__.setdefault('_lyrics_misses', {})
+        if time.time() - misses.get(cache_path, 0) < 1800:
+            return None
+
+        result = None
+        for text, track, rung_artist, loose in self._lyrics_search_rungs(query, artist):
+            data = await self._lrclib_search(text)
+            item = self._pick_lyrics_item(data, track, rung_artist, duration_seconds, loose, True)
+            if not item:
+                continue
+            parsed_lines = self._parse_synced_lyrics(item['syncedLyrics'])
             if not parsed_lines:
                 continue
-
             result = {
-                'track': item.get('trackName') or track_query,
-                'artist': self._format_artist_display(
-                    item.get('artistName') or 'Unknown'),
+                'track': item.get('trackName') or track,
+                'artist': self._format_artist_display(item.get('artistName') or 'Unknown'),
                 'lines': parsed_lines,
             }
+            if loose:
+                result['loose'] = True
             break
 
-        # Save to local cache (even if None, so we don't request it again)
-        save_json(cache_path, result, logger)
-
+        if result:
+            save_json(cache_path, result, logger)
+        else:
+            misses[cache_path] = time.time()
         return result
 
     def _build_lyricsnow_embed(self, lyrics_data: dict, current_second: float) -> discord.Embed:
@@ -6407,8 +6442,8 @@ class MusicCog(commands.Cog):
     # "shared" holds pre-per-user playlists (and master-password web edits);
     # everyone in the guild sees them alongside their own.
 
-    PLAYLISTS_FILE = os.path.join(BOT_DIR, 'playlists.json')
-    PLAYLIST_META_FILE = os.path.join(BOT_DIR, 'playlist_meta.json')
+    PLAYLISTS_FILE = os.path.join(DATA_DIR, 'playlists.json')
+    PLAYLIST_META_FILE = os.path.join(DATA_DIR, 'playlist_meta.json')
 
     @staticmethod
     def _migrate_guild_buckets(data: dict) -> dict:
@@ -6611,10 +6646,10 @@ class MusicCog(commands.Cog):
 
     # ---------- favorites ----------
 
-    FAVORITES_FILE = os.path.join(BOT_DIR, 'favorites.json')
-    DISLIKES_FILE = os.path.join(BOT_DIR, 'dislikes.json')
-    FEATURES_FILE = os.path.join(BOT_DIR, 'audio_features.json')
-    TRANSITIONS_FILE = os.path.join(BOT_DIR, 'autoplay_transitions.json')
+    FAVORITES_FILE = os.path.join(DATA_DIR, 'favorites.json')
+    DISLIKES_FILE = os.path.join(DATA_DIR, 'dislikes.json')
+    FEATURES_FILE = os.path.join(DATA_DIR, 'audio_features.json')
+    TRANSITIONS_FILE = os.path.join(DATA_DIR, 'autoplay_transitions.json')
 
     # ---------- audio features (Spotify-style content profile) ----------
 
@@ -6961,7 +6996,7 @@ class MusicCog(commands.Cog):
 
     # ---------- listening stats ----------
 
-    STATS_FILE = os.path.join(BOT_DIR, 'stats.jsonl')
+    STATS_FILE = os.path.join(DATA_DIR, 'stats.jsonl')
 
     def log_play(self, guild_id: int, song: Song, channel_id: Optional[int] = None):
         """Append one play to the persistent stats log (JSON lines)."""
@@ -7033,7 +7068,7 @@ class MusicCog(commands.Cog):
 
     # ---------- monthly wrapped ----------
 
-    WRAPPED_STATE_FILE = os.path.join(BOT_DIR, 'wrapped_state.json')
+    WRAPPED_STATE_FILE = os.path.join(DATA_DIR, 'wrapped_state.json')
 
     def _read_stats_range(self, guild_id: int, start_ts: int, end_ts: int) -> list:
         plays = []
@@ -7155,7 +7190,7 @@ class MusicCog(commands.Cog):
 
     # ---------- queue persistence across restarts ----------
 
-    STATE_FILE = os.path.join(BOT_DIR, 'player_state.json')
+    STATE_FILE = os.path.join(DATA_DIR, 'player_state.json')
 
     @staticmethod
     def _serialize_song(song: Song) -> dict:
@@ -7462,6 +7497,9 @@ class MusicCog(commands.Cog):
     )
     async def dj_cmd(self, interaction: discord.Interaction, mode: str = "auto",
                      style: Optional[str] = None):
+        if not getattr(config, 'DJ_ENABLED', True):
+            await interaction.response.send_message("🎧 DJ mode is disabled in the bot configuration.", ephemeral=True)
+            return
         key = str(interaction.guild.id)
         session = dj.sessions.get(key)
         if mode == "off":
@@ -7790,6 +7828,9 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="watch", description="Start a Watch Together room for this channel (synced videos + chat)")
     async def watch_cmd(self, interaction: discord.Interaction):
+        if not getattr(config, 'WATCHTOGETHER_ENABLED', True):
+            await interaction.response.send_message("🎬 Watch Together is disabled in the bot configuration.", ephemeral=True)
+            return
         import watchtogether
         url = watchtogether.get_room_link(interaction.channel.id, f"#{interaction.channel.name}", 'watch')
         embed = discord.Embed(
@@ -7807,6 +7848,9 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="reels", description="ReelsTogether: swipe through short videos in sync with friends")
     async def reels_cmd(self, interaction: discord.Interaction):
+        if not getattr(config, 'WATCHTOGETHER_ENABLED', True):
+            await interaction.response.send_message("📱 ReelsTogether is disabled in the bot configuration.", ephemeral=True)
+            return
         import watchtogether
         url = watchtogether.get_room_link(interaction.channel.id, f"#{interaction.channel.name}", 'reels')
         embed = discord.Embed(
@@ -8419,12 +8463,16 @@ async def main():
             web_runner = await webui.start_web_server(bot)
         except Exception as e:
             logger.error(f"Web UI failed to start (bot will run without it): {e}")
-        try:
-            import huddle_voice
-            huddle_voice_manager = huddle_voice.HuddleVoiceManager(cog, Song)
-            await huddle_voice_manager.start()
-        except Exception as e:
-            logger.error(f"Huddle WebRTC voice failed to start: {e}")
+        if getattr(config, 'HUDDLE_ENABLED', True) and config.HUDDLE_BASE_URL:
+            try:
+                import huddle_voice
+                huddle_voice_manager = huddle_voice.HuddleVoiceManager(cog, Song)
+                await huddle_voice_manager.start()
+            except Exception as e:
+                logger.error(f"Huddle WebRTC voice failed to start: {e}")
+        if getattr(config, 'DJ_ENABLED', True):
+            # DJ booths that were running before the restart come back.
+            asyncio.get_running_loop().create_task(dj.restore_sessions(cog))
         try:
             await bot.start(config.DISCORD_TOKEN)
         finally:
