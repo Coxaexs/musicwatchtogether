@@ -311,6 +311,69 @@ class DJEngineTests(unittest.TestCase):
         session.set_stems(True)
         self.assertTrue(self.session().stems_on)
 
+    def test_key_clash_bridges_on_the_drums_only(self):
+        session = self.session()
+        self.run_async(session.load("A", {"title": "a", "file": self.a}))
+        self.run_async(session.load("B", {"title": "b", "file": self.b}))
+        a, b = session.engine.decks["A"], session.engine.decks["B"]
+        a.meta["camelot"], b.meta["camelot"] = "8A", "2B"
+        self.assertEqual(dj.choose_style(a, b), "filter")
+        self.assertEqual(dj.auto_beats("filter", a, b), 8)
+        self.fake_stems(a)
+        self.fake_stems(b)
+        self.assertEqual(dj.choose_style(a, b), "drum_bridge")
+        engine = session.engine
+        a.playing = True
+        engine.xfader = -1
+        self.run_async(session.handle({"op": "mix", "style": "drum_bridge", "beats": 16, "now": True}))
+        overlap = 0.0
+        for _ in range(600):
+            engine.render()
+            if engine.transition and engine.transition.started:
+                overlap = max(overlap, min(a.stem_gain["other"], b.stem_gain["other"]))
+        self.assertIsNone(engine.transition)
+        self.assertTrue(b.playing)
+        self.assertLess(overlap, 0.01)          # the two melodies never sound together
+
+    def test_auto_dj_mixes_out_where_the_vocal_rests(self):
+        session = self.session()
+        self.run_async(session.load("A", {"title": "a", "file": self.a}))
+        a = session.engine.decks["A"]
+        self.fake_stems(a)
+        end_beat = a.beat_at(a.music_end())
+        latest = dj.mix_out_beat(a, "blend", 16, end_beat, 0)
+        # Sing over the last phrases only: the mix should move earlier.
+        vocals = np.zeros_like(a.audio)
+        sing_from = int(a.time_of_beat(latest - 8) * dj.SR)
+        vocals[sing_from:] = a.audio[sing_from:]
+        a.stems[2] = vocals
+        moved = dj.mix_out_beat(a, "blend", 16, end_beat, 0)
+        self.assertLess(moved, latest)
+        self.assertEqual((latest - moved) % 8, 0)
+        self.assertEqual(dj.mix_out_beat(a, "echo", 8, end_beat, 0) % 8, 0)
+
+    def test_loop_roll_shrinks_then_drops_the_new_song(self):
+        session = self.session()
+        self.run_async(session.load("A", {"title": "a", "file": self.a}))
+        self.run_async(session.load("B", {"title": "b", "file": self.b}))
+        engine = session.engine
+        a, b = engine.decks["A"], engine.decks["B"]
+        a.playing = True
+        a.seek(20.0)
+        engine.xfader = -1
+        self.run_async(session.handle({"op": "mix", "style": "loop_roll", "now": True}))
+        sizes = set()
+        for _ in range(400):
+            engine.render()
+            tr = engine.transition
+            if tr and tr.started and a.loop_on:
+                sizes.add(round((a.loop_out - a.loop_in) / a.beat_seconds, 2))
+                self.assertFalse(b.playing)       # nothing of B until the drop
+        self.assertIsNone(engine.transition)
+        self.assertTrue(b.playing and not a.playing)
+        self.assertEqual(engine.xfader, 1.0)
+        self.assertTrue({4, 2, 1}.issubset(sizes), sizes)
+
     def test_separator_uses_worker_then_cache(self):
         fake = os.path.join(self.tmp.name, "fake_worker.py")
         with open(fake, "w") as f:

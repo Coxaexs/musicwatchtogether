@@ -22,6 +22,48 @@ FAKE_WORKER = (
     "    print(json.dumps({'id': job['id'], 'ok': True, 'seconds': 0}), flush=True)\n")
 
 
+class StemsLibraryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = stems.CACHE_DIR
+        stems.CACHE_DIR = self.tmp.name
+        stems._library_cache = (None, [])
+
+    def tearDown(self):
+        stems.CACHE_DIR = self.saved
+        stems._library_cache = (None, [])
+        self.tmp.cleanup()
+
+    def write(self, digest, seconds, used, karaoke=False):
+        np.save(stems.stems_path(digest), np.zeros((3, int(seconds * stems.SR), 2), dtype=np.int16))
+        os.utime(stems.stems_path(digest), (used, used))
+        if karaoke:
+            open(stems.instrumental_path(digest), "wb").close()
+
+    def test_lists_each_song_once_newest_first(self):
+        self.write("aaa", 3, used=1000)
+        self.write("bbb", 2, used=2000, karaoke=True)
+        stems.remember(["yt:abcdefghijk", "song a artist"], "aaa", "Song A")
+        stems.remember(["spotify:search:song b"], "bbb", "Song B")
+        stems.remember(["yt:zzzzzzzzzzz"], "gone", "Pruned song")   # no stems file
+        stems.pin("aaa", "top")
+        songs = stems.library()
+        self.assertEqual([s["title"] for s in songs], ["Song B", "Song A"])
+        b, a = songs
+        self.assertEqual((a["youtube"], a["seconds"], a["karaoke"], a["pinned"]), ("abcdefghijk", 3, False, True))
+        self.assertEqual((b["youtube"], b["seconds"], b["karaoke"], b["pinned"]), (None, 2, True, False))
+        self.assertEqual(sorted(a["keys"]), ["song a artist", "yt:abcdefghijk"])
+
+    def test_reading_does_not_touch_files(self):
+        self.write("aaa", 1, used=1000)
+        stems.remember(["yt:abcdefghijk"], "aaa", "Song A")
+        stems.library()
+        self.assertEqual(os.path.getmtime(stems.stems_path("aaa")), 1000)
+
+    def test_empty_cache(self):
+        self.assertEqual(stems.library(), [])
+
+
 class StemsCacheTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -34,7 +76,11 @@ class StemsCacheTests(unittest.TestCase):
         stems.CACHE_DIR = os.path.join(self.tmp.name, "cache")
         os.environ["DJ_STEMS"] = "1"
         stems.SEPARATOR = stems.Separator()
+        self._temp = stems.gpu_temperature
+        stems.gpu_temperature = lambda: None          # don't depend on the real GPU
         self.loop = asyncio.new_event_loop()
+        self._mix_cache = dj.mixer.cache
+        dj.mixer.cache = dj.mixer.AnalysisCache(os.path.join(self.tmp.name, "mix.json"))
 
     def tearDown(self):
         async def stop():
@@ -43,6 +89,8 @@ class StemsCacheTests(unittest.TestCase):
                 stems.SEPARATOR.idle_task.cancel()
         self.loop.run_until_complete(stop())
         self.loop.close()
+        stems.gpu_temperature = self._temp
+        dj.mixer.cache = self._mix_cache
         stems.PYTHON, stems.WORKER, stems.CACHE_DIR, stems.CACHE_BYTES, env = self.saved
         if env is None:
             os.environ.pop("DJ_STEMS", None)
@@ -78,6 +126,29 @@ class StemsCacheTests(unittest.TestCase):
         again = self.loop.run_until_complete(
             stems.prepare("/nonexistent.wav", ["yt:aaaaaaaaaaa"], instrumental=True))
         self.assertEqual(again, digest)
+
+    def test_a_prepared_song_is_rebuilt_without_its_source(self):
+        path = self.song("a")
+        self.loop.run_until_complete(stems.prepare(path, ["yt:aaaaaaaaaaa", "song a"], "A",
+                                                   instrumental=True))
+        audio = stems.decode(path)
+        os.remove(path)                               # the source is gone
+        rebuilt, cached = stems.local_audio(["song a"])
+        self.assertEqual(rebuilt.shape, audio.shape)
+        np.testing.assert_allclose(rebuilt, audio, atol=2)
+        self.assertEqual(cached.shape, (3,) + audio.shape)
+        self.assertIsNone(stems.local_audio(["unknown"]))
+
+    def test_the_dj_loads_a_prepared_song_from_the_cache(self):
+        path = self.song("a", seconds=8)
+        self.loop.run_until_complete(stems.prepare(path, ["song a"], "A", instrumental=True))
+        session = dj.DJSession("t", "test", None)
+        self.loop.run_until_complete(session.load(
+            "A", {"title": "a", "audio_url": "https://example.invalid/expired", "keys": ["song a"]}))
+        deck = session.engine.decks["A"]
+        self.assertTrue(deck.loaded)
+        self.assertEqual(deck.stems_status, "ready")
+        self.assertNotIn("A", session.stem_tasks)     # nothing to split again
 
     def test_pins_survive_pruning_and_follow_the_playlist(self):
         a = self.loop.run_until_complete(stems.prepare(self.song("a", freq=200), ["a"], pin_reason="playlist:x"))
@@ -121,6 +192,30 @@ class StemsCacheTests(unittest.TestCase):
             await fg()
         self.loop.run_until_complete(run())
         self.assertEqual(order, ["listener", "background"])
+
+
+class BackgroundPauseTests(unittest.TestCase):
+    def test_background_waits_for_a_live_set_and_a_hot_gpu(self):
+        saved = (stems.pause_background, stems.gpu_temperature)
+        try:
+            stems.pause_background, stems.gpu_temperature = (lambda: False), (lambda: 60)
+            self.assertFalse(stems.background_should_wait())
+            stems.gpu_temperature = lambda: 90
+            self.assertTrue(stems.background_should_wait())
+            stems.pause_background, stems.gpu_temperature = (lambda: True), (lambda: None)
+            self.assertTrue(stems.background_should_wait())
+        finally:
+            stems.pause_background, stems.gpu_temperature = saved
+
+    def test_a_live_booth_pauses_background_work(self):
+        session = dj.DJSession("bg", "test", None)
+        session.live = True
+        dj.sessions["bg"] = session
+        try:
+            self.assertTrue(stems.pause_background())
+        finally:
+            dj.sessions.pop("bg", None)
+        self.assertFalse(stems.pause_background())
 
 
 class KaraokeDeckTests(unittest.TestCase):

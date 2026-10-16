@@ -45,7 +45,11 @@ from runtime import TaskRegistry, increment, prometheus
 from storage import SQLiteDocumentStore, load_json, save_json
 
 try:
-    import cobrowser
+    import config
+    if not getattr(config, 'COBROWSER_ENABLED', True):
+        cobrowser = None
+    else:
+        import cobrowser
 except Exception as _e:   # missing python-xlib etc. - watch still works
     cobrowser = None
     logging.getLogger('MusicBot.WatchTogether').warning(
@@ -54,10 +58,11 @@ except Exception as _e:   # missing python-xlib etc. - watch still works
 logger = logging.getLogger('MusicBot.WatchTogether')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKENS_FILE = os.path.join(BASE_DIR, 'watch_tokens.json')
-PROFILES_FILE = os.path.join(BASE_DIR, 'reels_profiles.json')
-WATCH_CACHE_DIR = os.path.join(BASE_DIR, 'watch_cache')
-REELS_CACHE_DIR = os.path.join(BASE_DIR, 'reels_cache')
+DATA_DIR = os.getenv("DATA_DIR") or BASE_DIR
+TOKENS_FILE = os.path.join(DATA_DIR, 'watch_tokens.json')
+PROFILES_FILE = os.path.join(DATA_DIR, 'reels_profiles.json')
+WATCH_CACHE_DIR = os.path.join(DATA_DIR, 'watch_cache')
+REELS_CACHE_DIR = os.path.join(DATA_DIR, 'reels_cache')
 
 TOKEN_TTL = 7 * 86400          # links stay valid for a week
 WATCH_CACHE_LIMIT = 10         # downloaded WatchTogether videos/HLS sessions
@@ -77,9 +82,9 @@ REELS_READY_AHEAD = 4          # cache the next four reels while this one plays
 REELS_MAX_DURATION = 150       # seconds - skip anything longer in the shorts feed
 HLS_MIN_DURATION = 8 * 60      # longer than this -> stream while downloading
 
-SETTINGS_FILE = os.path.join(BASE_DIR, 'room_settings.json')
-ROOM_PLAYLISTS_FILE = os.path.join(BASE_DIR, 'room_playlists.json')
-state_store = SQLiteDocumentStore(os.path.join(BASE_DIR, 'musicbot.sqlite3'), logger)
+SETTINGS_FILE = os.path.join(DATA_DIR, 'room_settings.json')
+ROOM_PLAYLISTS_FILE = os.path.join(DATA_DIR, 'room_playlists.json')
+state_store = SQLiteDocumentStore(os.path.join(DATA_DIR, 'musicbot.sqlite3'), logger)
 DEFAULT_SETTINGS = {
     'adblock': True, 'sponsorblock': True, 'quality': 720,
     'control_policy': 'moderators', 'skip_policy': 'vote', 'vote_threshold': 0.5,

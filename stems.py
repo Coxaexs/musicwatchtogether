@@ -40,17 +40,36 @@ NAMES = ("drums", "bass", "vocals")          # stored, in this order
 CONTROLS = ("drums", "bass", "vocals", "other")
 PYTHON = os.environ.get("DJ_STEMS_PYTHON") or os.path.join(HERE, "stems-env", "bin", "python")
 WORKER = os.path.join(HERE, "stems_worker.py")
-CACHE_DIR = os.environ.get("DJ_STEMS_CACHE") or os.path.join(HERE, "stems_cache")
+DATA_DIR = os.getenv("DATA_DIR") or HERE
+CACHE_DIR = os.environ.get("DJ_STEMS_CACHE") or os.path.join(DATA_DIR, "stems_cache")
 CACHE_BYTES = int(float(os.environ.get("DJ_STEMS_CACHE_GB") or 15) * 1024 ** 3)
 IDLE_SECONDS = 15 * 60                       # free the GPU after this long unused
 JOB_TIMEOUT = 15 * 60
 
 
 def enabled():
+    import config
+    if not getattr(config, "STEMS_ENABLED", True):
+        return False
     return os.environ.get("DJ_STEMS", "1") != "0" and os.path.exists(PYTHON)
 
 
 _gpu_checked = (0.0, False)
+GPU_PROC_DIR = "/proc/driver/nvidia/gpus"      # one entry per GPU the loaded NVIDIA driver has bound
+
+
+def gpu_present():
+    """Whether the NVIDIA driver has a GPU at all, read from /proc: no process, no waiting.
+
+    Without a card (or with the driver not loaded) every nvidia-smi call hangs for about a second while it tries to
+    load the kernel module, and these checks run on the bot's audio loop. DJ_STEMS_GPU_CHECK=0 skips this shortcut.
+    """
+    if os.environ.get("DJ_STEMS_GPU_CHECK", "1") == "0":
+        return True
+    try:
+        return bool(os.listdir(GPU_PROC_DIR))
+    except OSError:
+        return False
 
 
 def gpu_ok():
@@ -59,6 +78,9 @@ def gpu_ok():
     global _gpu_checked
     at, ok = _gpu_checked
     if time.monotonic() - at > 60:
+        if not gpu_present():
+            _gpu_checked = (time.monotonic(), False)
+            return False
         try:
             out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
             ok = out.returncode == 0 and "GPU" in out.stdout
@@ -66,6 +88,40 @@ def gpu_ok():
             ok = False
         _gpu_checked = (time.monotonic(), ok)
     return ok
+
+
+_temp_checked = (0.0, None)
+GPU_HOT = 78
+
+
+def gpu_temperature():
+    """GPU temperature in °C (checked at most every 30 s), or None."""
+    global _temp_checked
+    at, temp = _temp_checked
+    if time.monotonic() - at > 30:
+        if not gpu_present():
+            _temp_checked = (time.monotonic(), None)
+            return None
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            temp = int(out.split()[0])
+        except Exception:
+            temp = None
+        _temp_checked = (time.monotonic(), temp)
+    return temp
+
+
+#: () -> bool, set by dj.py: True while a DJ set is on air. Background work
+#: (playlist prep, top songs) waits then, so the live mix keeps the CPU.
+pause_background = lambda: False  # noqa: E731
+
+
+def background_should_wait():
+    if pause_background():
+        return True
+    temp = gpu_temperature()
+    return temp is not None and temp >= GPU_HOT
 
 
 def track_hash(audio):
@@ -174,6 +230,57 @@ def pinned():
     return set(load_index()["pins"])
 
 
+_library_cache = (None, [])
+
+
+def library():
+    """Every song with stems on disk, most recently used first.
+
+    One entry per separated song: {"hash", "title", "youtube" (video id or
+    None), "keys", "seconds", "karaoke" (instrumental ready), "pinned",
+    "used" (epoch of last use)}. Songs whose stems file was pruned are left
+    out. Reading this never touches the files, so browsing the list doesn't
+    change what the cache keeps.
+    """
+    global _library_cache
+    try:
+        stamp = (os.path.getmtime(_index_file()), os.path.getmtime(CACHE_DIR))
+    except OSError:
+        return []
+    if _library_cache[0] == stamp:
+        return [dict(item) for item in _library_cache[1]]
+    data = load_index()
+    songs = {}
+    for key, info in data["tracks"].items():
+        digest = (info or {}).get("hash")
+        if not digest:
+            continue
+        song = songs.setdefault(digest, {"hash": digest, "title": None, "youtube": None, "keys": []})
+        song["keys"].append(key)
+        song["title"] = song["title"] or (info or {}).get("title")
+        if key.startswith("yt:") and not song["youtube"]:
+            song["youtube"] = key[3:]
+    out = []
+    for digest, song in songs.items():
+        path = stems_path(digest)
+        try:
+            used = os.path.getmtime(path)
+            frames = np.load(path, mmap_mode="r").shape[1]
+        except (OSError, ValueError, IndexError):
+            continue
+        song.update(
+            title=song["title"] or "Unknown",
+            seconds=int(frames / SR),
+            karaoke=os.path.exists(instrumental_path(digest)),
+            pinned=digest in data["pins"],
+            used=used,
+        )
+        out.append(song)
+    out.sort(key=lambda song: song["used"], reverse=True)
+    _library_cache = (stamp, out)
+    return [dict(item) for item in out]
+
+
 def forget(keys):
     """Drop a song's stems and instrumental (a "recompute" starts from scratch)."""
     digest = lookup(keys)
@@ -184,6 +291,32 @@ def forget(keys):
             os.remove(path)
         except OSError:
             pass
+
+
+def forget_song(keys):
+    """Remove a song from the stems cache entirely: its files, its index entries and its pins.
+
+    Unlike forget() this finds the song through the index even when its stems file is already gone or damaged.
+    Returns True when the cache knew the song.
+    """
+    keys = [k for k in keys or () if k]
+    with _index_lock:
+        data = load_index()
+        digests = {(data["tracks"].get(k) or {}).get("hash") for k in keys} - {None}
+        if not digests:
+            return False
+        for key in [k for k, v in data["tracks"].items() if (v or {}).get("hash") in digests]:
+            del data["tracks"][key]
+        for digest in digests:
+            data["pins"].pop(digest, None)
+        _save_index(data)
+    for digest in digests:
+        for path in (stems_path(digest), instrumental_path(digest)):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return True
 
 
 def _prune():
@@ -222,7 +355,7 @@ def _prune():
 # --------------------------------------------------------------------------
 
 SR = 48_000
-MAX_SECONDS = 15 * 60
+MAX_SECONDS = 6 * 60  # Max 6 minutes
 KARAOKE_GUIDE = 0.0          # how much of the original vocal stays in karaoke
 
 
@@ -230,7 +363,9 @@ def decode(source):
     """Whole track as int16 (n, 2) at 48 kHz (same as the DJ deck's audio)."""
     command = ["ffmpeg", "-nostdin", "-loglevel", "error"]
     if str(source).startswith(("http://", "https://")):
-        command += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3"]
+        # A stalled stream fails after 20 s instead of hanging to the timeout.
+        command += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3",
+                    "-rw_timeout", "20000000"]
     command += ["-i", str(source), "-vn", "-t", str(MAX_SECONDS),
                 "-f", "s16le", "-ac", "2", "-ar", str(SR), "pipe:1"]
     result = subprocess.run(command, capture_output=True, timeout=300)
@@ -240,6 +375,30 @@ def decode(source):
         detail = result.stderr.decode(errors="replace").strip()[-200:]
         raise RuntimeError(detail or "The track has no audio.")
     return audio
+
+
+def local_audio(keys):
+    """(audio, stems) of a song rebuilt entirely from the cache, or None.
+
+    The karaoke instrumental is the mix minus the vocal stem, so adding the
+    vocal back gives the original track: a prepared song plays without
+    fetching it from YouTube again (stream links expire and get throttled).
+    """
+    digest = lookup(keys)
+    if not digest or not os.path.exists(instrumental_path(digest)):
+        return None
+    try:
+        stems = _load(stems_path(digest))
+        inst = decode(instrumental_path(digest))
+    except Exception as error:
+        logger.warning("Could not rebuild %s from the cache: %s", digest, error)
+        return None
+    n = stems.shape[1]
+    if len(inst) < n:
+        inst = np.pad(inst, ((0, n - len(inst)), (0, 0)))
+    vocals = stems[NAMES.index("vocals")].astype(np.int32) * (1 - KARAOKE_GUIDE)
+    audio = np.clip(inst[:n].astype(np.int32) + vocals, -32768, 32767).astype(np.int16)
+    return audio, stems
 
 
 def write_instrumental(audio, stems, digest):
@@ -272,7 +431,10 @@ async def prepare(source, keys, title=None, instrumental=False, pin_reason=None,
             pin(digest, pin_reason)
         return digest
     audio = await loop.run_in_executor(None, decode, source)
-    result = await SEPARATOR.separate(audio, background=background)
+    if len(audio) > SR * (6 * 60):
+        logger.info("Track '%.50s' is %.1fs (> 360s / 6m); skipping stem separation.", title or source, len(audio) / SR)
+        return None
+    result = await SEPARATOR.separate(audio, background=background, title=title)
     if result is None:
         return None
     digest = await loop.run_in_executor(None, track_hash, audio)
@@ -293,13 +455,18 @@ class Separator:
         self.idle_task = None
         self.device = None
         self.interactive_waiting = 0     # background work yields to these
+        # Progress for the web UI's stems panel (status()).
+        self.current = None              # {title, started, seconds} while a song is being split
+        self.finished = 0
+        self.failed = 0
+        self.ratios = []                 # seconds of work per second of audio, last 20 songs
 
     async def _start(self):
         os.makedirs(os.path.join(CACHE_DIR, "models"), exist_ok=True)
         env = dict(os.environ, TORCH_HOME=os.path.join(CACHE_DIR, "models"))
         log = open(os.path.join(CACHE_DIR, "worker.log"), "ab")
         self.proc = await asyncio.create_subprocess_exec(
-            PYTHON, WORKER,
+            "nice", "-n", "19", PYTHON, WORKER,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log,
             env=env, limit=1 << 20)
         log.close()
@@ -333,7 +500,7 @@ class Separator:
         finally:
             self.idle_task = None
 
-    async def separate(self, audio, wanted=lambda: True, background=False):
+    async def separate(self, audio, wanted=lambda: True, background=False, title=None):
         """Stems for a decoded track, or None when off/unwanted. Raises on failure.
 
         Background work (playlist prep, warming the most played songs) waits
@@ -341,14 +508,19 @@ class Separator:
         """
         if not enabled():
             return None
+        if len(audio) > SR * (6 * 60):
+            logger.info("Track is %.1fs (> 360s / 6m); skipping stem separation.", len(audio) / SR)
+            return None
         loop = asyncio.get_running_loop()
         key = await loop.run_in_executor(None, track_hash, audio)
         path = os.path.join(CACHE_DIR, key + ".npy")
         if os.path.exists(path):
             return await loop.run_in_executor(None, _load, path)
         if background:
-            while self.interactive_waiting or self.lock.locked():
-                await asyncio.sleep(1)
+            # Yield to listeners, to a live DJ set, and to a hot GPU (whose
+            # jobs would otherwise fall back to the CPU).
+            while self.interactive_waiting or self.lock.locked() or background_should_wait():
+                await asyncio.sleep(5 if background_should_wait() else 1)
         else:
             self.interactive_waiting += 1
         try:
@@ -363,6 +535,8 @@ class Separator:
             if os.path.exists(path):
                 return await loop.run_in_executor(None, _load, path)
             os.makedirs(CACHE_DIR, exist_ok=True)
+            self.current = {"title": title or "Song in the DJ booth", "started": time.monotonic(),
+                            "seconds": len(audio) / SR}
             raw = os.path.join(CACHE_DIR, key + ".raw")
             await loop.run_in_executor(None, np.ascontiguousarray(audio, dtype="<i2").tofile, raw)
             try:
@@ -380,10 +554,17 @@ class Separator:
                 if not reply.get("ok"):
                     raise RuntimeError(reply.get("error") or "Stem separation failed.")
                 logger.info("Separated %.0f s of audio in %.1f s", len(audio) / 48000, reply.get("seconds", 0))
+                self.finished += 1
+                self.ratios = (self.ratios + [(time.monotonic() - self.current["started"])
+                                              / max(1.0, self.current["seconds"])])[-20:]
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 await self._kill()           # a half-read reply would desync the pipe
                 raise
+            except Exception:
+                self.failed += 1
+                raise
             finally:
+                self.current = None
                 self.last_used = time.monotonic()
                 try:
                     os.remove(raw)
@@ -396,3 +577,30 @@ class Separator:
 
 
 SEPARATOR = Separator()
+
+
+def status():
+    """What the separator is doing, for the web UI's stems panel.
+
+    {"current": {title, percent, elapsed, eta, device} or None, "finished", "failed",
+     "average_seconds" (per finished song), "library" (songs with stems on disk)}.
+    The worker reports no progress, so percent / eta are estimated from how long recent songs took
+    (before any has finished: a rough per-device guess, with no eta).
+    """
+    sep = SEPARATOR
+    current = None
+    snap = sep.current
+    if snap:
+        elapsed = time.monotonic() - snap["started"]
+        ratio = sum(sep.ratios) / len(sep.ratios) if sep.ratios else (0.08 if sep.device == "cuda" else 1.0)
+        expected = max(1.0, ratio * snap["seconds"])
+        current = {"title": snap["title"], "percent": int(max(0, min(99, elapsed / expected * 100))),
+                   "elapsed": round(elapsed), "eta": max(0, round(expected - elapsed)) if sep.ratios else None,
+                   "device": sep.device}
+    average = (sum(sep.ratios) / len(sep.ratios)) * 200 if sep.ratios else None     # a typical 200 s song
+    try:
+        library_count = sum(1 for name in os.listdir(CACHE_DIR) if name.endswith(".npy") and name != "index.json")
+    except OSError:
+        library_count = 0
+    return {"current": current, "finished": sep.finished, "failed": sep.failed,
+            "average_seconds": round(average, 1) if average else None, "library": library_count}

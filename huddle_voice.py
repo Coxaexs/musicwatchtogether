@@ -6,7 +6,7 @@ and publishes the resulting audio as a genuine WebRTC bot participant.
 """
 
 import asyncio
-from array import array
+import gc
 from fractions import Fraction
 import json
 import logging
@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
+import numpy as np
 from av import AudioFrame
 import aiortc.codecs
 from aiortc.codecs import OpusEncoder as DefaultOpusEncoder
@@ -31,6 +32,7 @@ import config
 import dj
 import huddle
 import mixer
+from loop_watchdog import LoopWatchdog
 import stems
 
 
@@ -340,16 +342,10 @@ class RoomAudioTrack(MediaStreamTrack):
                 pass
 
         if self._volume < 0.999 and data.strip(b"\0"):
-            samples = array("h")
-            samples.frombytes(data)
-            if sys.byteorder != "little":
-                samples.byteswap()
-            gain = self._volume
-            for index, sample in enumerate(samples):
-                samples[index] = max(-32768, min(32767, int(sample * gain)))
-            if sys.byteorder != "little":
-                samples.byteswap()
-            data = samples.tobytes()
+            # Vectorised: the per-sample Python loop cost ~0.4 ms of every
+            # 20 ms frame on the event loop the sender shares with everything.
+            samples = np.frombuffer(data, dtype="<i2").astype(np.float32)
+            data = np.clip(samples * self._volume, -32768, 32767).astype("<i2").tobytes()
 
         frame = AudioFrame(format="s16", layout="stereo", samples=SAMPLES_PER_FRAME)
         frame.planes[0].update(data)
@@ -487,9 +483,10 @@ class RoomPublisher:
             except Exception:
                 # The queued song's stream link may have expired (403).
                 lookup = track.get("pageUrl") or track.get("query") or track.get("title")
-                if not (dj.resolver and lookup):
+                resolve = dj.fallback_resolver or dj.resolver
+                if not (resolve and lookup):
                     raise
-                resolved = await dj.resolver(lookup)
+                resolved = await resolve(lookup)
                 await stems.prepare(resolved["audio_url"], _mix_keys(track), track.get("title"),
                                     instrumental=True)
         except Exception as error:
@@ -720,6 +717,24 @@ class RoomPublisher:
             self.pending_candidates.setdefault(remote_id, []).append(candidate)
 
 
+def keep_audio_loop_responsive():
+    """Settings that stop the rest of the bot from starving the audio sender.
+
+    - Thread switch interval 5 ms -> 0.5 ms: with two busy Python threads
+      (DJ, stems, analysis) driving the real sender for 15 s, the default lost
+      72% of the audio in holes up to ~900 ms; 1 ms still lost 5-9% (holes up
+      to ~100 ms); 0.5 ms lost 0-0.6%.
+    - gc.freeze(): everything loaded by now (modules, caches, the library
+      index) leaves the collector's scans, so a full collection no longer
+      walks it and freezes the loop for hundreds of milliseconds. Frozen
+      objects are still freed normally when nothing refers to them.
+    """
+    sys.setswitchinterval(0.0005)
+    gc.collect()
+    gc.freeze()
+    logger.info("Audio loop: 0.5 ms thread switching, %d startup objects frozen out of GC", gc.get_freeze_count())
+
+
 class HuddleVoiceManager:
     def __init__(self, cog=None, song_class=None):
         self.headers = {
@@ -737,6 +752,10 @@ class HuddleVoiceManager:
         self.task = None
 
     async def start(self):
+        # Logs where the loop was stuck whenever a stall makes audio drop out.
+        if getattr(self, "watchdog", None) is None:
+            self.watchdog = LoopWatchdog.maybe_start()
+            keep_audio_loop_responsive()
         global MANAGER
         if not config.HUDDLE_BASE_URL or not config.HUDDLE_BOT_TOKEN:
             logger.info("Huddle WebRTC publisher disabled (not configured)")
@@ -771,14 +790,41 @@ class HuddleVoiceManager:
                                 data.get("error") or f"Huddle returned {response.status}"
                             )
                     await self._sync(data)
+                    delay = self._poll_delay(data)
                 except asyncio.CancelledError:
                     break
                 except Exception as error:
                     logger.warning("Huddle voice state poll failed: %s", error)
-                await asyncio.sleep(1)
+                    delay = 1
+                await asyncio.sleep(delay)
+
+    #: Seconds between polls while someone is in voice or something plays.
+    POLL_ACTIVE = 1
+    #: Seconds between polls while every voice room is empty and silent.
+    POLL_IDLE = 5
+
+    def _poll_delay(self, data: dict) -> float:
+        """Poll every second only while music could start or is playing.
+
+        Music only plays in a voice room someone is in, and /play needs its
+        caller in voice, so while every room is empty nothing can start; the
+        once-a-second poll was ~10,000 requests every three hours to Huddle
+        regardless.
+        """
+        if self.publishers:
+            return self.POLL_ACTIVE
+        for server in data.get("servers") or []:
+            for room in server.get("voiceChannels") or []:
+                if (room.get("player") or {}).get("track"):
+                    return self.POLL_ACTIVE
+                if any(not member.get("bot") for member in room.get("members") or []):
+                    return self.POLL_ACTIVE
+        return self.POLL_IDLE
 
     #: How many queued placeholders to have resolved ahead of time.
     RESOLVE_AHEAD = 2
+    #: A placeholder that could not be found is not looked up again for this long.
+    RESOLVE_RETRY_SECONDS = 600
 
     def _resolve_upcoming(self, channel_id: str, player: dict):
         """Look up playlist placeholders just before they are needed."""
@@ -789,6 +835,10 @@ class HuddleVoiceManager:
             track_id = track.get("id")
             task = self.resolve_tasks.get(track_id)
             if task and not task.done():
+                continue
+            failures = self.__dict__.setdefault("resolve_failed", {})
+            if (index > 0 and time.monotonic() - failures.get(track_id, -1e9)
+                    < self.RESOLVE_RETRY_SECONDS):
                 continue
             self.resolve_tasks[track_id] = asyncio.create_task(
                 self._resolve_track(channel_id, track, current=index == 0)
@@ -802,6 +852,11 @@ class HuddleVoiceManager:
             await huddle.resolve(channel_id, track["id"])
         except Exception as error:
             logger.warning("Could not resolve %r: %s", track.get("title"), error)
+            failures = self.__dict__.setdefault("resolve_failed", {})
+            failures[track.get("id")] = time.monotonic()
+            if len(failures) > 200:
+                for key in sorted(failures, key=failures.get)[:100]:
+                    failures.pop(key, None)
             if current:
                 # Don't sit silently on a song that cannot be found.
                 try:

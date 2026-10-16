@@ -828,34 +828,89 @@ def render_preview(out_source, in_source, plan_, lead=6.0, tail=6.0):
 # --------------------------------------------------------------------------
 
 def transition_cost(a, b):
-    """How rough a -> b would be; used by Smart Reorder."""
+    """How rough a -> b would be; used by Smart Reorder.
+
+    Tempo matters most: within ~6% the decks beat-match, past ~8% they can't
+    (the booth falls back to an echo out), so the cost jumps there. Then key
+    (Camelot neighbours are free-ish, a clash is not) and mood: energy, plus
+    a small step for flipping between minor and major.
+    """
     ratio = tempo_ratio(a.get("bpm"), b.get("bpm"))
-    tempo = abs(math.log(ratio)) * 12 if ratio else 1.0
-    keys = key_distance(a.get("camelot"), b.get("camelot")) * 0.35
-    energy = abs((b.get("energy") or 0.5) - (a.get("energy") or 0.5)) * 0.8
-    return tempo + keys + energy
+    gap = abs(math.log(ratio)) if ratio else 0.3
+    tempo = gap * 8 + (1.5 if gap > 0.08 else 0.0)
+    steps = key_distance(a.get("camelot"), b.get("camelot"))
+    keys = (0.0, 0.15, 0.7)[steps] if steps < 3 else 1.2
+    energy = abs((b.get("energy") or 0.5) - (a.get("energy") or 0.5)) * 1.6
+    mode_a, mode_b = (a.get("camelot") or "")[-1:], (b.get("camelot") or "")[-1:]
+    mood = 0.15 if mode_a and mode_b and mode_a != mode_b else 0.0
+    return tempo + keys + energy + mood
+
+
+def _path_cost(order, cost):
+    return sum(cost[order[i]][order[i + 1]] for i in range(len(order) - 1))
+
+
+def _improve(order, cost):
+    """2-opt plus moving single songs, on an open path (any start and end)."""
+    count = len(order)
+    improved, rounds = True, 0
+    while improved and rounds < 40:
+        improved, rounds = False, rounds + 1
+        # 2-opt: reverse a stretch. Edges at the path's ends cost nothing.
+        for i in range(0, count - 1):
+            for j in range(i + 1, count):
+                a = order[i - 1] if i > 0 else None
+                d = order[j + 1] if j + 1 < count else None
+                b, c = order[i], order[j]
+                before = (cost[a][b] if a is not None else 0) + (cost[c][d] if d is not None else 0)
+                after = (cost[a][c] if a is not None else 0) + (cost[b][d] if d is not None else 0)
+                if after < before - 1e-9:
+                    order[i:j + 1] = reversed(order[i:j + 1])
+                    improved = True
+        # Or-opt: take one song out and put it where it fits best.
+        for i in range(count):
+            node = order[i]
+            rest = order[:i] + order[i + 1:]
+            current = _path_cost(order, cost)
+            best, best_at = current, None
+            for k in range(len(rest) + 1):
+                trial = rest[:k] + [node] + rest[k:]
+                value = _path_cost(trial, cost)
+                if value < best - 1e-9:
+                    best, best_at = value, k
+            if best_at is not None:
+                order[:] = rest[:best_at] + [node] + rest[best_at:]
+                improved = True
+    return order
 
 
 def smart_order(metas):
-    """Order indices so neighbours match in BPM and key (greedy + 2-opt)."""
+    """Order indices so neighbours match in tempo, key and mood.
+
+    Greedy from every starting song, the best one polished with 2-opt and
+    single moves; then played in the direction that warms up (energy rises
+    over the first half) rather than one that starts at its peak.
+    """
     count = len(metas)
     if count < 3:
         return list(range(count))
     cost = [[transition_cost(metas[i], metas[j]) if i != j else 0
              for j in range(count)] for i in range(count)]
-    order, left = [0], set(range(1, count))
-    while left:
-        last = order[-1]
-        nxt = min(left, key=lambda j: cost[last][j])
-        order.append(nxt)
-        left.remove(nxt)
-    improved, rounds = True, 0
-    while improved and rounds < 20:
-        improved, rounds = False, rounds + 1
-        for i in range(1, count - 2):
-            for j in range(i + 1, count - 1):
-                a, b, c, d = order[i - 1], order[i], order[j], order[j + 1]
-                if cost[a][c] + cost[b][d] < cost[a][b] + cost[c][d] - 1e-9:
-                    order[i:j + 1] = reversed(order[i:j + 1])
-                    improved = True
+    best = None
+    for start in range(count):
+        order, left = [start], set(range(count)) - {start}
+        while left:
+            last = order[-1]
+            nxt = min(left, key=lambda j: cost[last][j])
+            order.append(nxt)
+            left.remove(nxt)
+        value = _path_cost(order, cost)
+        if best is None or value < best[0]:
+            best = (value, order)
+    order = _improve(best[1], cost)
+    if _path_cost(order[::-1], cost) <= _path_cost(order, cost) + 1e-9:
+        energy = [metas[i].get("energy") or 0.5 for i in order]
+        half = max(1, count // 2)
+        if sum(energy[:half // 2 or 1]) / (half // 2 or 1) > sum(energy[half // 2:half]) / max(1, half - half // 2):
+            order.reverse()
     return order

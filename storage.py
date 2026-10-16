@@ -39,6 +39,10 @@ def save_json(path, data, logger=None):
     try:
         with _lock_for(path):
             fd, temp_path = tempfile.mkstemp(prefix=".json-", dir=directory)
+            # mkstemp makes the file owner-only, which kept the 5-minute
+            # failover sync (run by another member of the bot's group) from
+            # copying player_state.json and friends. Group may read; others not.
+            os.fchmod(fd, 0o660)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(data, handle)
                 handle.flush()
