@@ -63,6 +63,31 @@ def save_json(path, data, logger=None):
                 pass
 
 
+
+def share_with_group(directory, logger=None):
+    """Make files that save_json wrote owner-only readable by the group too.
+
+    save_json only started setting 0o660 on 2026-10-14; lyrics cached before
+    that stayed 0o600, and the backup (another member of the bot's group)
+    failed on them every five minutes. Returns how many files it changed.
+    """
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return 0
+    changed = 0
+    for entry in entries:
+        try:
+            info = entry.stat(follow_symlinks=False)
+            if entry.is_file(follow_symlinks=False) and info.st_uid == os.getuid() and not info.st_mode & 0o040:
+                os.chmod(entry.path, 0o660)
+                changed += 1
+        except OSError as exc:
+            (logger or logging.getLogger(__name__)).warning(
+                "Could not share %s with the group: %s", entry.path, exc
+            )
+    return changed
+
 class SQLiteDocumentStore:
     """Small SQLite document store with transparent JSON-file migration."""
 

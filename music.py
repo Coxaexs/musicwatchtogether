@@ -30,7 +30,7 @@ import config
 import dj
 import mixer
 import stems
-from storage import SQLiteDocumentStore, load_json, save_json
+from storage import SQLiteDocumentStore, load_json, save_json, share_with_group
 
 # Setup musics folder for downloaded songs
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +51,8 @@ logging.basicConfig(
 logger = logging.getLogger('MusicBot')
 STATE_DB_FILE = os.path.join(DATA_DIR, 'musicbot.sqlite3')
 state_store = SQLiteDocumentStore(STATE_DB_FILE, logger)
+if share_with_group(os.path.join(DATA_DIR, 'lyrics'), logger):
+    logger.info("Made older lyrics cache files readable by the bot's group")
 
 try:
     os.makedirs(MUSICS_FOLDER, exist_ok=True)

@@ -118,6 +118,8 @@ class SpotifyCollectionTests(unittest.TestCase):
 
 
 class FakeCog:
+    GLOBAL_GUILD = music.MusicCog.GLOBAL_GUILD
+
     def __init__(self):
         self.playlists = {"1": {"shared": {"Night Drive": []}, "users": {}}}
         self.meta = {}
