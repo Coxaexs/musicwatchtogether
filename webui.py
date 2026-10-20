@@ -105,6 +105,8 @@ def _pair_key(entries, index):
 
 
 def _playlist_mix(guild_id, owner, name):
+    if owner == 'global':                       # a playlist shown in every room keeps one mix
+        guild_id, owner = '*', 'shared'
     mixes = state_store.load('playlist_mixes', {})
     record = mixes.get(str(guild_id), {}).get(owner, {}).get(name) or {}
     return {'enabled': bool(record.get('enabled')),
@@ -112,6 +114,8 @@ def _playlist_mix(guild_id, owner, name):
 
 
 def _save_playlist_mix(guild_id, owner, name, record):
+    if owner == 'global':
+        guild_id, owner = '*', 'shared'
     mixes = state_store.load('playlist_mixes', {})
     mixes.setdefault(str(guild_id), {}).setdefault(owner, {})[name] = record
     state_store.save('playlist_mixes', mixes)
@@ -763,6 +767,7 @@ class WebUI:
             'sleep_timer_ends_at': player.sleep_timer_ends_at,
             'is_247': player.is_247_mode,
             'current': current,
+            'stems_available': stems.enabled(),
             'queue': [_song_json(s) for s in list(player.queue)[:100]],
             'queue_length': len(player.queue),
             'history': [_song_json(s) for s in list(player.history)[:10]],
@@ -974,7 +979,7 @@ class WebUI:
         owner = cog.resolve_playlist_owner(data, guild.id, user_id, name)
         if not owner:
             raise web.HTTPNotFound(text=f'No playlist named {name}.')
-        entries = cog._bucket_for(data.get(str(guild.id), {}), owner).get(name, [])
+        entries = cog._bucket_for(data.get(cog._guild_for(guild.id, owner), {}), owner).get(name, [])
         return data, entries, owner, _playlist_mix(guild.id, owner, name)
 
     def _mix_json(self, guild, name, entries, record):
@@ -1075,7 +1080,7 @@ class WebUI:
                 order = [known[i] for i in mixer.smart_order([metas[i] for i in known])]
                 order += [i for i in range(len(entries)) if i not in set(known)]
                 reordered = [entries[i] for i in order]
-                self.cog._bucket_for(data.setdefault(str(guild.id), {}), owner)[name] = reordered
+                self.cog._bucket_for(data.setdefault(self.cog._guild_for(guild.id, owner), {}), owner)[name] = reordered
                 self.cog._write_playlists(data)
                 entries = reordered
             else:
@@ -1298,6 +1303,64 @@ class WebUI:
         finally:
             await socket.close()
         return socket
+
+    async def api_split_stems(self, request):
+        """Split the playing song or a queued one into stems, without the DJ booth.
+
+        Body: {"target": "current" | "queue", "index": n}. Uses the same queue as
+        the "Stemmed songs" playlist; the song joins that playlist when ready.
+        """
+        if not stems.enabled():
+            return web.json_response({'error': 'Stem separation is not installed on this bot.'}, status=409)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        target = body.get('target') or 'current'
+        requested = request.match_info.get('guild_id', '')
+        if huddle.is_huddle_id(requested):
+            import huddle_voice
+            manager = huddle_voice.MANAGER
+            player = (manager.players.get(huddle.channel_id_from(requested)) if manager else None) or {}
+            if target == 'queue':
+                queue = list(player.get('queue') or [])
+                index = int(body.get('index', -1))
+                track = queue[index] if 0 <= index < len(queue) else None
+            else:
+                track = player.get('track')
+            if not track:
+                return web.json_response({'error': 'That song is no longer there.'}, status=404)
+            name = ' — '.join(x for x in (track.get('title'), track.get('artist')) if x) or 'Unknown'
+            page = track.get('pageUrl') or ''
+            entry = {'title': track.get('title') or 'Unknown',
+                     'url': page or 'spotify:search:' + (track.get('query') or name),
+                     'thumbnail': track.get('thumbnail'), 'source_type': 'huddle'}
+        else:
+            guild, player = self._get_guild_and_player(request)
+            if target == 'queue':
+                queue = list(player.queue)
+                index = int(body.get('index', -1))
+                song = queue[index] if 0 <= index < len(queue) else None
+            else:
+                song = player.current
+            if not song:
+                return web.json_response({'error': 'That song is no longer there.'}, status=404)
+            entry = {'title': song.title, 'url': song.url, 'duration': song.duration,
+                     'source_type': song.source_type,
+                     'thumbnail': _thumbnail_from_url(song.url, song.thumbnail)}
+        if (entry.get('url') or '').startswith(('http://', 'https://')) and not mixer.track_key(entry['url']):
+            return web.json_response({'error': "That song can't be split."}, status=400)
+        queued, ready = request_stems([entry])
+        title = entry['title']
+        if ready:
+            message = f'{title} already has stems.'
+        elif queued:
+            waiting = max(0, _stem_queue.qsize() - 1) if _stem_queue else 0
+            message = (f'Splitting {title} into stems' + (f' after {waiting} other songs' if waiting else '')
+                       + f'. It shows up in {STEMS_PLAYLIST} when it is ready.')
+        else:
+            message = f'Already splitting {title}.'
+        return web.json_response({'message': message})
 
     async def api_action(self, request):
         requested = request.match_info.get('guild_id', '')
@@ -1741,10 +1804,13 @@ class WebUI:
     def _playlist_json(self, guild_id, user_id):
         """The acting user's playlists (own + guild-shared, own shadows shared)."""
         cog = self.cog
-        guild_data = cog._read_playlists().get(str(guild_id), {})
-        meta = cog._read_playlist_meta().get(str(guild_id), {})
+        all_lists = cog._read_playlists()
+        all_meta = cog._read_playlist_meta()
+        guild_data = all_lists.get(str(guild_id), {})
+        meta = all_meta.get(str(guild_id), {})
         own = guild_data.get('users', {}).get(str(user_id), {}) if user_id else {}
         shared = guild_data.get('shared', {})
+        everywhere = all_lists.get(cog.GLOBAL_GUILD, {}).get('shared', {})
 
         def track_json(entry):
             return {
@@ -1755,7 +1821,8 @@ class WebUI:
             }
 
         def playlist_json(name, entries, owner_key, is_shared):
-            custom = cog._bucket_for(meta, owner_key).get(name) if meta else None
+            source = all_meta.get(cog.GLOBAL_GUILD, {}) if owner_key == 'global' else meta
+            custom = cog._bucket_for(source, owner_key).get(name) if source else None
             return {
                 'name': name,
                 'count': len(entries),
@@ -1764,10 +1831,12 @@ class WebUI:
                      if _thumbnail_from_url(entry.get('url'), entry.get('thumbnail'))), None),
                 'custom_cover': bool(custom),
                 'shared': is_shared,
+                'everywhere': owner_key == 'global',
                 'tracks': [track_json(entry) for entry in entries[:200]],
             }
 
-        items = {name: playlist_json(name, entries, 'shared', True) for name, entries in shared.items()}
+        items = {name: playlist_json(name, entries, 'global', True) for name, entries in everywhere.items()}
+        items.update({name: playlist_json(name, entries, 'shared', True) for name, entries in shared.items()})
         items.update({name: playlist_json(name, entries, str(user_id), False) for name, entries in own.items()})
         result = [items[name] for name in sorted(items, key=str.lower) if name != STEMS_PLAYLIST]
         stem_entries = stems_playlist_entries(self._stems_library)
@@ -1900,7 +1969,9 @@ class WebUI:
         if not cog:
             return web.json_response({'track': None, 'lines': [], 'lyrics': None})
 
-        synced = await cog._fetch_synced_lyrics(query, artist, duration)
+        # Only Huddle's /lyrics and /lyricsnow call this, so a person is asking:
+        # look again even if the play-time prefetch missed a few minutes ago.
+        synced = await cog._fetch_synced_lyrics(query, artist, duration, fresh=True)
         if synced:
             return web.json_response({
                 'track': synced.get('track'),
@@ -1999,7 +2070,8 @@ class WebUI:
         # playlist wherever this user can see it (own first, then shared)
         own_lists = cog._bucket_for(guild_data, owner_key, create=True)
         found_owner = cog.resolve_playlist_owner(data, guild.id, user_id, name)
-        found_lists = cog._bucket_for(guild_data, found_owner) if found_owner else None
+        found_lists = (cog._bucket_for(data.setdefault(cog._guild_for(guild.id, found_owner), {}), found_owner)
+                       if found_owner else None)
         imported_name = None
 
         # The day's stem mixes play and queue like any playlist, and are never edited.
@@ -2126,10 +2198,13 @@ class WebUI:
         elif action == 'delete':
             if found_lists is None:
                 return web.json_response({'error': f'No playlist named {name}.'}, status=404)
+            if name.rstrip().endswith(' FLAC') or found_owner == 'global':
+                # The AI-planned FLAC playlists stay: their songs are kept split in high quality for them.
+                return web.json_response({'error': f'{name} is protected and cannot be deleted.'}, status=403)
             del found_lists[name]
             cog._write_playlists(data)
             meta_data = cog._read_playlist_meta()
-            guild_meta = cog._bucket_for(meta_data.setdefault(str(guild.id), {}), found_owner)
+            guild_meta = cog._bucket_for(meta_data.setdefault(cog._guild_for(guild.id, found_owner), {}), found_owner)
             cover_url = guild_meta.pop(name, None)
             if cover_url and cover_url.startswith('/playlist-covers/'):
                 try:
@@ -2292,7 +2367,8 @@ class WebUI:
         if not save_bytes_atomic(os.path.join(PLAYLIST_COVERS_DIR, filename), image, logger):
             return web.json_response({'error': 'Could not safely store that cover.'}, status=503)
         meta_data = cog._read_playlist_meta()
-        guild_meta = cog._bucket_for(meta_data.setdefault(str(guild.id), {}), found_owner, create=True)
+        guild_meta = cog._bucket_for(meta_data.setdefault(cog._guild_for(guild.id, found_owner), {}), found_owner,
+                                     create=True)
         old_cover = guild_meta.get(name)
         guild_meta[name] = '/playlist-covers/' + filename
         cog._write_playlist_meta(meta_data)
@@ -2330,6 +2406,7 @@ async def start_web_server(bot):
     app.router.add_get('/api/guilds/{guild_id}', ui.api_guild_state)
     app.router.add_get('/api/live', ui.api_live)
     app.router.add_post('/api/guilds/{guild_id}/action', ui.api_action)
+    app.router.add_post('/api/guilds/{guild_id}/stems', ui.api_split_stems)
     app.router.add_post('/api/guilds/{guild_id}/play', ui.api_play)
     app.router.add_post('/api/huddle/resolve', ui.api_huddle_resolve)
     app.router.add_get('/api/guilds/{guild_id}/lyrics', ui.api_lyrics)
@@ -2477,6 +2554,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   body[data-theme="vinyl-classic"] .card { box-shadow: inset 0 1px 0 rgba(255,235,200,.05), 0 2px 8px rgba(0,0,0,.4); }
   .np { display: flex; gap: 16px; align-items: center; }
   .np img { width: 110px; height: 82px; object-fit: cover; border-radius: 8px; background: var(--panel2); }
+  .stem-split { margin-top: 8px; padding: 4px 10px; font-size: 12px; }
   .np .title { font-size: 17px; font-weight: 600; margin-bottom: 4px; }
   .np .sub { color: var(--muted); font-size: 13px; }
   .bar { height: 6px; background: var(--panel2); border-radius: 3px; margin: 10px 0 4px; overflow: hidden; cursor: pointer; }
@@ -3560,6 +3638,7 @@ function render() {
         <div class="sub">requested by ${esc(c.requester)}${s.channel ? ' • 🔊 ' + esc(s.channel) : ''}${s.is_247 ? ' • 🔄 24/7' : ''}</div>
         ${c.autoplay_reason ? `<div class="sub" title="${esc(c.autoplay_reason)}">🧭 ${esc(c.autoplay_reason)}</div>` : ''}
         <div class="times"><span id="pos"></span><span>${esc(c.duration)}</span></div>
+        ${s.stems_available ? `<button class="stem-split" title="Split this song into drums, bass, vocals and the rest (no DJ booth needed)" onclick="splitStems('current')">✂ Stems</button>` : ''}
       </div>`;
     } else {
       html += `<div class="empty">${s.connected ? 'No record on the platter — add a song below.' : 'Not in a voice channel. Use /join in Discord.'}</div>`;
@@ -3575,6 +3654,7 @@ function render() {
         ${c.autoplay_reason ? `<div class="sub" title="${esc(c.autoplay_reason)}">🧭 ${esc(c.autoplay_reason)}</div>` : ''}
         <div class="bar" onclick="seekProgress(event)"><div id="pbar"></div></div>
         <div class="times"><span id="pos"></span><span>${esc(c.duration)}</span></div>
+        ${s.stems_available ? `<button class="stem-split" title="Split this song into drums, bass, vocals and the rest (no DJ booth needed)" onclick="splitStems('current')">✂ Stems</button>` : ''}
       </div></div>`;
   } else {
     html += `<div class="empty">${s.connected ? 'Nothing playing — add a song below.' : 'Not in a voice channel. Use /join in Discord.'}</div>`;
@@ -3691,6 +3771,7 @@ function render() {
       `<div class="qitem" draggable="true" data-queue-index="${i}" ondragstart="queueDragStart(event,${i})" ondragover="queueDragOver(event)" ondragleave="this.classList.remove('drag-over')" ondrop="queueDrop(event,${i})" ondragend="queueDragEnd()"><span class="n" title="Drag to reorder">☷ ${i + 1}.</span><span class="t">${esc(q.title)}</span>` +
       `<span class="d">${esc(q.duration)}</span><span class="btns">` +
       `<button title="Play now" onclick="act('skipto',{index:${i}})">▶</button>` +
+      (s.stems_available ? `<button title="Split into stems" aria-label="Split ${esc(q.title)} into stems" onclick="splitStems('queue',${i})">✂</button>` : '') +
       `<button title="Move up" aria-label="Move ${esc(q.title)} up" onclick="moveQueue(${i},${i-1})">↑</button>` +
       `<button title="Move down" aria-label="Move ${esc(q.title)} down" onclick="moveQueue(${i},${i+1})">↓</button>` +
       `<button title="Remove" onclick="act('remove',{index:${i}})">✖</button></span></div>`).join('');
@@ -3775,6 +3856,15 @@ async function act(action, extra) {
       {method: 'POST', body: JSON.stringify(Object.assign({action}, extra || {}))});
     lastStateAt = Date.now();
     render();
+  } catch (e) { toast('❌ ' + e.message); }
+}
+
+// Split a song into stems (drums, bass, vocals, rest) without the DJ booth.
+async function splitStems(target, index) {
+  try {
+    const res = await api(basePath + 'api/guilds/' + selected + '/stems',
+      {method: 'POST', body: JSON.stringify({target, index})});
+    toast('✂ ' + res.message);
   } catch (e) { toast('❌ ' + e.message); }
 }
 

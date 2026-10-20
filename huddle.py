@@ -15,7 +15,7 @@ import json
 import os
 import hashlib
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 
 import aiohttp
@@ -52,7 +52,33 @@ _DEFAULT_SETTINGS = {
 }
 
 
+_json_cache = {}   # path -> (checked at, mtime, value)
+
+
 def _read_json(path, fallback):
+    """A JSON file's content, read again only when it changed (checked every 2 s).
+
+    Room settings are read on every state poll and every 2 s by a live DJ booth,
+    on the event loop that feeds the room's audio; a slow disk stalled it.
+    Callers must not change what they get back (copy first).
+    """
+    now = time.monotonic()
+    cached = _json_cache.get(path)
+    if cached and now - cached[0] < 2:
+        return cached[2] if isinstance(cached[2], type(fallback)) else fallback
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        mtime = None
+    if cached and cached[1] == mtime and mtime is not None:
+        _json_cache[path] = (now, mtime, cached[2])
+        return cached[2] if isinstance(cached[2], type(fallback)) else fallback
+    value = _read_json_file(path, fallback)
+    _json_cache[path] = (now, mtime, value)
+    return value
+
+
+def _read_json_file(path, fallback):
     try:
         with open(path, 'r', encoding='utf-8') as handle:
             value = json.load(handle)
@@ -66,6 +92,7 @@ def _write_json(path, value):
     with open(temporary, 'w', encoding='utf-8') as handle:
         json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
     os.replace(temporary, path)
+    _json_cache.pop(path, None)
 
 
 def settings_for(channel_or_guild_id):
@@ -78,7 +105,7 @@ def settings_for(channel_or_guild_id):
 def update_settings(channel_or_guild_id, **patch):
     guild_id = (channel_or_guild_id if is_huddle_id(channel_or_guild_id)
                 else PREFIX + str(channel_or_guild_id))
-    all_settings = _read_json(_SETTINGS_FILE, {})
+    all_settings = dict(_read_json(_SETTINGS_FILE, {}))      # a copy: the read is cached
     settings = {**_DEFAULT_SETTINGS, **(all_settings.get(guild_id) or {})}
     settings.update(patch)
     all_settings[guild_id] = settings
@@ -190,6 +217,11 @@ def _song_json(track, requester=None):
     }
 
 
+def _stems_available():
+    import stems              # late: stems imports config, which is fine, but keep huddle light
+    return stems.enabled()
+
+
 def _format_duration(seconds):
     if not seconds:
         return None
@@ -249,6 +281,7 @@ async def room_state(guild_id):
         'sleep_timer_ends_at': 0,
         'is_247': False,
         'current': current,
+        'stems_available': _stems_available(),
         'queue': [_song_json(item) for item in (player.get('queue') or [])[:100]],
         'queue_length': len(player.get('queue') or []),
         'history': [],
@@ -349,6 +382,8 @@ async def action(guild_id, body):
         state = await room_state(guild_id)
         state['feedback'] = {**result, 'kind': name}
         return state
+    if name == 'longhistory':
+        return {'plays': played(guild_id, int(body.get('limit') or 250))}
     if name in ('stats', 'wrapped'):
         state = await room_state(guild_id)
         state['report'] = stats(guild_id, wrapped=name == 'wrapped')
@@ -432,7 +467,7 @@ async def feedback(guild_id, user_id, kind):
         raise ValueError('Nothing is playing.')
 
     path = _feedback_file(kind)
-    data = _read_json(path, {})
+    data = _read_json_file(path, {})          # edited in place below: never the cached copy
     stable_user_id = int.from_bytes(
         hashlib.sha256(str(user_id).encode('utf-8')).digest()[:8], 'big'
     ) & 0x7FFFFFFFFFFFFFFF
@@ -493,6 +528,35 @@ def record_play(channel_id, track):
             handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
     except OSError as error:
         logger.debug('Could not log Huddle play: %s', error)
+
+
+def played(guild_id, limit=250):
+    """The room's last `limit` plays from the stats log, newest first.
+
+    Unlike the hub's own history this survives restarts and includes Smart
+    Autoplay picks, so /longhistory can find a song from earlier in the day."""
+    limit = max(1, min(250, limit))
+    recent = deque(maxlen=limit)
+    try:
+        with open(_STATS_FILE, 'r', encoding='utf-8') as handle:
+            for line in handle:
+                if guild_id not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(entry.get('guild_id')) == guild_id:
+                    recent.append(entry)
+    except FileNotFoundError:
+        pass
+    return [{
+        'title': item.get('title') or 'Unknown',
+        'url': item.get('url'),
+        'seconds': item.get('seconds') or None,
+        'ts': int(item.get('ts') or 0),
+        'requestedBy': item.get('user_name'),
+    } for item in reversed(recent)]
 
 
 def stats(guild_id, wrapped=False):

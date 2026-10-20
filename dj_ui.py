@@ -38,7 +38,7 @@ body:not([data-mode=simple]) .simple-only{display:none!important}
 .modes button.on{background:var(--panel2);color:var(--text);box-shadow:0 0 0 1px var(--edge2) inset}
 .onair{display:flex;align-items:center;gap:6px;font-weight:800;font-size:11px;letter-spacing:.12em;color:var(--dim)}
 .onair i{width:8px;height:8px;border-radius:50%;background:var(--dim)}
-.onair.live{color:var(--red)}.onair.live i{background:var(--red);box-shadow:0 0 10px var(--red);animation:blink 1.4s infinite}
+.onair.live{color:var(--red)}.onair.live i{background:var(--red);box-shadow:0 0 10px var(--red);animation:blink 1.4s infinite;will-change:opacity}
 .pill{padding:7px 12px;border-radius:999px;border:1px solid var(--edge2);font-weight:700;font-size:11px;letter-spacing:.08em}
 .pill.auto.on{background:var(--orange);border-color:var(--orange);color:#1a0d00;box-shadow:0 0 16px #ff8a1c66}
 .pill.stemsw.on{background:#ff4fa3;border-color:#ff4fa3;color:#2a0016;box-shadow:0 0 16px #ff4fa366}
@@ -168,8 +168,11 @@ input[type=range]::-moz-range-thumb{background:linear-gradient(90deg,#8d939c,#e9
 body.realmode .smoothonly{display:none!important}
 body:not(.realmode) .realonly{display:none!important}
 .vibeseg button.on[data-v=chill]{background:#1f6bff;color:#fff}.vibeseg button.on[data-v=club]{background:#ff8a1c;color:#1a0d00}
+.aiseg button.on[data-v="1"]{background:linear-gradient(90deg,#7c5cff,#ff4fd8);color:#fff;box-shadow:0 0 14px #7c5cff66}
 .vibeseg button.on[data-v=hype]{background:linear-gradient(90deg,#ff3d5a,#ff4fa3);color:#fff;box-shadow:0 0 14px #ff3d5a66}
 .stems{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.stems.x6{grid-template-columns:repeat(3,minmax(0,1fr))}
+.stem.gone{display:none}
 .stem{position:relative;overflow:hidden;border-radius:8px;padding:9px 4px 11px;font-weight:800;font-size:10px;letter-spacing:.1em;background:#0d0f12;border:1px solid #000;box-shadow:0 1px 0 #ffffff10 inset;color:var(--dim)}
 .stem i{position:absolute;left:0;bottom:0;height:3px;width:calc(var(--g,1)*100%);background:var(--pc);transition:width .2s}
 .stem.lit{color:#fff;box-shadow:0 0 0 1px var(--pc) inset,0 0 12px color-mix(in srgb,var(--pc) 35%,transparent)}
@@ -383,7 +386,10 @@ function knob(p){
   <svg viewBox="0 0 44 44"><path class="kt"/><path class="ka"/><circle class="kb" cx="22" cy="22" r="14"/><line class="kp" x1="22" y1="22" x2="22" y2="11"/></svg>
   <label>${p.label}</label><output></output></div>`;
 }
-const STEMS=[['drums','DRUMS','#ffb020'],['bass','BASS','#1f6bff'],['vocals','VOCALS','#ff4fa3'],['other','MELODY','#2fe07a']];
+const STEMS=[['drums','DRUMS','#ffb020'],['bass','BASS','#1f6bff'],['vocals','VOCALS','#ff4fa3'],['guitar','GUITAR','#ff5a36'],['piano','PIANO','#b47bff'],['other','MELODY','#2fe07a']];
+// Guitar and piano only exist for songs split with them (upgraded on Oracle); otherwise they're part of MELODY.
+const EXTRA_STEMS=['guitar','piano'];
+const stemShown=(d,n)=>!EXTRA_STEMS.includes(n)||!!d?.stems?.extra;
 function deckHTML(k){
   const loops=[1/4,1/2,1,2,4,8,16,32];
   return `
@@ -470,6 +476,7 @@ function build(){
     <div class="seg modeseg" id="autoMode" title="Auto DJ: plays the queue in order, smooth mixes. Real DJ: performs a set — picks songs, plays their best part, mashups and drops."><button data-v="auto">AUTO DJ</button><button data-v="real">REAL DJ</button></div>
     <div class="seg modeseg vibeseg realonly" id="vibeSeg" title="How much Real DJ plays the decks: loops, effects, sampler, drops"><button data-v="chill">CHILL</button><button data-v="club">CLUB</button><button data-v="hype">HYPE</button></div>
     <div class="seg modeseg realonly" id="threeSeg" title="3 songs: Real DJ also lays a third song's vocal over the playing beat for a phrase, then plays that song next"><button data-v="2">2 SONGS</button><button data-v="3">3 SONGS</button></div>
+    <div class="seg modeseg aiseg realonly" id="aiSeg" title="Experimental: Real DJ uses the offline AI analysis: songs that sound alike follow each other, and it leaves, enters, loops and plays effects where an AI that listened to each song says it fits. Off = the DJ as before."><button data-v="0">AI OFF</button><button data-v="1">✨ AI · BETA</button></div>
     <div class="realinfo" id="realInfo"></div>
     <div class="smoothonly"><div class="label">Transition</div><div class="chips" id="styleChips"></div></div>
     <div class="row between med smoothonly"><span class="label">Length</span><select id="autoBeats" style="padding:4px 6px"><option value="">Style default</option><option value="4">1 bar</option><option value="8">2 bars</option><option value="16">4 bars</option><option value="32">8 bars</option><option value="64">16 bars</option></select></div>
@@ -540,7 +547,7 @@ function wire(){
       if(op==='spinback')return api({op:'brake',deck:k,spinback:true});
       if(op==='load_next')return api({op:'load_next',deck:k});
       if(b.dataset.stem){const g=S?.decks?.[k]?.stems?.gain||{};const n=b.dataset.stem;
-        if(e.shiftKey){for(const [m] of STEMS)api({op:'set',deck:k,param:'stem_'+m,value:m===n?1:0});return}
+        if(e.shiftKey){const d=S?.decks?.[k];for(const [m] of STEMS)if(stemShown(d,m))api({op:'set',deck:k,param:'stem_'+m,value:m===n?1:0});return}
         return api({op:'set',deck:k,param:'stem_'+n,value:(g[n]??1)>0.5?0:1})}
       if(op)return api({op,deck:k});
       if(b.dataset.flag)return api({op:'flag',deck:k,name:b.dataset.flag});
@@ -580,6 +587,7 @@ function wire(){
     api({op:'auto',mode,on:true}).then(r=>r&&toast(msg))};
   const VIBE_MSG={chill:'Chill: long smooth blends, few tricks.',club:'Club: loops, effects and drops most phrases.',hype:'Hype: tricks all the time, drops, sampler.'};
   $$('#vibeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',vibe:b.dataset.v}).then(r=>r&&toast(VIBE_MSG[b.dataset.v])));
+  $$('#aiSeg button').forEach(b=>b.onclick=()=>api({op:'auto',ai:b.dataset.v==='1'}).then(r=>r&&toast(b.dataset.v==='1'?'AI (beta): songs that sound alike, and exits, entries and effects an AI picked for each song.':'AI off: the DJ as before.')));
   $('#pauseSet').onclick=()=>api({op:S&&S.paused?'resume':'pause'});
   $$('#threeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',three:b.dataset.v==='3'}).then(r=>r&&toast(b.dataset.v==='3'?'3 songs: a third song sings over the beat for a phrase, then plays next.':'2 songs: back to back.')));
   $('#autoTop').onclick=modeBtn('auto','Auto DJ: the queue in order, smooth mixes.');
@@ -737,8 +745,11 @@ function renderDeck(k){
   box.classList.toggle('hide',!S.stems?.on);
   box.classList.toggle('wait',d.loaded&&st.status==='separating');
   box.classList.toggle('off',!d.loaded||(st.status!=='ready'&&st.status!=='separating'));
-  $$('.stem',box).forEach(b=>{const kar=d.karaoke&&b.dataset.stem==='vocals';const g=kar?0:(sg[b.dataset.stem]??1);b.style.setProperty('--g',g);b.classList.toggle('lit',st.status==='ready'&&g>0.5);
-    b.firstChild.textContent=kar?'🎤 KARAOKE':(STEMS.find(x=>x[0]===b.dataset.stem)||[])[1];b.title=kar?'Karaoke mode is on for this room: vocals stay out':''});
+  box.classList.toggle('x6',!!st.extra);
+  $$('.stem',box).forEach(b=>{const n=b.dataset.stem,kar=d.karaoke&&n==='vocals';const g=kar?0:(sg[n]??1);b.style.setProperty('--g',g);b.classList.toggle('lit',st.status==='ready'&&g>0.5);
+    b.classList.toggle('gone',!stemShown(d,n));
+    b.firstChild.textContent=kar?'🎤 KARAOKE':(n==='other'&&st.extra?'OTHER':(STEMS.find(x=>x[0]===n)||[])[1]);
+    b.title=kar?'Karaoke mode is on for this room: vocals stay out':(n==='other'&&st.extra?'Everything but drums, bass, vocals, guitar and piano':'')});
   const status=$('[data-r=status]',el);
   status.textContent=d.error?('⚠ '+d.error):(d.loading?'Decoding and analysing…':
     (d.loaded&&st.status==='separating'?'Splitting stems… (plays normally meanwhile)':(d.loaded&&st.status==='failed'?'Stems unavailable for this song.':'')));
@@ -780,8 +791,8 @@ function renderMixer(){
   const btn=$('#mixBtn');
   btn.disabled=!(other&&S.decks[other].loaded)||!!tr;
   btn.textContent=tr?(tr.started?'MIXING…':'ARMED'):(other?`MIX ${playing[0]} ▶ ${other}`:'MIX ▶');
-  $('#trText').innerHTML=tr?`<b>${esc(tr.label)}</b> ${tr.from} → ${tr.to} · ${tr.started?Math.round(tr.progress*100)+'%':'starts in '+Math.max(0,Math.ceil(tr.starts_in_beats??0))+' beats'}`:
-    (S.auto.on?(S.auto.mode==='real'?'<b>Real DJ</b> is on. It plays each song\'s best part and mixes into the next one\'s big moment.':'<b>Auto DJ</b> is on. It mixes the next song in on a phrase.'):'Load a song on each deck, then hit <b>MIX</b> or ride the crossfader.');
+  setHTML($('#trText'),tr?`<b>${esc(tr.label)}</b> ${tr.from} → ${tr.to} · ${tr.started?Math.round(tr.progress*100)+'%':'starts in '+Math.max(0,Math.ceil(tr.starts_in_beats??0))+' beats'}`:
+    (S.auto.on?(S.auto.mode==='real'?'<b>Real DJ</b> is on. It plays each song\'s best part and mixes into the next one\'s big moment.':'<b>Auto DJ</b> is on. It mixes the next song in on a phrase.'):'Load a song on each deck, then hit <b>MIX</b> or ride the crossfader.'));
   $('#trBar').style.width=tr&&tr.started?(tr.progress*100)+'%':'0';
   $('#trRight').textContent=tr?'':'';
   // Simple mode: hold-to-use FX pads on the master.
@@ -803,6 +814,7 @@ function renderAuto(){
   $$('#autoMode button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.mode||'auto')));
   $$('#vibeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.vibe||'club')));
   $$('#threeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.three?'3':'2')));
+  $$('#aiSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.ai?'1':'0')));
   {const pb=$('#pauseSet');const t=S.paused?'▶ RESUME SET':'⏸ PAUSE SET';if(pb.textContent!==t)pb.textContent=t;pb.classList.toggle('on',!!S.paused)}
 
   const ri=$('#realInfo');
@@ -822,7 +834,7 @@ function renderAuto(){
   let html=tr?`Mixing into <b>${esc(S.decks[tr.to].title||'deck '+tr.to)}</b>`:
     real?(S.crate.length?`${S.crate.length} songs in the crate. Real DJ picks from all of them.`:'The crate is empty. Queue a playlist and Real DJ picks from it.'):
     (next?`Up next: <b>${esc(next.title||next.query)}</b>`:'The queue is empty. Add songs with <b>/play</b> or the search tab'+(S.kind==='discord'&&a.on?', or Smart Autoplay picks one.':'.'));
-  $('#nextUp').innerHTML=html;
+  setHTML($('#nextUp'),html);
   const sg=$('#sgrid');
   if(CAT&&!sg.children.length){sg.innerHTML=CAT.samples.map((n,i)=>`<button class="pad" data-sample="${n}" style="--pc:${HOT[(i+4)%8]}">${SAMPLE_NAMES[n]||n}</button>`).join('');
     $$('[data-sample]',sg).forEach(b=>b.addEventListener('pointerdown',e=>{e.preventDefault();b.classList.add('lit');setTimeout(()=>b.classList.remove('lit'),180);api({op:'sample',name:b.dataset.sample})}))}
@@ -850,31 +862,53 @@ function livePos(d){
 const cv={};
 function resize(){
   for(const id of ['waveA','waveB','ovA','ovB']){
-    const c=$('#'+id);const r=c.getBoundingClientRect();const dpr=Math.min(2,devicePixelRatio||1);
+    const c=$('#'+id);const r=c.getBoundingClientRect();
+    // 1.5x is sharp enough for a moving waveform and has ~45% fewer pixels to fill than 2x.
+    const dpr=Math.min(1.5,devicePixelRatio||1);
     const w=Math.max(10,Math.round(r.width*dpr)),h=Math.max(10,Math.round(r.height*dpr));
     if(c.width!==w||c.height!==h){c.width=w;c.height=h;if(id.startsWith('ov'))ovCache[id.slice(2)]=null}
     cv[id]=c;
   }
+}
+// The scrolling waveform is drawn once into a strip three views wide and only
+// copied each frame; it is redrawn when the playhead nears the strip's edge.
+// (Drawing it column by column every frame kept a laptop's GPU and CPU busy.)
+const WAVE_SPAN=10; // seconds across the view
+const waveCache={};
+function waveStrip(k,w,W,H,t0){
+  let c=waveCache[k];
+  const pxPerSec=W/WAVE_SPAN;
+  if(c&&c.id===w.id&&c.W===W&&c.H===H&&t0>=c.t0&&t0+WAVE_SPAN<=c.t0+3*WAVE_SPAN)return c;
+  const start=t0-WAVE_SPAN;
+  const canvas=c&&c.W===W&&c.H===H?c.canvas:document.createElement('canvas');
+  canvas.width=3*W;canvas.height=H;
+  const g=canvas.getContext('2d');const mid=H/2,n=w.low.length,step=Math.max(1,Math.round(W/600));
+  g.clearRect(0,0,3*W,H);
+  // One path per colour: three fills instead of thousands of separate rectangles.
+  const bands=[[w.low,0.95,'#1f6bff'],[w.mid,0.8,'#ff9a2e'],[w.high,0.6,'#f4f6ff']];
+  for(const [band,scale,color] of bands){
+    g.beginPath();
+    for(let x=0;x<3*W;x+=step){
+      const i=Math.floor((start+x/pxPerSec)*w.rate);if(i<0||i>=n)continue;
+      const v=band[i]/255*mid*scale;if(v>0.3)g.rect(x,mid-v,step,v*2);
+    }
+    g.fillStyle=color;g.fill();
+  }
+  c=waveCache[k]={id:w.id,W,H,t0:start,canvas};
+  return c;
 }
 function drawWave(k,d,pos){
   const c=cv['wave'+k];if(!c)return;const g=c.getContext('2d');const W=c.width,H=c.height;
   g.fillStyle='#040506';g.fillRect(0,0,W,H);
   const w=waves[k];
   if(!d.loaded||!w){g.fillStyle='#1b1f25';g.font=`${Math.round(H/5)}px system-ui`;g.textAlign='center';g.fillText(d.loading?'LOADING…':'NO TRACK',W/2,H/2+H/14);return}
-  const span=10; // seconds across the view
-  const pxPerSec=W/span, t0=pos-span/2, mid=H/2;
+  const span=WAVE_SPAN;
+  const pxPerSec=W/span, t0=pos-span/2;
   // loop region
   const lp=d.loop;
   if(lp&&lp.in!=null&&lp.out!=null){g.fillStyle=lp.on?'#ff8a1c30':'#ff8a1c14';const x1=(lp.in-t0)*pxPerSec,x2=(lp.out-t0)*pxPerSec;g.fillRect(x1,0,x2-x1,H)}
-  const n=w.low.length;
-  const step=Math.max(1,Math.round(W/600));
-  for(let x=0;x<W;x+=step){
-    const i=Math.floor((t0+x/pxPerSec)*w.rate);if(i<0||i>=n)continue;
-    const lo=w.low[i]/255*mid*0.95,mi=w.mid[i]/255*mid*0.8,hi=w.high[i]/255*mid*0.6;
-    g.fillStyle='#1f6bff';g.fillRect(x,mid-lo,step,lo*2);
-    g.fillStyle='#ff9a2e';g.fillRect(x,mid-mi,step,mi*2);
-    g.fillStyle='#f4f6ff';g.fillRect(x,mid-hi,step,hi*2);
-  }
+  const strip=waveStrip(k,w,W,H,t0);
+  g.drawImage(strip.canvas,Math.round((t0-strip.t0)*pxPerSec),0,W,H,0,0,W,H);
   if(pos>0){g.fillStyle='#00000055';g.fillRect(0,0,W/2,H)}
   // beat grid
   if(d.bpm){const bs=60/d.bpm;let b=Math.ceil((t0-d.first_beat)/bs);
@@ -909,27 +943,63 @@ function setVu(id,level){
   if(el._n===n)return;el._n=n;
   [...el.children].forEach((seg,i)=>{seg.className=i<n?(i>=12?'r':i>=9?'y':'g'):''});
 }
-function frame(){
-  if(S&&S.active){
-    for(const k of DECKS){
-      const d=S.decks[k];const pos=livePos(d);
-      drawWave(k,d,pos);drawOverview(k,d,pos);
-      const el=$('.deck-'+k);const jog=$('.jog',el);
-      const ang=pos*360/1.8;
-      $('.plate',jog).style.transform=`rotate(${ang}deg)`;
-      const img=$('.hub img',jog);img.style.transform=`rotate(${ang}deg)`;
-      jog.style.setProperty('--p',d.loaded&&d.duration?(pos/d.duration).toFixed(4):0);
-      const sd=$('#sd'+k);
-      const remain=d.loaded?d.duration-pos:0;
-      const r=$('[data-remain]',sd),e=$('[data-elapsed]',sd),bars=$('[data-bars]',sd);
-      if(r){r.textContent='-'+fmt(remain,true);r.classList.toggle('low',d.playing&&remain<30);}
-      if(e)e.textContent=fmt(pos)+' / '+fmt(d.duration);
-      if(bars)bars.textContent=d.loaded?beatText(d,pos):'';
-      setVu(k,d.level);
-    }
-    setVu('L',S.mixer.level[0]);setVu('R',S.mixer.level[1]);
+// 30 frames a second is smooth for waveforms and platters; a 120 Hz screen
+// would otherwise redraw everything 120 times a second.
+const FRAME_MS=1000/30;
+let lastFrame=0;
+const drawn={};          // deck -> what its canvases last showed, to skip identical frames
+function setHTML(el,html){if(el&&el._h!==html){el._h=html;el.innerHTML=html}}
+function setText(el,text){if(el&&el._t!==text){el._t=text;el.textContent=text}}
+// The platters turn on the compositor (Web Animations): smooth at the
+// screen's full refresh rate, almost free for the page. 30 times a second
+// their speed and angle are lined up with the song (pitch, scratches,
+// seeks). Turning them from JS every frame cost a lot more, and at 30 fps
+// their 4-degree grooves aliased into a slow crawl.
+const TURN_MS=1800;                    // one turn of the record at normal speed (33 1/3 rpm)
+function platterAnims(jog){
+  if(!jog._anims){
+    const kf=[{transform:'rotate(0deg)'},{transform:'rotate(360deg)'}];
+    jog._anims=[$('.plate',jog),$('.hub img',jog)].map(el=>{el.style.transform='';return el.animate(kf,{duration:TURN_MS,iterations:Infinity})});
   }
+  return jog._anims;
+}
+function spin(){
+  for(const k of DECKS){
+    const d=S.decks[k];const jog=$('.deck-'+k+' .jog');if(!jog)continue;
+    const rate=d.loaded?(d.rate||0):0;
+    const want=((livePos(d)*1000)%TURN_MS+TURN_MS)%TURN_MS;
+    for(const a of platterAnims(jog)){
+      if(a.playbackRate!==rate)a.updatePlaybackRate(rate);
+      const now=((a.currentTime||0)%TURN_MS+TURN_MS)%TURN_MS;
+      let off=Math.abs(now-want);off=Math.min(off,TURN_MS-off);
+      if(off>40)a.currentTime=want;   // drifted, seeked or scratched: snap to the song
+    }
+  }
+}
+function frame(t){
   requestAnimationFrame(frame);
+  if(!(S&&S.active))return;
+  if(t-lastFrame<FRAME_MS-2)return;
+  lastFrame=t;
+  spin();
+  for(const k of DECKS){
+    const d=S.decks[k];const pos=livePos(d);
+    const key=[stateAt,pos.toFixed(3),cv['wave'+k]?.width,d.wave_id].join('|');
+    if(drawn[k]===key)continue;         // a stopped deck with nothing new: nothing to draw
+    drawn[k]=key;
+    drawWave(k,d,pos);drawOverview(k,d,pos);
+    const jog=$('.deck-'+k+' .jog');
+    const pr=d.loaded&&d.duration?(pos/d.duration).toFixed(3):'0';
+    if(jog._p!==pr){jog._p=pr;jog.style.setProperty('--p',pr)}
+    const sd=$('#sd'+k);
+    const remain=d.loaded?d.duration-pos:0;
+    const r=$('[data-remain]',sd),e=$('[data-elapsed]',sd),bars=$('[data-bars]',sd);
+    if(r){setText(r,'-'+fmt(remain,true));const low=d.playing&&remain<30;if(r._low!==low){r._low=low;r.classList.toggle('low',low)}}
+    setText(e,fmt(pos)+' / '+fmt(d.duration));
+    setText(bars,d.loaded?beatText(d,pos):'');
+    setVu(k,d.level);
+  }
+  setVu('L',S.mixer.level[0]);setVu('R',S.mixer.level[1]);
 }
 
 // ---------------------------------------------------------------- start
@@ -955,7 +1025,7 @@ async function init(){
   if(token){try{await fetch(base+'api/session',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({token,guild_id:guildId})})}catch(_){}}
   roomName();
   await poll();
-  const loop=async()=>{await poll();setTimeout(loop,document.hidden?1500:220)};loop();
+  const loop=async()=>{await poll();setTimeout(loop,document.hidden?2000:300)};loop();
   requestAnimationFrame(frame);
 }
 init();

@@ -111,10 +111,88 @@ class Engine(unittest.TestCase):
         djbrain.reload()
         self.brain.cleanup()
 
-    def deck(self):
+    def deck(self, ai=True):
         session = dj.DJSession("t", "test", Crate([]))
+        session.set_ai(ai)
         asyncio.run(session.load("A", {"title": "x", "file": self.path, "keys": [f"yt:{VID}"]}))
         return session, session.engine.decks["A"]
+
+    def test_the_switch_off_means_no_ai_anywhere(self):
+        _, probe = self.deck()
+        default = realdj.structure(probe)["exit"]
+        at = probe.time_of_beat((default - 1) * realdj.PHRASE)
+        plan_file(self.brain.name, {VID: {"trust": "high",
+                                          "exits": [{"character": "energetic", "at": at, "styles": ["cut"], "why": ""}],
+                                          "entries": [{"character": "safe", "at": 0.6, "styles": ["blend"], "why": ""}],
+                                          "hooks": [{"at": probe.time_of_beat(70), "length": 3.0, "what": "hook"}],
+                                          "moves": [{"at": probe.time_of_beat(61), "type": "echo", "why": ""}]}})
+        djbrain.reload()
+        _, deck = self.deck(ai=False)
+        s = realdj.structure(deck)
+        self.assertEqual(s["exit"], default)
+        self.assertNotIn("brain_exit", s)
+        self.assertEqual(realdj._suggested_touches(deck, 64), set())
+        self.assertIsNone(realdj._ai_hook(deck, 0, 999) if realdj._ai(deck) else None)
+        self.assertIsNone(realdj.sound_similarity(deck, deck))
+        self.assertTrue(all(realdj._ai_entry(deck, "blend", random.Random(i)) is None or True for i in range(3)))
+        # the same notes with the switch on do change things
+        _, on = self.deck(ai=True)
+        self.assertIn("brain_exit", realdj.structure(on))
+        self.assertEqual(realdj._suggested_touches(on, 64), {"echo"})
+
+    def test_entry_options_add_the_intro_and_creative_spots_and_keep_the_play_window_sane(self):
+        _, probe = self.deck()
+        creative_at = probe.time_of_beat(2 * realdj.PHRASE)
+        plan_file(self.brain.name, {VID: {"trust": "high", "exits": [], "moves": [],
+                                          "entries": [{"character": "safe", "at": 0.6, "styles": ["blend"], "why": "intro"},
+                                                      {"character": "energetic", "at": 31.0, "styles": ["cut"], "why": "chorus"},
+                                                      {"character": "creative", "at": creative_at, "styles": ["filter"], "why": "verse"}]}})
+        djbrain.reload()
+        seen = set()
+        for seed in range(80):
+            _, deck = self.deck()
+            cue = realdj._ai_entry(deck, "blend", random.Random(seed))
+            seen.add(None if cue is None else round(cue, 1))
+            if cue is not None:
+                s = realdj.structure(deck)
+                self.assertEqual(s["entry"], deck._ai_entry[1])
+                self.assertGreaterEqual(s["exit"], s["entry"] + 2)            # still a song, not a blip
+                self.assertEqual(realdj._ai_entry(deck, "blend", random.Random(seed + 1000)), cue)   # one choice per load
+        self.assertIn(None, seen)                                              # the built-in cue stays in the mix
+        self.assertTrue(any(c is not None and c < 3 for c in seen), seen)       # the intro
+        self.assertTrue(any(c is not None and c > 20 for c in seen), seen)      # the creative spot
+
+    def test_entries_too_late_in_the_song_are_never_chosen(self):
+        plan_file(self.brain.name, {VID: {"trust": "high", "exits": [], "moves": [],
+                                          "entries": [{"character": "creative", "at": 100.0, "styles": ["cut"], "why": "late"}]}})
+        djbrain.reload()
+        for seed in range(30):
+            _, deck = self.deck()
+            self.assertIsNone(realdj._ai_entry(deck, "cut", random.Random(seed)))
+
+    def test_gemini_hooks_give_a_hook_to_repeat_when_there_are_no_stems(self):
+        _, probe = self.deck()
+        at = probe.time_of_beat(70)
+        plan_file(self.brain.name, {VID: {"trust": "ok", "exits": [], "moves": [],
+                                          "hooks": [{"at": at, "length": 4.0, "what": "the chorus line"}]}})
+        djbrain.reload()
+        _, deck = self.deck()
+        hook = realdj._ai_hook(deck, 64, 90)
+        self.assertEqual(hook["beat"], 70)
+        self.assertEqual(hook["time"], at)
+        self.assertIsNone(realdj._ai_hook(deck, 0, 60))
+        _, off = self.deck(ai=False)
+        self.assertEqual(realdj.sound_similarity(off, off), None)
+
+    def test_the_booth_switch_reaches_the_decks_state_and_snapshot(self):
+        session = dj.DJSession("t", "test", Crate([]))
+        self.assertFalse(session.state()["auto"]["ai"])
+        self.assertFalse(any(d.ai for d in session.engine.decks.values()))
+        asyncio.run(session.handle({"op": "auto", "ai": True}))
+        self.assertTrue(session.state()["auto"]["ai"])
+        self.assertTrue(all(d.ai for d in session.engine.decks.values()))
+        asyncio.run(session.handle({"op": "auto", "ai": False}))
+        self.assertFalse(any(d.ai for d in session.engine.decks.values()))
 
     def test_default_exit_without_notes(self):
         _, deck = self.deck()

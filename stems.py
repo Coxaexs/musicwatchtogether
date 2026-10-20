@@ -7,7 +7,18 @@ disk cache when it has one, and otherwise queues the track for the worker.
 
 Results are int16 arrays of shape (3, n, 2): drums, bass, vocals at 48 kHz,
 aligned with the deck's audio. "Other" is derived by the engine as the mix
-minus those three.
+minus every stored stem.
+
+Guitar and piano: songs upgraded on Oracle (huddle-ops stems-sync) also have
+"<hash>.gp.npy", int16 (2, n, 2) from htdemucs_6s, aligned the same way.
+
+Storage: either raw arrays (<hash>.npy, <hash>.gp.npy; what the separator
+writes) or lossless FLAC (<hash>.stems.flac with 6 channels = drums, bass,
+vocals L/R; <hash>.gp.flac with 4). FLAC is about a third of the size, which
+is what lets the whole library have stems (huddle-ops stems-sync converts
+the cache and installs Oracle's splits that way). Readers take either.
+Songs without it simply have no separate guitar / piano: those stay in
+"other". See extras() and StemGains.
 
 Set DJ_STEMS=0 to turn it off. Without the worker venv it is off too, and the
 booth simply works without stems.
@@ -38,6 +49,37 @@ logger = logging.getLogger("MusicBot.Stems")
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAMES = ("drums", "bass", "vocals")          # stored, in this order
 CONTROLS = ("drums", "bass", "vocals", "other")
+EXTRA_NAMES = ("guitar", "piano")             # only some songs have these (extras())
+ALL_CONTROLS = CONTROLS + EXTRA_NAMES
+
+
+class StemGains(dict):
+    """A deck's stem gains, every control at 1.0 to start.
+
+    "other" means everything but drums, bass and vocals, so setting it also
+    sets guitar and piano unless the same call sets them too. Every move
+    written before guitar and piano existed (other=0 to take the music out)
+    keeps doing what it says. set_one() changes a single control (the booth's
+    buttons: muting "other" leaves the guitar playing).
+    """
+
+    def __init__(self, values=None):
+        super().__init__({name: 1.0 for name in ALL_CONTROLS})
+        if values:
+            self.update(values)
+
+    def update(self, *args, **kwargs):
+        new = dict(*args, **kwargs)
+        if "other" in new:
+            for name in EXTRA_NAMES:
+                new.setdefault(name, new["other"])
+        dict.update(self, new)
+
+    def __setitem__(self, key, value):
+        self.update({key: value})
+
+    def set_one(self, key, value):
+        dict.__setitem__(self, key, value)
 PYTHON = os.environ.get("DJ_STEMS_PYTHON") or os.path.join(HERE, "stems-env", "bin", "python")
 WORKER = os.path.join(HERE, "stems_worker.py")
 DATA_DIR = os.getenv("DATA_DIR") or HERE
@@ -47,11 +89,22 @@ IDLE_SECONDS = 15 * 60                       # free the GPU after this long unus
 JOB_TIMEOUT = 15 * 60
 
 
+_enabled_cache = (0.0, False, None)          # (checked at, answer, for which PYTHON)
+
+
 def enabled():
+    """Whether stem separation is on. Asked many times a second (booth state, every
+    deck load), and the venv lives on a hard disk that can take seconds to answer,
+    so the file check is cached for 30 s."""
+    global _enabled_cache
     import config
-    if not getattr(config, "STEMS_ENABLED", True):
+    if not getattr(config, "STEMS_ENABLED", True) or os.environ.get("DJ_STEMS", "1") == "0":
         return False
-    return os.environ.get("DJ_STEMS", "1") != "0" and os.path.exists(PYTHON)
+    at, ok, python = _enabled_cache
+    if time.monotonic() - at > 30 or python != PYTHON:
+        ok = os.path.exists(PYTHON)
+        _enabled_cache = (time.monotonic(), ok, PYTHON)
+    return ok
 
 
 _gpu_checked = (0.0, False)
@@ -132,11 +185,123 @@ def stems_path(digest):
     return os.path.join(CACHE_DIR, digest + ".npy")
 
 
+def extra_path(digest):
+    return os.path.join(CACHE_DIR, digest + ".gp.npy")
+
+
+def stems_flac_path(digest):
+    return os.path.join(CACHE_DIR, digest + ".stems.flac")
+
+
+def extra_flac_path(digest):
+    return os.path.join(CACHE_DIR, digest + ".gp.flac")
+
+
+def source_path(digest):
+    """A text file naming the downloaded song the stems were made from (library songs)."""
+    return os.path.join(CACHE_DIR, digest + ".src")
+
+
+def song_files(digest):
+    """Every file the cache can hold for a song."""
+    return [stems_path(digest), stems_flac_path(digest), instrumental_path(digest),
+            extra_path(digest), extra_flac_path(digest), source_path(digest)]
+
+
+def _source_audio(digest):
+    """The song's audio from its downloaded file, if a .src names one that still decodes
+    to exactly these samples (a re-download or a different ffmpeg would not)."""
+    try:
+        with open(source_path(digest), encoding="utf-8") as f:
+            path = f.read().strip()
+    except OSError:
+        return None
+    if not path or not os.path.exists(path):
+        return None
+    audio = decode(path)
+    return audio if track_hash(audio) == digest else None
+
+
+def has_stems(digest):
+    return bool(digest) and (os.path.exists(stems_path(digest)) or os.path.exists(stems_flac_path(digest)))
+
+
+def _stem_file(digest):
+    """The file holding a song's main stems (raw first), or None."""
+    for path in (stems_path(digest), stems_flac_path(digest)):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def read_flac_stems(path, parts):
+    """A FLAC of `parts` stereo stems -> int16 (parts, n, 2)."""
+    result = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", path, "-f", "s16le",
+                             "-ac", str(parts * 2), "-ar", str(SR), "pipe:1"], capture_output=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip()[-200:] or "could not read " + path)
+    data = np.frombuffer(result.stdout, dtype="<i2")
+    data = data[: len(data) // (parts * 2) * parts * 2]
+    return np.ascontiguousarray(data.reshape(-1, parts, 2).transpose(1, 0, 2))
+
+
+def load_stems(digest):
+    """A song's (3, n, 2) stems from whichever file it has; marks the song used (LRU)."""
+    path = _stem_file(digest)
+    if path is None:
+        raise FileNotFoundError(digest)
+    data = np.load(path) if path.endswith(".npy") else read_flac_stems(path, len(NAMES))
+    try:
+        os.utime(path)                       # LRU: recently used survives pruning
+    except OSError:
+        pass
+    return data
+
+
+def stem_frames(digest):
+    """Length (frames) of a song's stems, without reading them all."""
+    path = _stem_file(digest)
+    if path is None:
+        raise FileNotFoundError(digest)
+    if path.endswith(".npy"):
+        return np.load(path, mmap_mode="r").shape[1]
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                          "stream=duration_ts", "-of", "csv=p=0", path], capture_output=True, text=True, timeout=30)
+    return int(out.stdout.strip())
+
+
+def extras(keys=None, audio=None, frames=None):
+    """Guitar and piano for a song, int16 (2, n, 2), or None when it has none.
+
+    Found by the song's track keys (a song rebuilt from the cache) or by
+    hashing its decoded audio; `frames` (default: len(audio)) must match.
+    """
+    digest = lookup(keys) if keys else None
+    if digest is None and audio is not None:
+        digest = track_hash(audio)
+    if not digest:
+        return None
+    path = next((p for p in (extra_path(digest), extra_flac_path(digest)) if os.path.exists(p)), None)
+    if not path:
+        return None
+    try:
+        data = np.load(path) if path.endswith(".npy") else read_flac_stems(path, len(EXTRA_NAMES))
+    except (OSError, ValueError, RuntimeError) as error:
+        logger.warning("Could not read guitar/piano for %s: %s", digest, error)
+        return None
+    want = frames if frames is not None else (len(audio) if audio is not None else data.shape[1])
+    if data.shape[0] != len(EXTRA_NAMES) or data.shape[2:] != (2,) or data.shape[1] != want:
+        logger.warning("Guitar/piano for %s has shape %s, expected %d frames", digest, data.shape, want)
+        return None
+    return data
+
+
 def instrumental_path(digest):
     return os.path.join(CACHE_DIR, digest + ".inst.flac")
 
 
 def _load(path):
+    """Stems from a raw .npy path (what the separator just wrote)."""
     stems = np.load(path)
     os.utime(path)                           # LRU: recently used survives pruning
     return stems
@@ -189,7 +354,7 @@ def lookup(keys):
     tracks = load_index()["tracks"]
     for key in keys or ():
         entry = tracks.get(key) if key else None
-        if entry and os.path.exists(stems_path(entry["hash"])):
+        if entry and has_stems(entry["hash"]):
             return entry["hash"]
     return None
 
@@ -237,7 +402,8 @@ def library():
     """Every song with stems on disk, most recently used first.
 
     One entry per separated song: {"hash", "title", "youtube" (video id or
-    None), "keys", "seconds", "karaoke" (instrumental ready), "pinned",
+    None), "keys", "seconds", "karaoke" (instrumental ready), "extra" (guitar /
+    piano too), "pinned",
     "used" (epoch of last use)}. Songs whose stems file was pruned are left
     out. Reading this never touches the files, so browsing the list doesn't
     change what the cache keeps.
@@ -262,16 +428,17 @@ def library():
             song["youtube"] = key[3:]
     out = []
     for digest, song in songs.items():
-        path = stems_path(digest)
+        path = _stem_file(digest)
         try:
             used = os.path.getmtime(path)
-            frames = np.load(path, mmap_mode="r").shape[1]
-        except (OSError, ValueError, IndexError):
+            frames = stem_frames(digest)
+        except (OSError, ValueError, IndexError, TypeError):
             continue
         song.update(
             title=song["title"] or "Unknown",
             seconds=int(frames / SR),
             karaoke=os.path.exists(instrumental_path(digest)),
+            extra=os.path.exists(extra_path(digest)) or os.path.exists(extra_flac_path(digest)),
             pinned=digest in data["pins"],
             used=used,
         )
@@ -286,7 +453,7 @@ def forget(keys):
     digest = lookup(keys)
     if not digest:
         return
-    for path in (stems_path(digest), instrumental_path(digest)):
+    for path in song_files(digest):
         try:
             os.remove(path)
         except OSError:
@@ -311,7 +478,7 @@ def forget_song(keys):
             data["pins"].pop(digest, None)
         _save_index(data)
     for digest in digests:
-        for path in (stems_path(digest), instrumental_path(digest)):
+        for path in song_files(digest):
             try:
                 os.remove(path)
             except OSError:
@@ -328,7 +495,7 @@ def _prune():
     except OSError:
         return
     for name in names:
-        if not (name.endswith(".npy") or name.endswith(".inst.flac")):
+        if not name.endswith((".npy", ".inst.flac", ".stems.flac", ".gp.flac", ".src")):
             continue
         digest = name.split(".", 1)[0]
         if digest in keep:
@@ -343,7 +510,7 @@ def _prune():
     for digest in sorted(sizes, key=used.get, reverse=True):
         total += sizes[digest]
         if total > CACHE_BYTES:
-            for path in (stems_path(digest), instrumental_path(digest)):
+            for path in song_files(digest):
                 try:
                     os.remove(path)
                 except OSError:
@@ -385,10 +552,23 @@ def local_audio(keys):
     fetching it from YouTube again (stream links expire and get throttled).
     """
     digest = lookup(keys)
-    if not digest or not os.path.exists(instrumental_path(digest)):
+    if not digest:
         return None
+    if not os.path.exists(instrumental_path(digest)):
+        # A library song: no instrumental is kept, its download is the audio.
+        if not os.path.exists(source_path(digest)):
+            return None
+        try:
+            audio = _source_audio(digest)
+            if audio is None:
+                return None
+            stems = load_stems(digest)
+        except Exception as error:
+            logger.warning("Could not load %s from its download: %s", digest, error)
+            return None
+        return (audio, stems) if stems.shape[1] == len(audio) else None
     try:
-        stems = _load(stems_path(digest))
+        stems = load_stems(digest)
         inst = decode(instrumental_path(digest))
     except Exception as error:
         logger.warning("Could not rebuild %s from the cache: %s", digest, error)
@@ -514,8 +694,8 @@ class Separator:
         loop = asyncio.get_running_loop()
         key = await loop.run_in_executor(None, track_hash, audio)
         path = os.path.join(CACHE_DIR, key + ".npy")
-        if os.path.exists(path):
-            return await loop.run_in_executor(None, _load, path)
+        if has_stems(key):
+            return await loop.run_in_executor(None, load_stems, key)
         if background:
             # Yield to listeners, to a live DJ set, and to a hot GPU (whose
             # jobs would otherwise fall back to the CPU).
@@ -532,8 +712,8 @@ class Separator:
             # The deck may have moved on while this waited behind another song.
             if not wanted():
                 return None
-            if os.path.exists(path):
-                return await loop.run_in_executor(None, _load, path)
+            if has_stems(key):
+                return await loop.run_in_executor(None, load_stems, key)
             os.makedirs(CACHE_DIR, exist_ok=True)
             self.current = {"title": title or "Song in the DJ booth", "started": time.monotonic(),
                             "seconds": len(audio) / SR}
@@ -599,7 +779,9 @@ def status():
                    "device": sep.device}
     average = (sum(sep.ratios) / len(sep.ratios)) * 200 if sep.ratios else None     # a typical 200 s song
     try:
-        library_count = sum(1 for name in os.listdir(CACHE_DIR) if name.endswith(".npy") and name != "index.json")
+        library_count = len({name.split(".", 1)[0] for name in os.listdir(CACHE_DIR)
+                             if (name.endswith(".npy") and not name.endswith(".gp.npy"))
+                             or name.endswith(".stems.flac")})
     except OSError:
         library_count = 0
     return {"current": current, "finished": sep.finished, "failed": sep.failed,

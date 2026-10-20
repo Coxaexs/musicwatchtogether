@@ -1722,7 +1722,7 @@ class MusicControlView(View):
             return
 
         await interaction.response.defer(ephemeral=True)
-        lyrics_data = await cog._fetch_synced_lyrics_for_song(player.current)
+        lyrics_data = await cog._fetch_synced_lyrics_for_song(player.current, fresh=True)
         if not lyrics_data or not lyrics_data.get('lines'):
             await interaction.followup.send(
                 f"🎤 No synced lyrics found for **{player.current.title}**.", ephemeral=True
@@ -1866,6 +1866,75 @@ class HistoryReplayView(View):
     def __init__(self, cog, guild_id: int, songs: list[Song]):
         super().__init__(timeout=180)
         self.add_item(HistoryReplaySelect(cog, guild_id, songs))
+
+
+class LongHistoryView(View):
+    """/longhistory: the last 250 plays, 25 per page, with a replay picker for the page shown."""
+    PAGE_SIZE = 25
+
+    def __init__(self, cog, guild_id: int, songs: list[Song]):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.songs = songs
+        self.page = 0
+        self.pages = max(1, math.ceil(len(songs) / self.PAGE_SIZE))
+        self._rebuild()
+
+    def _page_songs(self) -> list[Song]:
+        start = self.page * self.PAGE_SIZE
+        return self.songs[start:start + self.PAGE_SIZE]
+
+    def embed(self) -> discord.Embed:
+        start = self.page * self.PAGE_SIZE
+        lines = []
+        for i, song in enumerate(self._page_songs(), start + 1):
+            title = song.title if len(song.title) <= 55 else song.title[:52] + "..."
+            artist = (f" — {song.artist}" if song.artist
+                      and self.cog._artist_key(song.artist) not in self.cog._artist_key(title) else "")
+            when = f" • <t:{song.played_at}:R>" if song.played_at else ""
+            lines.append(f"**{i}.** {title}{artist} `{song.duration}`{when}")
+        description = "\n".join(lines)
+        if len(description) > 4096:
+            description = description[:4093] + "..."
+        embed = discord.Embed(
+            title="📜 Long listening history",
+            description=description,
+            color=discord.Color.from_rgb(124, 92, 255),
+        )
+        unique = len({song.url for song in self.songs})
+        embed.set_author(name=f"{len(self.songs)} tracks played • {unique} unique")
+        embed.set_footer(text=f"Page {self.page + 1}/{self.pages} • choose a track below to queue it again")
+        return embed
+
+    def _rebuild(self):
+        self.clear_items()
+        prev_button = Button(emoji="◀️", style=discord.ButtonStyle.secondary,
+                             disabled=self.page == 0, row=1)
+        next_button = Button(emoji="▶️", style=discord.ButtonStyle.secondary,
+                             disabled=self.page >= self.pages - 1, row=1)
+        prev_button.callback = self._prev
+        next_button.callback = self._next
+        replay = HistoryReplaySelect(self.cog, self.guild_id, self._page_songs())
+        # Keep the numbering in the picker matching the page, not restarting at 1
+        start = self.page * self.PAGE_SIZE
+        for offset, option in enumerate(replay.options):
+            option.label = f"{start + offset + 1}. {self._page_songs()[offset].title}"[:100]
+        replay.row = 0
+        self.add_item(replay)
+        self.add_item(prev_button)
+        self.add_item(next_button)
+
+    async def _turn(self, interaction: discord.Interaction, delta: int):
+        self.page = max(0, min(self.pages - 1, self.page + delta))
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def _prev(self, interaction: discord.Interaction):
+        await self._turn(interaction, -1)
+
+    async def _next(self, interaction: discord.Interaction):
+        await self._turn(interaction, 1)
 
 
 class ServerInviteSelect(discord.ui.Select):
@@ -2100,6 +2169,7 @@ class MusicPlayer:
         self.sleep_timer_task: Optional[asyncio.Task] = None
         self.sleep_timer_ends_at: Optional[float] = None  # unix time, for display
         self.history = deque(maxlen=25)  # Recently played songs, newest first
+        self.long_history = deque(maxlen=250)  # Same, kept longer for /longhistory
         self.audio_filter: Optional[str] = None  # Active /filter preset name
         self.crossfade_seconds = 0  # Fade in/out duration between songs (0 = off)
         self.skip_votes = set()  # User IDs that voted to skip the current song
@@ -2754,6 +2824,7 @@ class MusicPlayer:
             if not self.history or self.history[0].url != self.current.url:
                 self.current.played_at = int(time.time())
                 self.history.appendleft(self.current)
+                self.long_history.appendleft(self.current)
 
             # Record in persistent listening stats (skip bot-requested plays
             # so 24/7 mode and autoplay don't drown out real requests)
@@ -5093,8 +5164,12 @@ class MusicCog(commands.Cog):
         return artists[0] if artists else None
 
     async def _fetch_synced_lyrics_for_song(self, song: Song,
-                                            query: Optional[str] = None) -> Optional[dict]:
-        """Try each unique artist in order, never one comma-joined mega-query."""
+                                            query: Optional[str] = None,
+                                            fresh: bool = False) -> Optional[dict]:
+        """Try each unique artist in order, never one comma-joined mega-query.
+
+        fresh=True is for someone asking right now (/lyricsnow, the 🎤 button):
+        it searches again even if the background prefetch just missed."""
         search_query = query or song.title
         if query is None and str(song.url).startswith('spotify:search:'):
             search_query = re.split(
@@ -5104,7 +5179,7 @@ class MusicCog(commands.Cog):
         artists = self._lyrics_artist_candidates_for_song(song) or [None]
         duration = parse_duration_to_seconds(song.duration)
         for artist in artists:
-            result = await self._fetch_synced_lyrics(candidate, artist, duration)
+            result = await self._fetch_synced_lyrics(candidate, artist, duration, fresh=fresh)
             if result:
                 return result
         return None
@@ -5127,7 +5202,7 @@ class MusicCog(commands.Cog):
                             duration_seconds: Optional[int] = None) -> Optional[dict]:
         """Fetch lyrics from lrclib using free public search API."""
         for text, track, rung_artist, loose in self._lyrics_search_rungs(query, artist):
-            data = await self._lrclib_search(text)
+            data = await self._lrclib_search(text) or []
             item = self._pick_lyrics_item(data, track, rung_artist, duration_seconds, loose, False)
             if not item:
                 continue
@@ -5236,17 +5311,18 @@ class MusicCog(commands.Cog):
                 out.append(rung)
         return out
 
-    async def _lrclib_search(self, text: str) -> list:
+    async def _lrclib_search(self, text: str) -> Optional[list]:
+        """lrclib search results; None when lrclib could not be reached."""
         url = f"https://lrclib.net/api/search?q={quote(text)}"
         timeout = aiohttp.ClientTimeout(total=12)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url, headers={'User-Agent': 'MusicBot/1.0'}) as resp:
                     if resp.status != 200:
-                        return []
+                        return None
                     data = await resp.json()
         except Exception:
-            return []
+            return None
         return data if isinstance(data, list) else []
 
     def _pick_lyrics_item(self, data: list, track: str, artist: Optional[str],
@@ -5279,7 +5355,8 @@ class MusicCog(commands.Cog):
         return None
 
     async def _fetch_synced_lyrics(self, query: str, artist: Optional[str] = None,
-                                   duration_seconds: Optional[int] = None) -> Optional[dict]:
+                                   duration_seconds: Optional[int] = None,
+                                   fresh: bool = False) -> Optional[dict]:
         track_query, artist = self._lyrics_search_context(query, artist)
         cache_path = self._get_lyrics_cache_path(track_query, artist)
         if os.path.exists(cache_path):
@@ -5293,12 +5370,16 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 logger.error(f"Error reading lyrics cache for {query}: {e}")
         misses = self.__dict__.setdefault('_lyrics_misses', {})
-        if time.time() - misses.get(cache_path, 0) < 1800:
+        if not fresh and time.time() - misses.get(cache_path, 0) < 1800:
             return None
 
         result = None
+        unreachable = False
         for text, track, rung_artist, loose in self._lyrics_search_rungs(query, artist):
             data = await self._lrclib_search(text)
+            if data is None:
+                unreachable = True
+                data = []
             item = self._pick_lyrics_item(data, track, rung_artist, duration_seconds, loose, True)
             if not item:
                 continue
@@ -5316,7 +5397,9 @@ class MusicCog(commands.Cog):
 
         if result:
             save_json(cache_path, result, logger)
-        else:
+            misses.pop(cache_path, None)
+        elif not unreachable:
+            # Only a real "lrclib has nothing" counts; a timeout is not a miss
             misses[cache_path] = time.time()
         return result
 
@@ -6400,6 +6483,16 @@ class MusicCog(commands.Cog):
             embed=embed, view=HistoryReplayView(self, interaction.guild.id, songs)
         )
 
+    @app_commands.command(name="longhistory", description="Show everything played lately (up to 250 songs)")
+    async def longhistory(self, interaction: discord.Interaction):
+        player = self.get_player(interaction.guild)
+        songs = list(player.long_history)
+        if not songs:
+            await interaction.response.send_message("❌ Nothing has been played yet!", ephemeral=True)
+            return
+        view = LongHistoryView(self, interaction.guild.id, songs)
+        await interaction.response.send_message(embed=view.embed(), view=view)
+
     @app_commands.command(name="search", description="Search YouTube and pick from the top 5 results")
     @app_commands.describe(query="What to search for")
     async def search(self, interaction: discord.Interaction, query: str):
@@ -6483,9 +6576,18 @@ class MusicCog(commands.Cog):
     def _owner_key(user_id) -> str:
         return str(user_id) if user_id else 'shared'
 
+    #: Playlists in every room and server: stored once under this pseudo-guild ("shared" bucket)
+    #: and resolved with owner 'global'. A room's own playlist of the same name wins.
+    GLOBAL_GUILD = '*'
+
+    @classmethod
+    def _guild_for(cls, guild_id, owner_key) -> str:
+        """Where a playlist of this owner lives: the room, or the global pseudo-guild."""
+        return cls.GLOBAL_GUILD if owner_key == 'global' else str(guild_id)
+
     @staticmethod
     def _bucket_for(guild_data: dict, owner_key: str, create: bool = False) -> dict:
-        if owner_key == 'shared':
+        if owner_key in ('shared', 'global'):        # 'global': guild_data is the global pseudo-guild
             return guild_data.setdefault('shared', {})
         users = guild_data.setdefault('users', {})
         if create:
@@ -6493,9 +6595,11 @@ class MusicCog(commands.Cog):
         return users.get(owner_key, {})
 
     def get_user_playlists(self, guild_id, user_id) -> dict:
-        """Merged view for one user: guild-shared playlists + their own (own wins)."""
-        guild_data = self._read_playlists().get(str(guild_id), {})
-        merged = dict(guild_data.get('shared', {}))
+        """Merged view for one user: global, then guild-shared playlists, then their own (own wins)."""
+        data = self._read_playlists()
+        guild_data = data.get(str(guild_id), {})
+        merged = dict(data.get(self.GLOBAL_GUILD, {}).get('shared', {}))
+        merged.update(guild_data.get('shared', {}))
         if user_id:
             merged.update(guild_data.get('users', {}).get(str(user_id), {}))
         return merged
@@ -6507,11 +6611,13 @@ class MusicCog(commands.Cog):
             return str(user_id)
         if name in guild_data.get('shared', {}):
             return 'shared'
+        if name in data.get(self.GLOBAL_GUILD, {}).get('shared', {}):
+            return 'global'
         return None
 
     def playlist_cover_url(self, guild_id, owner_key: str, name: str, entries: list) -> Optional[str]:
         """Custom cover if uploaded, else the first track thumbnail we can find."""
-        meta = self._read_playlist_meta().get(str(guild_id), {})
+        meta = self._read_playlist_meta().get(self._guild_for(guild_id, owner_key), {})
         cover = self._bucket_for(meta, owner_key).get(name) if owner_key else None
         if cover:
             return cover
@@ -6614,15 +6720,19 @@ class MusicCog(commands.Cog):
 
     @playlist.command(name="list", description="Show your saved playlists in this server")
     async def playlist_list(self, interaction: discord.Interaction):
-        guild_data = self._read_playlists().get(str(interaction.guild.id), {})
+        data = self._read_playlists()
+        guild_data = data.get(str(interaction.guild.id), {})
         own = guild_data.get('users', {}).get(str(interaction.user.id), {})
         shared = {n: s for n, s in guild_data.get('shared', {}).items() if n not in own}
-        if not own and not shared:
+        everywhere = {n: s for n, s in data.get(self.GLOBAL_GUILD, {}).get('shared', {}).items()
+                      if n not in own and n not in shared}
+        if not own and not shared and not everywhere:
             await interaction.response.send_message("📭 No saved playlists yet - build a queue and use `/playlist save`!", ephemeral=True)
             return
 
         lines = [f"• **{name}** ({len(songs)} songs)" for name, songs in sorted(own.items())]
         lines += [f"• **{name}** ({len(songs)} songs) · shared" for name, songs in sorted(shared.items())]
+        lines += [f"• **{name}** ({len(songs)} songs) · everywhere" for name, songs in sorted(everywhere.items())]
         embed = discord.Embed(
             title="💾 Saved Playlists",
             description="\n".join(lines[:25]),
@@ -6640,7 +6750,11 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(f"❌ No playlist named **{name}**.", ephemeral=True)
             return
 
-        del self._bucket_for(data[str(interaction.guild.id)], owner)[name]
+        if name.rstrip().endswith(" FLAC") or owner == 'global':
+            # The AI-planned FLAC playlists stay (their songs are kept split in high quality for them).
+            await interaction.response.send_message(f"🔒 **{name}** is protected and can't be deleted.", ephemeral=True)
+            return
+        del self._bucket_for(data[self._guild_for(interaction.guild.id, owner)], owner)[name]
         self._write_playlists(data)
         await interaction.response.send_message(f"🗑️ Deleted playlist **{name}**.")
 
@@ -7776,7 +7890,7 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer()
 
-        lyrics_data = await self._fetch_synced_lyrics_for_song(player.current)
+        lyrics_data = await self._fetch_synced_lyrics_for_song(player.current, fresh=True)
 
         if not lyrics_data:
             await interaction.followup.send(f"❌ Synced lyrics not found for: **{search_query}**")

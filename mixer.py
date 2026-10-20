@@ -132,6 +132,31 @@ def catalog():
     }
 
 
+CUE_FIELDS = ("out_at", "in_at")     # planned cut points (seconds), e.g. from an AI-planned playlist
+
+
+def _cues(spec):
+    """The planned parts of a spec that the mixer itself does not use but must keep: cut points
+    (where to leave the outgoing song, where to enter the next), the DJ booth's style for the
+    pair and the planner's note."""
+    out = {}
+    booth = spec.get("booth")
+    if isinstance(booth, str) and re.fullmatch(r"[a-z_]{2,20}", booth):
+        out["booth"] = booth
+        if spec.get("booth_beats") in (1, 2, 4, 8, 16, 32, 64):
+            out["booth_beats"] = spec["booth_beats"]
+    if isinstance(spec.get("why"), str) and spec["why"].strip():
+        out["why"] = spec["why"].strip()[:200]
+    for field in CUE_FIELDS:
+        try:
+            value = float(spec.get(field))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= value < 3600:
+            out[field] = round(value, 3)
+    return out
+
+
 def normalize_spec(spec):
     """Validate a stored/submitted transition. `None` means Auto."""
     if not isinstance(spec, dict):
@@ -139,7 +164,7 @@ def normalize_spec(spec):
     preset = spec.get("preset") or "auto"
     if preset not in PRESETS and preset not in ("auto", "custom"):
         preset = "auto"
-    clean = {"preset": preset}
+    clean = {"preset": preset, **_cues(spec)}
     if preset == "auto":
         return clean
     base = PRESETS.get(preset) or PRESETS["fade"]
@@ -482,7 +507,7 @@ def auto_spec(out_meta, in_meta):
 def resolve_spec(spec, out_meta, in_meta):
     spec = normalize_spec(spec)
     if spec["preset"] == "auto":
-        return auto_spec(out_meta, in_meta)
+        return {**auto_spec(out_meta, in_meta), **_cues(spec)}
     return spec
 
 
@@ -509,8 +534,11 @@ def plan(out_meta, in_meta, spec=None, out_duration=None, out_position=0.0):
         length = spec["bars"] * bar
     first_beat = out_meta.get("first_beat") or 0.0
     out_at = music_end - length
+    planned = spec.get("out_at")
+    if planned is not None and out_position + 3 < planned and planned + length <= (duration or music_end) - 0.5:
+        out_at = planned                 # a planned exit (playlist mix): still snapped to a bar below
     # Snap back to a bar line of the outgoing song.
-    bars_in = math.floor((out_at - first_beat) / bar)
+    bars_in = math.floor((out_at - first_beat) / bar + (0.5 if planned is not None and out_at == planned else 0))
     out_at = first_beat + bars_in * bar
     if out_at <= out_position + 3:
         return None
@@ -520,7 +548,13 @@ def plan(out_meta, in_meta, spec=None, out_duration=None, out_position=0.0):
     stretch = ratio if abs(1 - ratio) <= 0.10 else 1.0
     cue = in_meta.get("first_beat") or 0.0
     music_start = in_meta.get("music_start") or 0.0
-    if cue < music_start and in_meta.get("bpm"):
+    planned_in = spec.get("in_at")
+    in_duration = in_meta.get("duration") or 0
+    if planned_in is not None and in_meta.get("bpm") and (not in_duration or planned_in + length * 2 < in_duration):
+        # A planned entry (playlist mix): onto the nearest bar line of the incoming song.
+        in_bar = 4 * 60.0 / in_meta["bpm"]
+        cue += max(0, round((planned_in - cue) / in_bar)) * in_bar
+    elif cue < music_start and in_meta.get("bpm"):
         in_bar = 4 * 60.0 / in_meta["bpm"]
         cue += math.ceil((music_start - cue) / in_bar) * in_bar
     return {

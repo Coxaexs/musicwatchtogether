@@ -24,6 +24,7 @@ def make_brain(directory, vectors):
 
 class Deck:
     def __init__(self, keys, bpm=120, camelot="8A", energy=0.5):
+        self.ai = True
         self.info = {"keys": keys}
         self.meta = {"bpm": bpm, "camelot": camelot, "energy": energy}
         self.bpm = bpm

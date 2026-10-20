@@ -53,6 +53,7 @@ MIN_PLAY = 60.0                # seconds of each song, at least ...
 MAX_PLAY = 170.0               # ... and at most
 TEMPO_MATCH = 0.06             # beat-matchable without a tempo ride
 TEMPO_RIDE = 0.15              # beyond this, no blend: a drop or echo out
+GUITAR_RIDE_MIN = 0.3          # guitar share of the old song's mix for a guitar ride (as dj.py)
 RIDE_MAX = 6.0                 # percent the outgoing song may be pushed
 SET_MINUTES = 75.0             # one energy arc (warm-up, peak, breather, peak)
 
@@ -85,7 +86,7 @@ def structure(deck):
     Cached on the deck; recomputed when its stems arrive (vocals and drums
     then come from the stems instead of the waveform's bands).
     """
-    key = (deck.wave_id, deck.stems_status, deck.bpm)
+    key = (deck.wave_id, deck.stems_status, deck.bpm, _ai(deck), getattr(deck, "_ai_entry", None))
     cached = getattr(deck, "_structure", None)
     if cached and cached[0] == key:
         return cached[1]
@@ -94,6 +95,12 @@ def structure(deck):
     return result
 
 
+def _ai(deck):
+    """Whether this deck's booth has the experimental AI switch on (the booth sets deck.ai)."""
+    return bool(getattr(deck, "ai", False))
+
+
+ENTRY_WEIGHTS = {"safe": 2.0, "energetic": 2.5, "creative": 1.0}
 EXIT_WEIGHTS = {"safe": 2.0, "energetic": 2.5, "creative": 1.0}
 
 
@@ -104,9 +111,15 @@ def _with_brain(deck, s):
     change its mind halfway). An option is only used if the song then plays between roughly MIN_PLAY and
     MAX_PLAY; anything else keeps the built-in exit. Never raises.
     """
-    if not s:
+    if not s or not _ai(deck):
         return s
     try:
+        entered = getattr(deck, "_ai_entry", None)         # plan_transition chose where this song comes in
+        if entered and entered[0] == deck.wave_id and entered[1] is not None:
+            s = dict(s, entry=entered[1], entry_beat=entered[1] * PHRASE)
+            floor = s["entry"] + max(2, int(math.ceil(MIN_PLAY / (PHRASE * deck.beat_seconds))))
+            if s["exit"] < floor:                              # the built-in exit was for the built-in entry
+                s = dict(s, exit=min(len(s["phrases"]), floor), exit_beat=min(len(s["phrases"]), floor) * PHRASE)
         options = djbrain.exits((getattr(deck, "info", None) or {}).get("keys"))
         if not options:
             return s
@@ -159,8 +172,9 @@ def _structure(deck):
         high = float(bands["high"][i0:i1].mean()) if i1 > i0 else 0.0
         vocals = deck.stem_presence("vocals", t0, t1) if deck.has_stems else None
         drums = deck.stem_presence("drums", t0, t1) if deck.has_stems else None
+        guitar = deck.stem_presence("guitar", t0, t1) if deck.has_stems else None    # None without guitar
         phrases.append({"beat": k * PHRASE, "start": t0, "energy": low + mid + high,
-                        "low": low, "vocals": vocals, "drums": drums})
+                        "low": low, "vocals": vocals, "drums": drums, "guitar": guitar})
     peak = max(p["energy"] for p in phrases) or 1.0
     low_peak = max(p["low"] for p in phrases) or 1.0
     for p in phrases:
@@ -204,9 +218,62 @@ def _structure(deck):
             "first_big_beat": first_big * PHRASE}
 
 
+def _ai_entry(inn, style, rng):
+    """Seconds into the incoming song to start from, from Gemini's entry options, or None for the built-in cue.
+
+    The built-in cue is "just before the first big section", which is Gemini's "energetic" entry, so that one stays
+    the default; the AI adds the song's clean intro ("safe") and "creative" spots. One choice per load is kept, and
+    the song's play window (structure) follows it. Never raises.
+    """
+    try:
+        pick = getattr(inn, "_ai_entry", None)
+        if not pick or pick[0] != inn.wave_id:
+            options = djbrain.entries((getattr(inn, "info", None) or {}).get("keys"))
+            usable = []
+            for option in options:
+                if option["character"] == "energetic":
+                    continue
+                if inn.duration - option["at"] < MIN_PLAY * 1.3 or option["at"] > inn.duration * 0.6:
+                    continue
+                weight = ENTRY_WEIGHTS.get(option["character"], 1.0) * (2.0 if style in option["styles"] else 1.0)
+                usable.append((option, weight))
+            total = sum(w for _, w in usable) + ENTRY_WEIGHTS["energetic"]      # the built-in cue competes too
+            choice = None
+            point = rng.random() * total
+            for option, weight in usable:
+                point -= weight
+                if point <= 0:
+                    choice = option
+                    break
+            if choice is None:
+                inn._ai_entry = (inn.wave_id, None, None)
+            else:
+                beat = int(round(inn.beat_at(choice["at"]) / 4)) * 4
+                inn._ai_entry = (inn.wave_id, int(round(beat / PHRASE)), round(inn.time_of_beat(beat), 3))
+            pick = inn._ai_entry
+        return pick[2]
+    except Exception:
+        logger.debug("Gemini entry options skipped", exc_info=True)
+        return None
+
+
+def _ai_hook(m, low, high):
+    """A hook Gemini marked between beats `low` and `high`, shaped like find_hooks() entries, or None."""
+    try:
+        for hook in djbrain.hooks((getattr(m, "info", None) or {}).get("keys")):
+            beat = m.beat_at(hook["at"])
+            if low <= beat <= high:
+                return {"beat": int(round(beat)), "length": 2, "time": hook["at"], "score": 1.0}
+    except Exception:
+        pass
+    return None
+
+
 def _suggested_touches(m, boundary):
     """Kinds of touch Gemini put in the 8 beats up to this phrase end (and just after), or an empty set."""
     try:
+        if not _ai(m):
+            return set()
         keys = (getattr(m, "info", None) or {}).get("keys")
         return {x["type"] for x in djbrain.moves(keys, m.time_of_beat(boundary - 8), m.time_of_beat(boundary + 1))}
     except Exception:
@@ -246,6 +313,8 @@ def score_candidate(meta, out_meta, target, recent_artists):
 
 def sound_similarity(out, inn):
     """How alike two loaded decks sound (djbrain cosine; random pair ~0.5), or None when the brain has no opinion."""
+    if not _ai(out):
+        return None
     return djbrain.similarity((getattr(out, "info", None) or {}).get("keys"), (getattr(inn, "info", None) or {}).get("keys"))
 
 
@@ -254,7 +323,7 @@ def pick_next(items, out_deck, minutes, history, rng=random):
     if not items:
         return None
     out_meta = dict(out_deck.meta or {}, live_bpm=out_deck.live_bpm()) if out_deck else {}
-    out_keys = (getattr(out_deck, "info", None) or {}).get("keys") if out_deck else None
+    out_keys = (getattr(out_deck, "info", None) or {}).get("keys") if out_deck and _ai(out_deck) else None
     target = energy_target(minutes)
     played = {(h.get("title") or "").lower() for h in history[:40]}
     recent = [(h.get("artist") or "").lower() for h in history[:2]]
@@ -331,6 +400,10 @@ def choose_style(out, inn, so, si, last_styles, rng=random, vibe="club"):
                 vocal_out = max((p["vocals"] or 0) for p in tail) if tail else None
             options += [("stem_swap", 4), ("mashup", 3 if vocal_out and vocal_out > 0.25 else 1),
                         ("acapella", 2 if vocal_out and vocal_out > 0.3 else 0)]
+            if out.extra is not None and so:
+                tail = [p for p in so["phrases"] if so["exit_beat"] - 2 * PHRASE <= p["beat"] < so["exit_beat"]]
+                riff = max((p.get("guitar") or 0) for p in tail) if tail else 0
+                options += [("guitar_ride", 3 if riff >= GUITAR_RIDE_MIN else 0)]
         options += [("blend", 3), ("fade", 1 if vibe == "chill" else 0.5)]
         if e_in > e_out + 0.2:
             options += [("loop_roll", 2), ("filter", 2)]
@@ -384,6 +457,9 @@ def plan_transition(out, inn, current_beat, last_styles, rng=random, vibe="club"
             in_cue = inn.cue
     else:
         in_cue = inn.cue
+    ai_cue = _ai_entry(inn, style, rng) if si and _ai(inn) else None
+    if ai_cue is not None:
+        in_cue = ai_cue
     # Where the old song goes out: ending at its planned exit phrase.
     if so:
         exit_beat = so["exit_beat"]
@@ -418,13 +494,13 @@ def beat_profile(deck):
 
     {"vocals", "drums", "mix"}: float arrays, index i = beat i / 2, each scaled
     so its loud end (95th percentile) is 1, and "raw": the unscaled RMS of
-    every part (drums, bass, vocals, other, mix) for predicting how loud a
-    mix of the two songs will be. None without stems or a beat grid. Cached
+    every part (drums, bass, vocals, other, mix, plus guitar and piano when the
+    song has them) for predicting how loud a mix of the two songs will be. None without stems or a beat grid. Cached
     on the deck.
     """
     if not deck.has_stems or not deck.bpm:
         return None
-    key = (deck.wave_id, deck.bpm, deck.first_beat, id(deck.stems))
+    key = (deck.wave_id, deck.bpm, deck.first_beat, id(deck.stems), id(deck.extra))
     cached = getattr(deck, "_beat_profile", None)
     if cached and cached[0] == key:
         return cached[1]
@@ -439,18 +515,29 @@ def beat_profile(deck):
     drums = np.zeros(count, np.float32)
     bass = np.zeros(count, np.float32)
     mix = np.zeros(count, np.float32)
+    extra = deck.extra
+    guitar = np.zeros(count, np.float32) if extra is not None else None
+    piano = np.zeros(count, np.float32) if extra is not None else None
     for i in range(count):
         a = int(max(0.0, deck.time_of_beat(i / 2)) * SR)
         b = min(total, a + int(half * SR))
         if b - a < step * 4:
             continue
-        for out, source in ((vocals, deck.stems[vi, a:b:step]), (drums, deck.stems[di, a:b:step]),
-                            (bass, deck.stems[bi, a:b:step]), (mix, deck.audio[a:b:step])):
+        parts = [(vocals, deck.stems[vi, a:b:step]), (drums, deck.stems[di, a:b:step]),
+                 (bass, deck.stems[bi, a:b:step]), (mix, deck.audio[a:b:step])]
+        if extra is not None:
+            parts += [(guitar, extra[0, a:b:step]), (piano, extra[1, a:b:step])]
+        for out, source in parts:
             x = source.astype(np.float32)
             out[i] = float(np.sqrt((x * x).mean()))
     # "Other" isn't stored: what's left of the mix (parts taken as unrelated).
-    other = np.sqrt(np.maximum(0.0, mix ** 2 - drums ** 2 - bass ** 2 - vocals ** 2))
+    rest = mix ** 2 - drums ** 2 - bass ** 2 - vocals ** 2
+    if extra is not None:
+        rest = rest - guitar ** 2 - piano ** 2
+    other = np.sqrt(np.maximum(0.0, rest))
     result = {"raw": {"drums": drums, "bass": bass, "vocals": vocals, "other": other, "mix": mix}}
+    if extra is not None:
+        result["raw"].update(guitar=guitar, piano=piano)
     for name, values in (("vocals", vocals), ("drums", drums), ("mix", mix)):
         loud = float(np.percentile(values, 95)) if values.any() else 0.0
         result[name] = np.clip(values / loud, 0.0, 1.5) if loud > 0 else values
@@ -581,8 +668,11 @@ def predicted_drop(script, beats, prof_out, prof_in, start_beat, cue_beat):
         power = 0.0
         for raw, index, gain, side in ((raw_o, io, g_out, "out."), (raw_i, ii, g_in, "in.")):
             if 0 <= index < len(raw["mix"]):
-                for stem in ("drums", "bass", "vocals", "other"):
-                    power += (gain * values[side + stem] * float(raw[stem][index])) ** 2
+                for stem in ("drums", "bass", "vocals", "other", "guitar", "piano"):
+                    if stem not in raw:
+                        continue          # no separate guitar / piano: they're in "other"
+                    level = values.get(side + stem, values[side + "other"])
+                    power += (gain * level * float(raw[stem][index])) ** 2
         levels.append(math.sqrt(power))
     if len(levels) < 2:
         return 0.0
@@ -703,6 +793,13 @@ def classic_script(style, beats):
                   f(0.3, 0.04, in_bass=1.0, out_bass=0.0), f(0.3, 0.12, out_drums=0.0),
                   f(0.3, 0.2, out_other=0.0), f(0.72, 0.16, out_vocals=0.0),
                   f(0.85, 0.12, in_vocals=1.0), f(0.9, 0.1, xf=1.0)]
+    elif style == "guitar_ride":
+        # Both guitars are pinned from the start: the old one stays when "other" leaves.
+        frames = [f(0, 0, out_guitar=1.0, in_guitar=0.0), f(0, 0.1, xf=0.5), f(0, 0.2, in_drums=1.0),
+                  f(0, 0.15, out_vocals=0.0), f(0.1, 0.2, out_other=0.0, out_piano=0.0),
+                  f(0.25, 0.15, out_drums=0.0), f(0.4, 0.04, in_bass=1.0, out_bass=0.0),
+                  f(0.55, 0.2, in_other=1.0, in_piano=1.0), f(0.68, 0.15, out_guitar=0.0),
+                  f(0.84, 0.08, in_guitar=1.0), f(0.85, 0.12, in_vocals=1.0), f(0.9, 0.1, xf=1.0)]
     elif style == "drum_bridge":
         frames = [f(0, 0.06, xf=0.5), f(0, 0.2, in_drums=1.0), f(0.15, 0.3, out_vocals=0.0),
                   f(0.2, 0.28, out_other=0.0), f(0.48, 0.04, in_bass=1.0, out_bass=0.0),
@@ -718,17 +815,23 @@ ROUTINE_LABELS = {"trade": "Back and forth", "tease": "Hook tease"}
 # How much each vibe likes each move (multiplies its score).
 TASTE = {
     "chill": {"trade": 0.85, "tease": 0.5, "mashup": 1.2, "stem_swap": 1.3, "acapella": 1.0,
-              "drum_bridge": 1.0, "drop": 0.12, "blend": 1.0},
+              "drum_bridge": 1.0, "guitar_ride": 1.25, "drop": 0.12, "blend": 1.0},
     "club": {"trade": 1.15, "tease": 1.1, "mashup": 1.0, "stem_swap": 0.95, "acapella": 0.9,
-             "drum_bridge": 1.0, "drop": 0.75, "blend": 0.7},
+             "drum_bridge": 1.0, "guitar_ride": 1.0, "drop": 0.75, "blend": 0.7},
     "hype": {"trade": 1.0, "tease": 1.45, "mashup": 0.9, "stem_swap": 0.8, "acapella": 0.85,
-             "drum_bridge": 1.0, "drop": 1.25, "blend": 0.5},
+             "drum_bridge": 1.0, "guitar_ride": 0.85, "drop": 1.25, "blend": 0.5},
 }
 
 
 def _vocal(s, phrase):
     phrases = s["phrases"]
     return float(phrases[phrase]["vocals"] or 0) if 0 <= phrase < len(phrases) else 0.0
+
+
+def _guitar(s, phrase):
+    """How much of the mix the guitar is in a phrase (0 when the song has no separate guitar)."""
+    phrases = s["phrases"]
+    return float(phrases[phrase].get("guitar") or 0) if 0 <= phrase < len(phrases) else 0.0
 
 
 def _landing(si, offset):
@@ -828,6 +931,10 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
             classic("acapella", start, 1, 1, 0.8 + 0.9 * sing0, "the old vocal a cappella over the new song")
             classic("stem_swap", start, 1, 1, 1.0 + 0.6 * (1 - sing0),
                     "stem swap: the parts change hands one by one")
+            riff = _guitar(so, start)
+            if riff >= GUITAR_RIDE_MIN and sing0 < 0.35:
+                classic("guitar_ride", start, 1, 1, 1.0 + 1.2 * riff - 0.6 * sing0,
+                        "guitar ride: the old guitar carries on over the new drums and bass")
         else:
             classic("drum_bridge", start, 1, 1, 1.4, "keys clash: only the drums overlap")
         tease_hook = _hook_in(hooks, b0 + 8, b0 + P - 6)
@@ -1120,6 +1227,8 @@ class RealDJ:
         hook = None
         if nxt and nxt["big"] and m.has_stems and self.vibe != "chill":
             hook = _hook_in(find_hooks(m, s), boundary + 1, min(boundary + PHRASE - 4, plan.start_beat - 8))
+        if hook is None and nxt and nxt["big"] and self.vibe != "chill" and _ai(m):
+            hook = _ai_hook(m, boundary + 1, min(boundary + PHRASE - 4, plan.start_beat - 8))
         if hook:
             options += [("hook_repeat", 4 if self.vibe == "hype" else 3)]
         word = None

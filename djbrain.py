@@ -141,6 +141,22 @@ def exits(keys):
             if not any(a["start"] <= e["at"] <= a["end"] for a in avoid)]
 
 
+def entries(keys):
+    """Ways to start the song when it comes in: [{character, at (seconds), styles, why}], never an avoided spot."""
+    found = plan(keys)
+    if not found:
+        return []
+    avoid = found.get("avoid") or []
+    return [e for e in found.get("entries") or []
+            if not any(a["start"] <= e["at"] <= a["end"] for a in avoid)]
+
+
+def hooks(keys):
+    """Memorable moments worth stuttering: [{at (seconds), length (seconds), what}]."""
+    found = plan(keys)
+    return list(found.get("hooks") or []) if found else []
+
+
 def moves(keys, start, end):
     """Moves a DJ would make between these seconds: [{at, type, why}] (types: roll, echo, sweep, riser, ...)."""
     found = plan(keys)
