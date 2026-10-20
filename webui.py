@@ -20,6 +20,7 @@ import secrets
 import shutil
 import struct
 import time
+from types import SimpleNamespace
 
 from aiohttp import web
 
@@ -342,7 +343,7 @@ class WebUI:
         except Exception:
             watch = {}
         checks = {
-            'discord': bool(self.bot and self.bot.is_ready()),
+            'discord': bool(self.bot and self.bot.is_ready()) if config.DISCORD_TOKEN else True,
             'database': state_store.healthy(),
             'storage_writable': os.access(os.path.dirname(TOKENS_FILE), os.W_OK),
             'ffmpeg': bool(shutil.which('ffmpeg')),
@@ -459,6 +460,18 @@ class WebUI:
         except KeyError:
             return web.json_response({'error': 'room not found'}, status=404)
         return await self.api_admin_state(request)
+
+    async def api_admin_huddle_link(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        channel_id = str(body.get('channel_id') or '').strip()
+        if not channel_id:
+            return web.json_response({'error': 'missing channel_id'}, status=400)
+        guild_id = huddle.PREFIX + channel_id if not huddle.is_huddle_id(channel_id) else channel_id
+        token = generate_token(guild_id)
+        return web.json_response({'token': token, 'guild_id': guild_id})
 
     async def api_guilds(self, request):
         guilds = []
@@ -896,12 +909,11 @@ class WebUI:
             return web.json_response({'error': 'empty query'}, status=400)
 
         guild = next((item for item in self.bot.guilds if item.me), None)
-        if not guild:
-            return web.json_response(
-                {'error': 'The music bot is not connected to Discord yet.'},
-                status=503,
-            )
-        requester = guild.me
+        requester = guild.me if guild else SimpleNamespace(
+            id=0,
+            bot=True,
+            display_name="Huddle",
+        )
         songs = []
         try:
             if 'spotify.com' in query or query.startswith('spotify:'):
@@ -1359,6 +1371,7 @@ async def start_web_server(bot):
     app.router.add_get('/api/admin/state', ui.api_admin_state)
     app.router.add_post('/api/admin/update', ui.api_admin_update)
     app.router.add_delete('/api/admin/rooms/{room_id}', ui.api_admin_delete_room)
+    app.router.add_post('/api/admin/huddle-link', ui.api_admin_huddle_link)
     app.router.add_get('/api/guilds', ui.api_guilds)
     app.router.add_get('/api/guilds/{guild_id}', ui.api_guild_state)
     app.router.add_get('/api/live', ui.api_live)
@@ -1379,6 +1392,12 @@ async def start_web_server(bot):
         watchtogether.setup(app, bot)
     except Exception as e:
         logger.error(f"Watch Together failed to mount (dashboard still works): {e}", exc_info=True)
+
+    try:
+        import dj
+        dj.setup(app, ui)
+    except Exception as e:
+        logger.error(f"DJ booth failed to mount (dashboard still works): {e}", exc_info=True)
 
     runner = web.AppRunner(app)
     await runner.setup()

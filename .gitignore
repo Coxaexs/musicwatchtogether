@@ -20,6 +20,8 @@ musics/
 lyrics/
 watch_cache/
 reels_cache/
+dj_cache/
+stems-env/
 *.mp3
 *.m4a
 *.opus

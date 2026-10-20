@@ -611,6 +611,8 @@ def load_opus():
         '/usr/local/lib/libopus.dylib',
         '/opt/homebrew/opt/opus/lib/libopus.dylib',
         '/usr/local/opt/opus/lib/libopus.dylib',
+        '/usr/lib64/libopus.so.0',
+        '/usr/lib64/libopus.so',
         '/usr/lib/x86_64-linux-gnu/libopus.so.0',
         '/usr/lib/aarch64-linux-gnu/libopus.so.0',
         '/usr/lib/libopus.so.0',
@@ -8128,7 +8130,12 @@ async def main():
         except Exception as e:
             logger.error(f"Huddle WebRTC voice failed to start: {e}")
         try:
-            await bot.start(config.DISCORD_TOKEN)
+            if config.DISCORD_TOKEN:
+                await bot.start(config.DISCORD_TOKEN)
+            else:
+                logger.info("ℹ️ DISCORD_TOKEN not set; running in standalone Web/Huddle mode")
+                stop_event = asyncio.Event()
+                await stop_event.wait()
         finally:
             try:
                 await cog.shutdown()
@@ -8141,7 +8148,10 @@ async def main():
 
 if __name__ == "__main__":
     if not config.DISCORD_TOKEN:
-        print("❌ Error: DISCORD_TOKEN not set in .env file!")
-        exit(1)
+        if not (config.WEB_UI_ENABLED or config.HUDDLE_BASE_URL):
+            print("❌ Error: DISCORD_TOKEN not set in .env file!")
+            exit(1)
+        else:
+            print("ℹ️ DISCORD_TOKEN not set; running in standalone Web/Huddle mode")
     
     asyncio.run(main())

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DJ Booth</title>
+<link rel="stylesheet" href="static/dj.css">
+</head>
+<body>
+<header id="top"><div class="brand"><span class="logo">◉</span>DJ Booth</div></header>
+<main id="stage"></main>
+<div id="libraryHolder"></div>
+
+<div id="learnBar" hidden>
+  <span id="learnText">MIDI learn: click a control in the booth, then move a knob or press a pad on your controller.</span>
+  <button id="learnDone" class="btn primary" type="button">Done</button>
+</div>
+
+<div id="login" hidden>
+  <form id="loginForm" class="login-card">
+    <h2>DJ Booth</h2>
+    <p class="muted">Open the booth from Huddle with <code>/dj</code>, or enter the music dashboard password.</p>
+    <input id="password" type="password" placeholder="Password" autocomplete="current-password">
+    <button class="btn primary" type="submit">Unlock</button>
+    <p id="loginError" class="error"></p>
+  </form>
+</div>
+
+<dialog id="dialog"></dialog>
+<div id="toast"></div>
+
+<script src="static/engine.js"></script>
+<script src="static/autodj.js"></script>
+<script src="static/app.js"></script>
+</body>
+</html>

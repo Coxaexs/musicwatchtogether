@@ -88,11 +88,66 @@ def _socket_url() -> str:
     return urlunparse(parsed._replace(scheme=scheme))
 
 
+class LiveFeed:
+    """PCM pushed by a browser DJ booth: s16le, stereo, 48 kHz.
+
+    The booth sends audio as fast as its sound card produces it; this jitter
+    buffer hands the WebRTC sender exact 20 ms frames, waits for ~100 ms of
+    audio before (re)starting, and drops the oldest audio when the browser
+    runs ahead so latency stays bounded.
+    """
+
+    PREBUFFER_FRAMES = 5
+    MAX_FRAMES = 40
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.started = False
+
+    def push(self, data: bytes):
+        self.buffer += data
+        overflow = len(self.buffer) - self.MAX_FRAMES * BYTES_PER_FRAME
+        if overflow > 0:
+            overflow += (-overflow) % 4  # keep stereo s16 samples aligned
+            del self.buffer[:overflow]
+
+    def frames_buffered(self) -> int:
+        return len(self.buffer) // BYTES_PER_FRAME
+
+    def pop_frame(self):
+        if not self.started:
+            if self.frames_buffered() < self.PREBUFFER_FRAMES:
+                return None
+            self.started = True
+        if len(self.buffer) < BYTES_PER_FRAME:
+            self.started = False
+            return None
+        frame = bytes(self.buffer[:BYTES_PER_FRAME])
+        del self.buffer[:BYTES_PER_FRAME]
+        return frame
+
+
+#: Huddle channel id -> the DJ booth feed currently on air there.
+LIVE_FEEDS: dict = {}
+
+
+def attach_live(channel_id: str) -> LiveFeed:
+    feed = LiveFeed()
+    LIVE_FEEDS[channel_id] = feed
+    return feed
+
+
+def detach_live(channel_id: str, feed: LiveFeed):
+    if LIVE_FEEDS.get(channel_id) is feed:
+        LIVE_FEEDS.pop(channel_id, None)
+
+
 class RoomAudioTrack(MediaStreamTrack):
     kind = "audio"
 
-    def __init__(self):
+    def __init__(self, channel_id: str | None = None):
         super().__init__()
+        self.channel_id = channel_id
         self._process = None
         self._reader_task = None
         # Nearly half a second absorbs FFmpeg/network scheduling jitter. The
@@ -245,7 +300,12 @@ class RoomAudioTrack(MediaStreamTrack):
                 await asyncio.sleep(self._next_frame_at - now)
 
         data = bytes(BYTES_PER_FRAME)
-        if not self._paused:
+        live = LIVE_FEEDS.get(self.channel_id) if self.channel_id else None
+        if live is not None:
+            # The DJ booth owns the room while it is live; the queue player's
+            # decoded audio waits (FFmpeg is held by backpressure).
+            data = live.pop_frame() or data
+        elif not self._paused:
             try:
                 # Wait for real PCM instead of injecting a silent frame every
                 # time FFmpeg and the sender wake a few milliseconds apart.
@@ -253,7 +313,7 @@ class RoomAudioTrack(MediaStreamTrack):
             except asyncio.TimeoutError:
                 pass
 
-        if self._volume < 0.999 and data.strip(b"\0"):
+        if live is None and self._volume < 0.999 and data.strip(b"\0"):
             samples = array("h")
             samples.frombytes(data)
             if sys.byteorder != "little":
@@ -278,7 +338,7 @@ class RoomPublisher:
     def __init__(self, channel_id: str, headers: dict):
         self.channel_id = channel_id
         self.headers = headers
-        self.source = RoomAudioTrack()
+        self.source = RoomAudioTrack(channel_id)
         self.relay = MediaRelay()
         self.peers = {}
         self.pending_candidates = {}
@@ -525,6 +585,9 @@ class HuddleVoiceManager:
                 if player.get("track"):
                     active[room["id"]] = player
                     await self._observe_room(room["id"], player)
+                elif room["id"] in LIVE_FEEDS:
+                    # A live DJ booth needs the publisher even with no queue.
+                    active[room["id"]] = player
 
         for channel_id in set(self.publishers) - set(active):
             publisher = self.publishers.pop(channel_id)

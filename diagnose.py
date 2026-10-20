@@ -29,6 +29,8 @@ def check_opus():
     """Check if opus library is available"""
     opus_paths = [
         # Linux paths
+        '/usr/lib64/libopus.so.0',
+        '/usr/lib64/libopus.so',
         '/usr/lib/x86_64-linux-gnu/libopus.so.0',
         '/usr/lib/aarch64-linux-gnu/libopus.so.0',
         '/usr/lib/libopus.so.0',

@@ -1,0 +1,6 @@
+# Optional: stem separation for the DJ booth. Install into a separate
+# virtualenv (PyTorch is large) and point DJ_DEMUCS_PYTHON at it; see README.
+# Install torch/torchaudio first from https://download.pytorch.org/whl/cpu
+# (or the CUDA index for a GPU).
+demucs>=4.0.1,<5
+soundfile>=0.12,<1
