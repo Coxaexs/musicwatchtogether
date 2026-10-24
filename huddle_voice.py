@@ -717,10 +717,11 @@ class RoomPublisher:
     async def _lights(self):
         """The club's light feed (club.py) to the room's hub shard.
 
-        A socket of its own, which only sends and which the hub keeps out of
-        the room's roster. Light goes out while someone has the club open;
-        told nobody has (club-idle) it waits a few seconds and tries again,
-        or sooner when someone opens it (club-wake).
+        A socket of its own, which the hub keeps out of the room's roster.
+        Light goes out while someone has the club open; told nobody has
+        (club-idle) it waits a few seconds and tries again, or sooner when
+        someone opens it (club-wake). It also hears the crowd (club-crowd:
+        taps of More / Chill and cheers, for Real DJ).
         """
         query = urlencode({"room": self.channel_id, "feed": "1"})
         url = f"{_socket_url()}?{query}"
@@ -738,13 +739,17 @@ class RoomPublisher:
                                         return
                                     continue
                                 try:
-                                    kind = json.loads(message.data).get("t")
+                                    data = json.loads(message.data)
+                                    kind = data.get("t")
                                 except (ValueError, AttributeError):
                                     continue
                                 if kind == "club-idle":
                                     idle["until"] = time.monotonic() + 5
                                 elif kind == "club-wake":
                                     idle["until"] = 0.0
+                                elif kind == "club-crowd":
+                                    # A tap of More / Chill or a cheer: Real DJ hears it (club.Crowd).
+                                    club.crowd(self.channel_id).hear(data.get("kind"), data.get("by"), data.get("people"))
 
                         reader = asyncio.create_task(listen())
                         try:

@@ -18,6 +18,10 @@ The moves (perform) are what the person at the club's decks presses: a build
 and drop, an acapella, a beat break, a stutter, an echo throw. They play the
 booth's own controls on the deck that leads, on its beat, the way Real DJ's
 flourishes do.
+
+The crowd (Crowd) is everyone else's say: taps of "More" or "Chill" and
+cheers, which move Real DJ's vibe a step, the energy of the songs it picks,
+and call a build and drop when the room cheers together.
 """
 
 import base64
@@ -702,6 +706,113 @@ def perform(session, move):
                 feed.event("echo", _beat_ms(m, beat, now_beat))
         session.club_busy_until = ((m.name, m.wave_id), end)
     return f"{MOVES[move]} on the next {'bar' if move in ('drop', 'acapella', 'beatbreak') else 'beat'}"
+
+
+# What the people with the club open tell the DJ (the hub's club-crowd
+# messages): a tap of "More" or "Chill", which counts for CROWD_VOTE_S and
+# fades, and cheers (the room's 🔥 🎉 👏 emotes).
+CROWD_VOTE_S = 120.0
+CROWD_SHIFT = 0.4                  # mood that moves the vibe a step; it steps back below CROWD_SETTLE
+CROWD_SETTLE = 0.2
+CROWD_LIFT = 0.3                   # how far everyone wanting more lifts the set's energy target
+CHEER_WINDOW_S = 8.0
+CHEER_EACH = 3                     # one person's cheers that count in a window
+CROWD_DROP_EVERY_S = 60.0
+CROWD_SAID_S = 8.0                 # how long the club bar says what the DJ did about it
+VIBE_STEPS = ("chill", "club", "hype")
+
+
+class Crowd:
+    """What a room's crowd wants of the DJ, from the hub's club-crowd messages."""
+
+    def __init__(self):
+        self.votes = {}            # who -> (more | chill, monotonic time)
+        self.cheers = deque()      # (who, time)
+        self.people = 1            # how many have the club open
+        self.step = 0              # the vibe step the crowd has the DJ on: -1, 0 or 1
+        self.dropped_at = -math.inf
+        self.said = None           # (up | down | drop, time): what the DJ did about it
+
+    def hear(self, kind, who, people=None, now=None):
+        now = time.monotonic() if now is None else now
+        if isinstance(people, int) and not isinstance(people, bool) and people > 0:
+            self.people = min(people, 500)
+        who = str(who or "")[:64]
+        if kind in ("more", "chill"):
+            self.votes[who] = (kind, now)
+        elif kind == "cheer":
+            self.cheers.append((who, now))
+            while len(self.cheers) > 200:
+                self.cheers.popleft()
+
+    def _fresh(self, now):
+        for who, (_, at) in list(self.votes.items()):
+            if now - at >= CROWD_VOTE_S:
+                del self.votes[who]
+        return list(self.votes.values())
+
+    def counts(self, now=None):
+        """(more, chill): the votes still counting."""
+        kinds = [kind for kind, _ in self._fresh(time.monotonic() if now is None else now)]
+        return kinds.count("more"), kinds.count("chill")
+
+    def mood(self, now=None):
+        """-1 (everyone wants it calmer) .. 1 (everyone wants more), each vote fading with its age."""
+        now = time.monotonic() if now is None else now
+        fresh = self._fresh(now)
+        total = sum((1 if kind == "more" else -1) * (1 - (now - at) / CROWD_VOTE_S) for kind, at in fresh)
+        return max(-1.0, min(1.0, total / max(self.people, len(fresh), 1)))
+
+    def follow(self, now=None):
+        """The vibe step the crowd has the DJ on (-1, 0 or 1), with some give so it doesn't flap."""
+        now = time.monotonic() if now is None else now
+        mood = self.mood(now)
+        if self.step and mood * self.step < CROWD_SETTLE:
+            self.step = 0
+        if not self.step and abs(mood) >= CROWD_SHIFT:
+            self.step = 1 if mood > 0 else -1
+            self.said = ("up" if mood > 0 else "down", now)
+        return self.step
+
+    def cheered(self, now=None):
+        """Whether the room is cheering together, and the last drop for it was a while ago."""
+        now = time.monotonic() if now is None else now
+        while self.cheers and now - self.cheers[0][1] > CHEER_WINDOW_S:
+            self.cheers.popleft()
+        if now - self.dropped_at < CROWD_DROP_EVERY_S:
+            return False
+        each = {}
+        for who, _ in self.cheers:
+            each[who] = min(CHEER_EACH, each.get(who, 0) + 1)
+        return sum(each.values()) >= max(CHEER_EACH, self.people)
+
+    def dropping(self, now=None):
+        """The DJ answers the cheer with a drop."""
+        now = time.monotonic() if now is None else now
+        self.dropped_at = now
+        self.cheers.clear()
+        self.said = ("drop", now)
+
+    def info(self, now=None):
+        """What the club bar shows: the votes, and what the DJ did about them a moment ago."""
+        now = time.monotonic() if now is None else now
+        more, chill = self.counts(now)
+        said = self.said[0] if self.said and now - self.said[1] < CROWD_SAID_S else None
+        return {"more": more, "chill": chill, "said": said} if more or chill or said else None
+
+
+CROWDS = {}
+
+
+def crowd(room):
+    """The crowd of a Huddle room's club (made on first use)."""
+    return CROWDS.setdefault(room, Crowd())
+
+
+def crowd_vibe(base, step):
+    """The vibe a step up or down from the one the booth chose."""
+    index = VIBE_STEPS.index(base) if base in VIBE_STEPS else 1
+    return VIBE_STEPS[max(0, min(len(VIBE_STEPS) - 1, index + step))]
 
 
 def night_entries(entries, playing=(), count=30, rng=None):

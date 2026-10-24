@@ -40,6 +40,7 @@ import time
 
 import numpy as np
 
+import club
 import djbrain
 import mixer
 import stems
@@ -56,6 +57,7 @@ TEMPO_RIDE = 0.15              # beyond this, no blend: a drop or echo out
 GUITAR_RIDE_MIN = 0.3          # guitar share of the old song's mix for a guitar ride (as dj.py)
 RIDE_MAX = 6.0                 # percent the outgoing song may be pushed
 SET_MINUTES = 75.0             # one energy arc (warm-up, peak, breather, peak)
+CROWD_DROP_WAIT_S = 20.0       # how long a cheer for a drop waits for its moment
 
 # How much the DJ plays the decks. chill: long blends, few touches. club: a
 # touch most phrases, loop rolls and drops with a riser / 808. hype: tricks
@@ -318,13 +320,16 @@ def sound_similarity(out, inn):
     return djbrain.similarity((getattr(out, "info", None) or {}).get("keys"), (getattr(inn, "info", None) or {}).get("keys"))
 
 
-def pick_next(items, out_deck, minutes, history, rng=random):
-    """Index of the crate item to play next (or None for an empty crate)."""
+def pick_next(items, out_deck, minutes, history, rng=random, lift=0.0):
+    """Index of the crate item to play next (or None for an empty crate).
+
+    lift: how far the crowd moves the set's energy target (club.CROWD_LIFT at most).
+    """
     if not items:
         return None
     out_meta = dict(out_deck.meta or {}, live_bpm=out_deck.live_bpm()) if out_deck else {}
     out_keys = (getattr(out_deck, "info", None) or {}).get("keys") if out_deck and _ai(out_deck) else None
-    target = energy_target(minutes)
+    target = min(0.95, max(0.1, energy_target(minutes) + lift))
     played = {(h.get("title") or "").lower() for h in history[:40]}
     recent = [(h.get("artist") or "").lower() for h in history[:2]]
     best = None
@@ -1009,6 +1014,9 @@ class RealDJ:
         self.layer = None              # the third song in play: {"for", "title", "stage", ...}
         self.layered = set()           # (deck, wave id): songs that had (or tried) a layer
         self.teased = None             # the layered song's crate item: it plays next
+        self.crowd = getattr(session, "crowd", None)   # club.Crowd: the club's say (Huddle rooms)
+        self.lift = 0.0                # the crowd's push on the energy of the next songs
+        self.drop_wanted = None        # when the crowd cheered for a drop (monotonic)
 
     def minutes(self):
         return (time.monotonic() - self.started_at) / 60
@@ -1024,6 +1032,7 @@ class RealDJ:
         session = self.session
         engine = session.engine
         decks = engine.decks
+        self._hear_crowd()
         with engine.lock:
             playing = [d for d in decks.values() if d.playing]
             tr = engine.transition
@@ -1079,6 +1088,7 @@ class RealDJ:
             if m.loop_on:
                 return
             self._ride(m, plan, current)
+            self._crowd_drop(m, plan, current)
             self._flourish(m, plan, current)
             seconds_left = (plan.start_beat - current) * m.beat_seconds / max(0.05, m.base_rate())
             if seconds_left < 1.2:
@@ -1160,7 +1170,7 @@ class RealDJ:
         if any(session._loading(d) for d in DECKS):
             return
         items = session.crate.items()
-        index = pick_next(items, None, self.minutes(), session.history, self.rng)
+        index = pick_next(items, None, self.minutes(), session.history, self.rng, self.lift)
         if index is None:
             return
         item = await session.crate.take(index)
@@ -1176,7 +1186,7 @@ class RealDJ:
             session.load_in_background(deck.name, item)
             return
         items = session.crate.items()
-        index = pick_next(items, out, self.minutes(), session.history, self.rng)
+        index = pick_next(items, out, self.minutes(), session.history, self.rng, self.lift)
         if index is None:
             item = await session._next_item()       # Discord: Smart Autoplay
         else:
@@ -1184,6 +1194,53 @@ class RealDJ:
         if item:
             self.next_title = item.get("title")
             session.load_in_background(deck.name, item)
+
+    def _hear_crowd(self):
+        """The club's crowd steers the set: the vibe a step from the booth's, the
+        energy of the songs picked next, and a drop when the room cheers together."""
+        crowd = self.crowd
+        if crowd is None:
+            return
+        now = time.monotonic()
+        vibe = club.crowd_vibe(getattr(self.session, "vibe", self.vibe), crowd.follow(now))
+        if vibe != self.vibe:
+            logger.info("Real DJ %s: the crowd moves the vibe to %s", self.session.key, vibe)
+            self.vibe = vibe
+            self.plan_for = None           # plan the next mix again, in this vibe
+        self.lift = club.CROWD_LIFT * crowd.mood(now)
+        if self.drop_wanted is None and crowd.cheered(now):
+            self.drop_wanted = now
+
+    def _crowd_drop(self, m, plan, current):
+        """The crowd cheered: a build and drop (club.perform) landing on the next
+        half phrase, unless the mix comes first (a lift of its own)."""
+        if self.drop_wanted is None:
+            return
+        if time.monotonic() - self.drop_wanted > CROWD_DROP_WAIT_S:
+            self.drop_wanted = None
+            return
+        drop = math.ceil((current + 8.75) / (PHRASE // 2)) * (PHRASE // 2)
+        if drop >= plan.start_beat - 4:
+            self.drop_wanted = None
+            if self.crowd is not None:
+                self.crowd.cheers.clear()
+            return
+        if drop - 8 - current >= 4:
+            return                         # perform builds from the next bar: wait for the one 8 beats out
+        engine = self.session.engine
+        if engine.fx.on or engine.transition or m.loop_on:
+            return
+        self.drop_wanted = None
+        try:
+            club.perform(self.session, "drop")
+        except ValueError:
+            return
+        # No flourish of its own on the drop's phrase line.
+        key = (m.name, m.wave_id)
+        self.flourish_at[key] = max(self.flourish_at.get(key, -9), int((drop - 1) // PHRASE))
+        if self.crowd is not None:
+            self.crowd.dropping()
+        logger.info("Real DJ %s: the crowd cheered: a build and drop on beat %d", self.session.key, drop)
 
     def _ride(self, m, plan, current):
         """Walk the outgoing tempo toward the next song over the last 32 beats."""

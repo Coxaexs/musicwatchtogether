@@ -1783,7 +1783,9 @@ class DJSession:
         self.auto = auto
         self.mode = "auto"               # auto (smooth queue) | real (Real DJ set)
         self.real = None                 # realdj.RealDJ while mode == "real"
-        self.vibe = "club"               # Real DJ: chill | club | hype
+        self.vibe = "club"               # Real DJ: chill | club | hype (the crowd moves it a step: club.Crowd)
+        room = getattr(crate, "channel_id", None) if kind == "huddle" else None
+        self.crowd = club.crowd(room) if room else None   # the club's say, for Real DJ
         self.three = False               # Real DJ: 3 songs (layer a third song's vocal)
         self.ai = False                  # experimental: Real DJ uses the offline AI analysis (djbrain)
         self.paused = False              # the whole set paused (pause / resume)
@@ -2107,11 +2109,12 @@ class DJSession:
             upcoming = (waiting.info.get("title") if waiting else None) or (self.real.next_title if self.real else None)
             info = {
                 "mode": ("real" if self.mode == "real" else "auto") if self.auto else "hands",
-                "vibe": self.vibe,
+                "vibe": self.real.vibe if self.real else self.vibe,
                 "mix": ({"style": tr.label, "progress": round(tr.progress, 2)}
                         if tr is not None and tr.started and not tr.done else None),
                 "key": m.meta.get("camelot") if m is not None and m.loaded else None,
                 "paused": self.paused,
+                "crowd": self.crowd.info() if self.crowd else None,
             }
         if not upcoming and self.mode != "real":
             # Auto DJ plays the queue in order: its next song is the queue's first.

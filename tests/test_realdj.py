@@ -5,11 +5,13 @@ import sys
 import tempfile
 import unittest
 import wave
+from types import SimpleNamespace
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import club  # noqa: E402
 import dj  # noqa: E402
 import realdj  # noqa: E402
 
@@ -212,6 +214,75 @@ class RealDJTests(unittest.TestCase):
         self.assertTrue(session.real.touches, "hype played no live touches")
         # Songs are cut to their good part: three songs in well under 3 × 125 s.
         self.assertLess(seconds, 3 * 125)
+
+    def test_the_crowd_picks_livelier_songs(self):
+        metas = {"calm": {"bpm": 124, "energy": 0.45}, "lively": {"bpm": 124, "energy": 0.85}}
+        items = [{"title": name, "keys": [name]} for name in metas]
+        saved = realdj.mixer.cache
+        realdj.mixer.cache = SimpleNamespace(get=lambda *keys: metas.get(keys[0]))
+        try:
+            pick = lambda lift: items[realdj.pick_next(items, None, 0, [], random.Random(0), lift)]["title"]
+            self.assertEqual(pick(0.0), "calm")
+            self.assertEqual(pick(club.CROWD_LIFT), "lively")
+        finally:
+            realdj.mixer.cache = saved
+
+    def test_the_crowd_moves_the_vibe_and_cheers_bring_a_drop(self):
+        session = dj.DJSession("t", "test", Crate(self.files), auto=True)
+        session.live = True
+        session.mode = "real"
+        session.crowd = crowd = club.Crowd()
+        session.real = real = realdj.RealDJ(session, rng=random.Random(5), vibe="club")
+        engine = session.engine
+        engine.light = club.Feed()
+
+        async def step():
+            await session._tick()
+            await asyncio.sleep(0)
+            for task in list(session.load_tasks.values()):
+                if not task.done():
+                    await task
+            for _ in range(12):                 # 0.24 s of audio per tick
+                engine.render()
+
+        def beat():
+            m = engine.master()
+            return m.beat_at(m.seconds) if m is not None and m.playing and m.bpm else 0
+
+        async def run():
+            for _ in range(2000):
+                if real.plan is not None and real.plan_for is not None and beat() > 8:
+                    break
+                await step()
+            self.assertIsNotNone(real.plan, "no mix planned")
+            self.assertEqual(real.vibe, "club")
+            crowd.hear("more", "a", people=1)
+            await step()
+            self.assertEqual(real.vibe, "hype")
+            self.assertAlmostEqual(real.lift, club.CROWD_LIFT, delta=0.01)
+            await step()                        # the club bar hears of it on the next tick
+            self.assertEqual(engine.light.info["vibe"], "hype")
+            self.assertEqual(engine.light.info["crowd"], {"more": 1, "chill": 0, "said": "up"})
+            self.assertEqual(session.vibe, "club")      # the booth's choice stays
+            for _ in range(3):
+                crowd.hear("cheer", "a")
+            asked = beat()
+            for _ in range(400):
+                if crowd.dropped_at > 0:
+                    break
+                await step()
+            return asked
+
+        asked = asyncio.run(run())
+        self.assertGreater(crowd.dropped_at, 0, "the cheer brought no drop")
+        drop = session.club_busy_until[1] - 1
+        self.assertEqual(drop % 16, 0)                  # on a half phrase
+        self.assertLessEqual(drop - asked, 16 + 9)      # the next one there was time to build into
+        self.assertLess(drop, real.plan.start_beat)
+        kinds = [e["k"] for e in engine.light.events]
+        self.assertIn("build", kinds)
+        self.assertIn("drop", kinds)
+        self.assertEqual(crowd.info()["said"], "drop")
 
 
 if __name__ == "__main__":

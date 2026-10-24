@@ -375,6 +375,61 @@ class NightTests(unittest.TestCase):
         self.assertNotIn("Song 4", titles)
 
 
+class CrowdTests(unittest.TestCase):
+    def test_a_tap_moves_the_vibe_a_step_and_fades(self):
+        crowd = club.Crowd()
+        crowd.hear("more", "a", people=1, now=0)
+        self.assertEqual(crowd.mood(0), 1.0)
+        self.assertEqual(crowd.follow(0), 1)
+        self.assertEqual(crowd.info(1), {"more": 1, "chill": 0, "said": "up"})
+        self.assertEqual(crowd.follow(60), 1)             # half faded: still above CROWD_SETTLE
+        self.assertEqual(crowd.info(60), {"more": 1, "chill": 0, "said": None})
+        self.assertEqual(crowd.follow(100), 0)            # faded below it
+        self.assertIsNone(crowd.info(club.CROWD_VOTE_S + 1))
+        self.assertEqual(club.crowd_vibe("club", 1), "hype")
+        self.assertEqual(club.crowd_vibe("hype", 1), "hype")
+        self.assertEqual(club.crowd_vibe("club", -1), "chill")
+        self.assertEqual(club.crowd_vibe("chill", -1), "chill")
+
+    def test_the_room_has_to_lean_one_way(self):
+        crowd = club.Crowd()
+        crowd.hear("more", "a", people=4, now=0)
+        self.assertEqual(crowd.follow(0), 0)              # one of four
+        crowd.hear("more", "b", people=4, now=0)
+        self.assertEqual(crowd.follow(0), 1)              # half the room
+        crowd.hear("chill", "b", people=4, now=1)         # changes their mind: their last tap counts
+        self.assertEqual(crowd.counts(1), (1, 1))
+        self.assertEqual(crowd.follow(1), 0)
+        crowd.hear("chill", "a", people=4, now=2)
+        self.assertEqual(crowd.follow(2), -1)
+        self.assertEqual(crowd.info(2)["said"], "down")
+        crowd.hear("nonsense", "c", people=True, now=3)   # ignored, and so is a bad head count
+        self.assertEqual((crowd.counts(3), crowd.people), ((0, 2), 4))
+
+    def test_cheering_together_calls_a_drop_now_and_then(self):
+        crowd = club.Crowd()
+        for at in (0, 1):
+            crowd.hear("cheer", "a", people=1, now=at)
+        self.assertFalse(crowd.cheered(1))
+        crowd.hear("cheer", "a", people=1, now=2)
+        self.assertTrue(crowd.cheered(2))                 # alone: three cheers in a few seconds
+        crowd.dropping(2)
+        for at in (3, 4, 5):
+            crowd.hear("cheer", "a", now=at)
+        self.assertFalse(crowd.cheered(5))                # the last drop was a moment ago
+        self.assertEqual(crowd.info(5)["said"], "drop")
+        later = 2 + club.CROWD_DROP_EVERY_S
+        for at in range(5):
+            crowd.hear("cheer", "a", people=4, now=later + at)
+        self.assertFalse(crowd.cheered(later + 4))        # one of four cheering, however much
+        crowd.hear("cheer", "b", now=later + 4)
+        self.assertTrue(crowd.cheered(later + 4))
+        crowd.cheers.clear()
+        for at in (0, 1, 2, 9):
+            crowd.hear("cheer", "c", people=1, now=later + 20 + at)
+        self.assertFalse(crowd.cheered(later + 29.5))     # the first ones are too old
+
+
 class StyledSkipTests(unittest.TestCase):
     def test_the_club_mix_buttons_pick_the_style(self):
         audio, parts = synthetic_song()
