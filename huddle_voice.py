@@ -132,6 +132,15 @@ class RoomAudioTrack(MediaStreamTrack):
         self.meter = club.PlayerMeter()
         #: AutoMix's analysis of the song playing (its beat grid), or None.
         self.analysis = None
+        # Blocks put into the queue and taken out of it since it was last
+        # emptied, and the blocks of a spliced AutoMix transition among them
+        # (first, end, and the outgoing song's mix point): the lights' beat
+        # for a block depends on which song (or the blend) it belongs to.
+        self._queued = 0
+        self._taken = 0
+        self._segment = None
+        #: The AutoMix blend the lights are showing ({"style", "progress"}), or None.
+        self.mix_info = None
 
     async def configure(
         self,
@@ -233,6 +242,8 @@ class RoomAudioTrack(MediaStreamTrack):
                 self._frames.get_nowait()
             except asyncio.QueueEmpty:
                 break
+        self._queued = self._taken = 0
+        self._segment = None
 
         process = self._process
         self._process = None
@@ -252,6 +263,7 @@ class RoomAudioTrack(MediaStreamTrack):
     async def _put_bytes(self, pending: bytearray):
         while len(pending) >= BYTES_PER_FRAME:
             await self._frames.put(bytes(pending[:BYTES_PER_FRAME]))
+            self._queued += 1
             del pending[:BYTES_PER_FRAME]
 
     async def _pump_frames(self):
@@ -279,6 +291,8 @@ class RoomAudioTrack(MediaStreamTrack):
                     await self._put_bytes(pending)
                     await self._frames.put(mix["on_start"])
                     pending.extend(mix["segment"])
+                    first = self._queued
+                    self._segment = (first, first + len(pending) // BYTES_PER_FRAME, mix["out_at"])
                     self._mix = None
                     self._url = mix["next_url"]
                     self.track_id = mix["next_track_id"]
@@ -315,9 +329,27 @@ class RoomAudioTrack(MediaStreamTrack):
         if not isinstance(item, bytes):
             return                       # a mix marker: the next block will do
         values = self.meter.frame(item)
-        position = self._src_pos - (len(queue) - ahead) * SAMPLES_PER_FRAME / SAMPLE_RATE
-        beat, bpm = club.player_beat(self.analysis, position)
-        self.light.add(time.time() * 1000 + ahead * 1000 * SAMPLES_PER_FRAME / SAMPLE_RATE, values, beat, bpm)
+        block = SAMPLES_PER_FRAME / SAMPLE_RATE
+        index = self._taken + sum(1 for i in range(ahead) if isinstance(queue[i], bytes))
+        segment = self._segment
+        mix = None
+        if segment and index < segment[1]:
+            first, end, out_at = segment
+            if index >= first:
+                # The blend itself: neither song's grid holds, so the
+                # listeners find the beat from the kicks until it is over.
+                beat = bpm = None
+                mix = {"style": "AutoMix", "progress": round((index - first) / max(1, end - first) * 20) / 20}
+            else:
+                beat, bpm = club.player_beat(self.analysis, out_at - (first - index) * block)
+        else:
+            self._segment = None
+            position = self._src_pos - (len(queue) - ahead) * block
+            beat, bpm = club.player_beat(self.analysis, position)
+        if mix != self.mix_info:
+            self.mix_info = mix
+            self.light.info = {**(self.light.info or {"mode": "player"}), "mix": mix}
+        self.light.add(time.time() * 1000 + ahead * 1000 * block, values, beat, bpm, notes=self.meter.notes)
 
     async def recv(self):
         loop = asyncio.get_running_loop()
@@ -361,7 +393,9 @@ class RoomAudioTrack(MediaStreamTrack):
                     except Exception:
                         logger.exception("AutoMix start callback failed")
                     item = await asyncio.wait_for(self._frames.get(), timeout=1)
-                data = item if isinstance(item, bytes) else data
+                if isinstance(item, bytes):
+                    self._taken += 1
+                    data = item
             except asyncio.TimeoutError:
                 pass
             if self.light is not None and self.light.wanted:
@@ -437,7 +471,7 @@ class RoomPublisher:
             keys = [key for key in _mix_keys(track) if key]
             self.source.analysis = mixer.cache.get(*keys) if keys else None
         upcoming = (player.get("queue") or [{}])[0]
-        self.lights.info = {"mode": "player", "next": upcoming.get("title") or None}
+        self.lights.info = {"mode": "player", "next": upcoming.get("title") or None, "mix": self.source.mix_info}
         settings = huddle.settings_for(self.channel_id)
         settings_key = tuple(sorted(settings.items()))
         url = str(track.get("audioUrl") or "")

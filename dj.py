@@ -497,7 +497,7 @@ class Deck:
         # and they are part of "other".
         self.extra = None
         self.stems_status = None    # None | separating | ready | failed
-        # The club's light envelope (club.envelope): uint8 (frames, 6), or None.
+        # The club's light for the song (club.light: envelope and notes): uint8 (frames, 9), or None.
         self.light = None
         self.stem_gain = stems.StemGains()
         self.stem_now = dict(self.stem_gain)
@@ -1639,8 +1639,8 @@ class DJEngine:
             self.master_level = [max(self.master_level[i] * 0.82, float(peak[i])) for i in (0, 1)]
             if (self.light is not None and self.light.wanted and not self.paused
                     and any(d.playing for d in self.decks.values())):
-                values, beat, bpm, lit_by_stems = club.frame(self)
-                self.light.add(time.time() * 1000 + club.LOOKAHEAD * 1000, values, beat, bpm, lit_by_stems)
+                values, notes, beat, bpm, lit_by_stems = club.frame(self)
+                self.light.add(time.time() * 1000 + club.LOOKAHEAD * 1000, values, beat, bpm, lit_by_stems, notes)
             return (np.clip(mix, -1, 1) * 32767).astype("<i2").tobytes()
 
     # ---- state ----
@@ -1984,16 +1984,16 @@ class DJSession:
         self._light_up(deck, token)
 
     def _light_up(self, deck, token):
-        """The club's light envelope for a deck's song, in the background (Hoffle
-        booths only): from its stems when it has them, else from the mix. A song
-        whose stems arrive later is lit again from them."""
+        """The club's light for a deck's song (its envelope and notes), in the
+        background (Hoffle booths only): from its stems when it has them, else from
+        the mix. A song whose stems arrive later is lit again from them."""
         if self.engine.light is None:
             return
         audio, parts = deck.audio, deck.stems
 
         async def run():
             try:
-                env = await asyncio.get_running_loop().run_in_executor(None, club.envelope, audio, parts)
+                env = await asyncio.get_running_loop().run_in_executor(None, club.light, audio, parts)
             except Exception:
                 logger.exception("DJ %s: light envelope failed on %s", self.key, deck.name)
                 return
@@ -2104,15 +2104,22 @@ class DJSession:
             m = engine.master()
             waiting = next((d for d in (engine.decks[n] for n in DECKS)
                             if d is not m and d.loaded and not d.playing and not d.ended), None)
-            feed.info = {
+            upcoming = (waiting.info.get("title") if waiting else None) or (self.real.next_title if self.real else None)
+            info = {
                 "mode": ("real" if self.mode == "real" else "auto") if self.auto else "hands",
                 "vibe": self.vibe,
                 "mix": ({"style": tr.label, "progress": round(tr.progress, 2)}
                         if tr is not None and tr.started and not tr.done else None),
-                "next": (waiting.info.get("title") if waiting else None) or (self.real.next_title if self.real else None),
                 "key": m.meta.get("camelot") if m is not None and m.loaded else None,
                 "paused": self.paused,
             }
+        if not upcoming and self.mode != "real":
+            # Auto DJ plays the queue in order: its next song is the queue's first.
+            try:
+                upcoming = next((item.get("title") for item in self.crate.items()[:1]), None)
+            except Exception:
+                upcoming = None
+        feed.info = {**info, "next": upcoming}
 
     def _follow_karaoke(self):
         """Mirror the room's karaoke setting onto the decks (checked every 2 s)."""

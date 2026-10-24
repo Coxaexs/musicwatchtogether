@@ -44,6 +44,36 @@ def frame_at(env, seconds):
     return env[int(seconds * SR / club.BLOCK)]
 
 
+def tone(t, hz, harmonics=1):
+    """A note with `harmonics` overtones falling away (1: a sine)."""
+    return sum(np.sin(2 * np.pi * hz * h * t) / h for h in range(1, harmonics + 1))
+
+
+def notes_song():
+    """8 s with known notes. Bass: A1 then D2. The rest of the music: a C major
+    chord, then A minor. Voice: quiet, then E4 (with vibrato), then G4."""
+    n = SR * SECONDS
+    t = np.arange(n) / SR
+    first = t < SECONDS / 2
+    bass = 0.25 * np.where(first, tone(t, 55.0, 5), tone(t, 73.42, 5))
+    major = tone(t, 261.63, 3) + tone(t, 329.63, 3) + tone(t, 392.0, 3)
+    minor = tone(t, 220.0, 3) + tone(t, 261.63, 3) + tone(t, 329.63, 3)
+    other = 0.06 * np.where(first, major, minor)
+    wobble = 2 ** (0.2 / 12 * np.sin(2 * np.pi * 5 * t))          # vibrato, a fifth of a semitone
+    voice = np.where(t < 5, np.sin(2 * np.pi * np.cumsum(329.63 * wobble) / SR), np.sin(2 * np.pi * 392.0 * t))
+    voice = voice + 0.5 * np.sin(2 * np.pi * 2 * np.where(t < 5, 329.63, 392.0) * t)
+    vocals = 0.2 * np.where(t >= 2, voice, 0.0)
+    drums = synthetic_song()[1][0][:, 0] / (0.8 * 32767)      # the same kicks
+    to16 = lambda x: (np.stack([x, x], axis=1) * 0.4 * 32767).astype(np.int16)   # all together stays under full scale
+    return to16(drums + bass + vocals + other), np.stack([to16(drums), to16(bass), to16(vocals)])
+
+
+def note_at(notes, seconds, part):
+    """The pitch class (0 = C) a part is on at `seconds`, or None."""
+    value = int(frame_at(notes, seconds)[club.NOTE_PARTS.index(part)])
+    return (value & 15) - 1 if value else None
+
+
 class EnvelopeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -77,9 +107,58 @@ class EnvelopeTests(unittest.TestCase):
         audio = np.tile(self.audio, (30, 1))            # four minutes
         parts = np.tile(self.parts, (1, 30, 1))
         started = time.perf_counter()
-        env = club.envelope(audio, parts)
-        self.assertEqual(len(env), len(audio) // club.BLOCK)
-        self.assertLess(time.perf_counter() - started, 8.0)
+        env = club.light(audio, parts)
+        self.assertEqual(env.shape, (len(audio) // club.BLOCK, len(club.CHANNELS) + len(club.NOTE_PARTS)))
+        self.assertLess(time.perf_counter() - started, 15.0)
+
+
+A, C, D, E, G = 9, 0, 2, 4, 7
+
+
+class NoteTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.audio, cls.parts = notes_song()
+
+    def test_with_stems_each_part_is_on_its_note(self):
+        notes = club.notes(self.audio, self.parts)
+        self.assertEqual(notes.dtype, np.uint8)
+        self.assertEqual(notes.shape, (len(self.audio) // club.BLOCK, 3))
+        self.assertEqual([note_at(notes, s, "bass") for s in (1.0, 2.25, 3.5)], [A, A, A])
+        self.assertEqual([note_at(notes, s, "bass") for s in (4.6, 6.25, 7.5)], [D, D, D])
+        self.assertEqual([note_at(notes, s, "chord") for s in (1.0, 3.0)], [C, C])
+        self.assertEqual([note_at(notes, s, "chord") for s in (5.0, 7.0)], [A, A])
+        self.assertIsNone(note_at(notes, 1.0, "vocal"))               # not singing yet
+        self.assertEqual([note_at(notes, s, "vocal") for s in (2.5, 3.5, 4.5)], [E, E, E])
+        self.assertEqual([note_at(notes, s, "vocal") for s in (5.5, 7.0)], [G, G])
+        # A clear, held note is a strong one.
+        self.assertGreaterEqual(int(frame_at(notes, 3.0)[0]) >> 4, 8)
+
+    def test_without_stems_the_bass_comes_off_the_mix_and_there_is_no_voice(self):
+        notes = club.notes(self.audio)
+        self.assertEqual(note_at(notes, 2.25, "bass"), A)
+        self.assertEqual(note_at(notes, 6.25, "bass"), D)
+        self.assertIsNotNone(note_at(notes, 2.25, "chord"))
+        self.assertEqual(int(notes[:, club.NOTE_PARTS.index("vocal")].max()), 0)
+
+    def test_silence_has_no_notes(self):
+        quiet = np.zeros((SR * 2, 2), np.int16)
+        self.assertEqual(int(club.notes(quiet, np.zeros((3, SR * 2, 2), np.int16)).max()), 0)
+        self.assertEqual(club.notes(quiet[:100]).shape, (0, 3))
+
+    def test_the_player_reads_the_bass_and_the_chord_as_it_plays(self):
+        meter = club.PlayerMeter()
+        t = np.arange(SR * 2) / SR
+        mix = 0.3 * np.sin(2 * np.pi * 55.0 * t) + 0.05 * (tone(t, 261.63, 3) + tone(t, 329.63, 3) + tone(t, 392.0, 3))
+        pcm = (np.stack([mix, mix], axis=1) * 32767).astype("<i2")
+        for i in range(0, len(pcm) - club.BLOCK + 1, club.BLOCK):
+            meter.frame(pcm[i:i + club.BLOCK].tobytes())
+        bass, chord, vocal = meter.notes
+        self.assertEqual((bass & 15) - 1, A)
+        self.assertEqual((chord & 15) - 1, C)
+        self.assertEqual(vocal, 0)
+        meter.reset()
+        self.assertEqual(meter.notes, bytes(3))
 
 
 def lit_engine():
@@ -88,7 +167,7 @@ def lit_engine():
     deck = engine.decks["A"]
     deck.audio, deck.stems = audio, parts
     deck.meta = {"bpm": BPM, "bpm_confidence": 1.0, "first_beat": 0.0}
-    deck.light = club.envelope(audio, parts)
+    deck.light = club.light(audio, parts)
     deck.playing = True
     engine.master_name = "A"
     engine.xfader = -1.0
@@ -101,7 +180,7 @@ class FrameTests(unittest.TestCase):
         engine, deck = lit_engine()
         deck.seek(5.97)
         deck.rate_now = 1.0
-        values, beat, bpm, lit_by_stems = club.frame(engine, ahead=0.05)   # lands on the kick at 6.0 s
+        values, notes, beat, bpm, lit_by_stems = club.frame(engine, ahead=0.05)   # lands on the kick at 6.0 s
         self.assertTrue(lit_by_stems)
         self.assertAlmostEqual(bpm, BPM)
         self.assertAlmostEqual(beat, 12.04, places=2)
@@ -122,6 +201,33 @@ class FrameTests(unittest.TestCase):
         engine.xfader = 1.0                               # over to deck B
         values, *_ = club.frame(engine, ahead=0.0)
         self.assertEqual(max(values), 0.0)
+
+    def test_each_part_has_the_note_of_the_deck_it_sounds_loudest_on(self):
+        engine, a = lit_engine()
+        audio, parts = notes_song()
+        a.audio, a.stems, a.light = audio, parts, club.light(audio, parts)
+        b = engine.decks["B"]
+        b.audio, b.stems, b.light = audio, parts, club.light(audio, parts)
+        b.meta = dict(a.meta)
+        a.seek(2.25)
+        a.rate_now = 1.0
+        _, notes, *_ = club.frame(engine, ahead=0.0)
+        self.assertEqual([(n & 15) - 1 for n in notes], [A, C, E])
+        a.stem_now = dict(a.stem_now, bass=0.0)          # the bass muted: no bass note
+        _, notes, *_ = club.frame(engine, ahead=0.0)
+        self.assertEqual(notes[0], 0)
+        self.assertEqual((notes[1] & 15) - 1, C)
+        # Deck B in the second half comes up over the crossfader: its notes take over.
+        b.seek(6.25)
+        b.rate_now, b.playing, b.fader = 1.0, True, 1.0
+        engine.xfader = 1.0
+        _, notes, *_ = club.frame(engine, ahead=0.0)
+        self.assertEqual([(n & 15) - 1 for n in notes], [D, A, G])
+        # A light from before notes (6 channels) lights with no notes.
+        b.light = club.envelope(audio, parts)
+        values, notes, *_ = club.frame(engine, ahead=0.0)
+        self.assertGreater(max(values), 0.1)
+        self.assertEqual(notes, bytes(3))
 
     def test_rendering_feeds_the_lights_only_for_a_room_booth(self):
         engine, deck = lit_engine()
@@ -154,6 +260,16 @@ class FeedTests(unittest.TestCase):
         self.assertEqual([len(base64.b64decode(m["f"])) for m in messages], [18, 12])
         feed.add(340, [0.5] * 6)                         # the clock carries on across a take
         self.assertEqual(feed.take(now=1.1)[0]["at"], 340)
+
+    def test_notes_ride_beside_their_frames(self):
+        feed = club.Feed()
+        feed.add(1000, [0.5] * 6, notes=bytes([0x9A, 0, 0x45]))
+        feed.add(1020, [0.5] * 6)                          # a frame without notes: zeros
+        feed.add(1040, [0.5] * 6, notes=bytes([0x9A, 0x31, 0]))
+        [message] = feed.take(now=1.0)
+        self.assertEqual(base64.b64decode(message["n"]), bytes([0x9A, 0, 0x45, 0, 0, 0, 0x9A, 0x31, 0]))
+        feed.add(1060, [0.5] * 6)
+        self.assertNotIn("n", feed.take(now=1.1)[0])      # no notes at all: none sent
 
     def test_moments_and_info_ride_along(self):
         feed = club.Feed()
@@ -284,9 +400,6 @@ class StyledSkipTests(unittest.TestCase):
         self.assertNotEqual(engine.transition.style, "mashup")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class StartNightTests(unittest.TestCase):
     """webui's "club" op: the booth on air in Real DJ club mode, stemmed songs queued."""
@@ -332,3 +445,141 @@ class StartNightTests(unittest.TestCase):
         session = asyncio.run(self.webui.WebUI._start_club(self.ui, "huddle:room-1"))
         self.assertEqual(self.queued, [])
         self.assertEqual(session.vibe, "club")
+
+    def test_auto_dj_starts_the_night_too(self):
+        session = asyncio.run(self.webui.WebUI._start_club(self.ui, "huddle:room-1", "chill", "auto"))
+        self.assertEqual((session.mode, session.auto, session.vibe), ("auto", True, "chill"))
+        self.assertEqual(len(self.queued), 1)
+
+
+class AutoDJTests(unittest.TestCase):
+    """Auto DJ (the booth mixing the queue by itself) under the club's lights."""
+
+    def test_the_lights_follow_an_auto_dj_mix_from_one_song_into_the_next(self):
+        audio, parts = synthetic_song()
+        session = dj.DJSession("huddle:auto", "huddle", crate=SimpleNamespace(items=lambda: [{"title": "Third"}]), auto=True)
+        session.save_state = lambda: None
+        session.live = True
+        session.auto_style, session.auto_beats = "fade", 4
+        engine = session.engine
+        engine.light = club.Feed()
+        for name, title in (("A", "One"), ("B", "Two")):
+            deck = engine.decks[name]
+            deck.audio, deck.stems = audio, parts
+            deck.meta = {"bpm": BPM, "bpm_confidence": 1.0, "first_beat": 0.0, "camelot": "8A"}
+            deck.light = club.envelope(audio, parts)
+            deck.info = {"title": title}
+        a, b = engine.decks["A"], engine.decks["B"]
+        a.playing, a.fader = True, 1.0
+        engine.master_name, engine.xfader = "A", -1.0
+        a.seek(3.0)
+        asyncio.run(session._tick())
+        self.assertEqual(engine.light.info["mode"], "auto")
+        self.assertEqual(engine.light.info["next"], "Two")
+        mixes, beats, renders = [], [], 0
+        while not (b.playing and engine.transition is None) and renders < 400:
+            engine.render()
+            renders += 1
+            values, notes, beat, bpm, lit = club.frame(engine, ahead=0.0)
+            beats.append(beat)
+            if renders % 12 == 0:                         # the session ticks every quarter second
+                asyncio.run(session._tick())
+                if engine.light.info.get("mix"):
+                    mixes.append(engine.light.info["mix"]["progress"])
+        self.assertTrue(b.playing, "Auto DJ never mixed into the next song")
+        self.assertIsNone(engine.transition)
+        self.assertTrue(mixes, "the club never showed the mix")
+        self.assertEqual(mixes, sorted(mixes))
+        # A frame for every block rendered, all the way through the mix, and always a beat.
+        self.assertEqual(sum(1 for f in engine.light.frames if f), min(200, renders))
+        self.assertNotIn(None, beats)
+        asyncio.run(session._tick())
+        self.assertEqual(engine.light.info["next"], "Third")
+
+
+class FakeFFmpeg:
+    """A decoder whose output is a tone, block after block."""
+
+    def __init__(self, seconds):
+        t = np.arange(int(seconds * SR)) / SR
+        self.data = (np.stack([0.3 * np.sin(2 * np.pi * 220 * t)] * 2, axis=1) * 32767).astype("<i2").tobytes()
+        self.returncode = None
+        self.stdout = self
+        self.pid = 0
+
+    async def readexactly(self, n):
+        if len(self.data) < n:
+            rest, self.data = self.data, b""
+            raise asyncio.IncompleteReadError(rest, n)
+        chunk, self.data = self.data[:n], self.data[n:]
+        return chunk
+
+    def terminate(self):
+        self.returncode = 0
+
+    async def communicate(self):
+        return b"", b""
+
+
+class AutoMixLightTests(unittest.TestCase):
+    """The room's ordinary player with AutoMix: a rendered transition spliced between two songs."""
+
+    def test_the_beat_holds_up_to_the_blend_and_picks_up_the_next_song_after_it(self):
+        import huddle_voice
+
+        async def run():
+            track = huddle_voice.RoomAudioTrack()
+            track.light = club.Feed()
+            track.analysis = {"bpm": BPM, "bpm_confidence": 1.0, "first_beat": 0.0}
+            track._paused = False
+            track._url = "old"
+            track._process = FakeFFmpeg(4.0)
+            blend = (np.zeros((SR, 2)) + 0.1 * 32767).astype("<i2").tobytes()     # one second
+            started = []
+            track.set_mix({"url": "old", "out_at": 2.0, "segment": blend, "next_url": "new",
+                           "next_resume": 1.0, "next_track_id": "t2", "on_start": lambda: started.append(True)})
+
+            async def spawn(url, position, filters):
+                return FakeFFmpeg(3.0)
+            track._spawn = spawn
+            seen = []
+            add = track.light.add
+
+            def spy(t_ms, values, beat=None, bpm=None, stems=False, notes=None):
+                seen.append((beat, (track.light.info or {}).get("mix")))
+                self.assertEqual(len(notes), 3)
+                add(t_ms, values, beat, bpm, stems, notes)
+            track.light.add = spy
+            pump = asyncio.create_task(track._pump_frames())
+            await asyncio.sleep(0.05)
+            for _ in range(240):
+                track._next_frame_at = -1e9                 # no pacing in a test ...
+                await track.recv()
+                await asyncio.sleep(0)                      # ... but the decoder keeps up, as it does live
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+            return seen, started
+
+        seen, started = asyncio.run(run())
+        self.assertEqual(started, [True])
+        beats = [beat for beat, _ in seen]
+        first_gap = beats.index(None)
+        gap = len(beats) - first_gap - next(i for i, b in enumerate(reversed(beats)) if b is None)
+        before, after = beats[:first_gap], beats[first_gap + gap:]
+        # The old song, on its grid up to its mix point (2 s = beat 4) ...
+        self.assertAlmostEqual(before[-1], 4.0, delta=0.1)
+        self.assertTrue(all(b2 >= b1 for b1, b2 in zip(before, before[1:])))     # (a block's jitter at most)
+        # ... no grid through the blend (one second, 50 blocks; the mix marker in the queue hides one) ...
+        self.assertAlmostEqual(gap, 50, delta=1)
+        progress = [mix["progress"] for _, mix in seen[first_gap:first_gap + gap]]
+        self.assertEqual(progress, sorted(progress))
+        self.assertGreater(progress[-1], 0.9)
+        # ... then the new song's grid from where the blend leaves it (1 s = beat 2).
+        self.assertAlmostEqual(after[0], 2.0, delta=0.1)
+        self.assertTrue(all(b2 >= b1 for b1, b2 in zip(after, after[1:])))
+        self.assertAlmostEqual(after[-1] - after[0], (len(after) - 1) * 0.04, delta=0.1)
+        self.assertIsNone(seen[-1][1])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1208,7 +1208,7 @@ class WebUI:
             elif op == 'club':
                 if player is not None:
                     raise ValueError('The club is in Hoffle rooms.')
-                session = await self._start_club(key, body.get('vibe'))
+                session = await self._start_club(key, body.get('vibe'), body.get('mode'))
             elif op == 'stop':
                 session = dj.sessions.get(key)
                 if session:
@@ -1229,17 +1229,19 @@ class WebUI:
             state['catalog'] = dj.catalog()
         return web.json_response(state)
 
-    async def _start_club(self, key, vibe=None):
+    async def _start_club(self, key, vibe=None, mode=None):
         """A night in a Hoffle room's club: the booth on air with Real DJ in club
-        mode and stems on, and a shuffled handful of stemmed songs in the room's
-        queue for it to pick from (unless the queue is well stocked already)."""
+        mode (or Auto DJ, mixing the queue in order) and stems on, and a
+        shuffled handful of stemmed songs in the room's queue for it to pick
+        from (unless the queue is well stocked already)."""
         import huddle_voice
         if not huddle_voice.MANAGER:
             raise RuntimeError('Huddle voice publishing is not running on the bot.')
         await huddle.room_state(key)  # KeyError for an unknown room
         channel_id = huddle.channel_id_from(key)
         session = await dj.start_huddle(channel_id, auto=True)
-        await session.handle({'op': 'auto', 'mode': 'real', 'on': True,
+        auto_dj = mode == 'auto'
+        await session.handle({'op': 'auto', 'mode': 'auto' if auto_dj else 'real', 'on': True,
                               'vibe': vibe if vibe in ('chill', 'club', 'hype') else 'club'})
         if stems.enabled() and not session.stems_on:
             session.set_stems(True)
@@ -1253,7 +1255,7 @@ class WebUI:
                 await huddle.play_many(key, picks, STEMS_PLAYLIST)
                 session.notice = f'Queued {len(picks)} stemmed songs for tonight'
             elif not queued:
-                session.notice = 'No stemmed songs yet: queue anything and Real DJ will play it'
+                session.notice = f"No stemmed songs yet: queue anything and {'Auto DJ' if auto_dj else 'Real DJ'} will play it"
         return session
 
     async def api_guild_state(self, request):

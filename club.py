@@ -25,9 +25,11 @@ import json
 import math
 import random
 import time
+from collections import deque
 
 import numpy as np
-from scipy import signal
+from scipy import fft as sfft
+from scipy import ndimage, signal
 
 SR = 48_000
 BLOCK = 960                        # 20 ms: one audio block, one light frame
@@ -48,10 +50,10 @@ _HIGH = signal.butter(2, 1800, "highpass", fs=_RATE, output="sos")
 _MID = signal.butter(2, [300, 3000], "bandpass", fs=_RATE, output="sos")
 
 
-def _mono(source, start, end):
-    """Samples start..end of an int16 (n, 2) array as float mono at 12 kHz."""
+def _mono(source, start, end, down=4):
+    """Samples start..end of an int16 (n, 2) array as float mono at 12 kHz (48 kHz / down)."""
     x = source[start:end].astype(np.float32).mean(axis=1) / 32768.0
-    return signal.resample_poly(x, 1, 4).astype(np.float32)
+    return signal.resample_poly(x, 1, down).astype(np.float32)
 
 
 def _rms(x):
@@ -130,12 +132,236 @@ def envelope(audio, parts=None):
     return np.round(np.nan_to_num(out) * 255).astype(np.uint8)
 
 
+# --------------------------------------------------------------------------
+# Notes
+# --------------------------------------------------------------------------
+#
+# Beside how loud each part is, the light says which note it is on: the bass
+# line's note, the chord the rest of the music plays (its root) and the note
+# the voice sings. The room's browsers colour each part's lights by its note,
+# so the colours move with the music the way its parts do, not at random.
+
+NOTE_PARTS = ("bass", "chord", "vocal")
+#: Notes are read every other light frame, off a 6 kHz copy in 170 ms windows.
+NOTE_EVERY = 2
+_NOTE_DOWN = 8
+_NOTE_RATE = SR // _NOTE_DOWN
+_NOTE_SIZE = 1024
+_NOTE_FFT = 4096
+_NOTE_HOP = BLOCK // _NOTE_DOWN * NOTE_EVERY
+_NOTE_WINDOW = np.hanning(_NOTE_SIZE).astype(np.float32)
+_NOTE_FREQS = np.fft.rfftfreq(_NOTE_FFT, 1 / _NOTE_RATE)
+
+
+def _harmonic_bins(lo, hi, weights):
+    """Pitches lo..hi (MIDI): their pitch classes, the FFT bin of each one's
+    harmonics, and the harmonics' weights (none past the top of the spectrum)."""
+    midi = np.arange(lo, hi + 1)
+    freqs = 440.0 * 2 ** ((midi[:, None] - 69) / 12) * np.arange(1, len(weights) + 1)[None, :]
+    bins = np.minimum(np.round(freqs * _NOTE_FFT / _NOTE_RATE).astype(int), _NOTE_FFT // 2)
+    w = np.where(freqs < 0.45 * _NOTE_RATE, np.asarray(weights, np.float32)[None, :], 0.0)
+    return midi % 12, bins, w.astype(np.float32)
+
+
+# The bass stem: E1..C4 on five harmonics, the upper ones counting about as much
+# as the fundamental (they place the note more sharply; 91% of notes in the
+# song's key on real songs, against 88% leaning on the fundamental). The voice:
+# A2..C6 on four. With no stems, the mix's low end: E1..E3 on two, as the rest
+# of the music sits above it.
+_BASS = _harmonic_bins(28, 60, (0.7, 0.9, 0.9, 0.8, 0.7))
+_MIX_BASS = _harmonic_bins(28, 52, (1.0, 0.5))
+_VOICE = _harmonic_bins(45, 84, (1.0, 0.85, 0.7, 0.55))
+
+
+def _chroma_matrix():
+    """FFT bins (110 Hz..2 kHz) to pitch classes, a bin between two notes counting less."""
+    midi = 12 * np.log2(np.maximum(_NOTE_FREQS, 1.0) / 440) + 69
+    nearest = np.round(midi)
+    weight = np.cos(np.pi * (midi - nearest)) ** 2 * ((_NOTE_FREQS >= 110) & (_NOTE_FREQS <= 2000))
+    m = np.zeros((len(_NOTE_FREQS), 12), np.float32)
+    m[np.arange(len(_NOTE_FREQS)), nearest.astype(int) % 12] = weight
+    return m
+
+
+def _triads():
+    """Major and minor triads on each root (rows 0..11 major, 12..23 minor), centred, unit length."""
+    t = np.zeros((24, 12), np.float32)
+    for root in range(12):
+        for row, third in ((root, 4), (root + 12, 3)):
+            t[row, [root, (root + third) % 12, (root + 7) % 12]] = (1.0, 0.8, 0.9)
+    t -= t.mean(axis=1, keepdims=True)
+    return t / np.linalg.norm(t, axis=1, keepdims=True)
+
+
+_CHROMA = _chroma_matrix()
+_TRIADS = _triads()
+
+
+def _spectra(windows):
+    """Square-rooted magnitude spectra of a batch of _NOTE_SIZE windows."""
+    return np.sqrt(np.abs(sfft.rfft(windows * _NOTE_WINDOW, n=_NOTE_FFT, axis=-1))).astype(np.float32)
+
+
+def _pitch(spectra, table):
+    """Each window's most sounding pitch class, and how clearly it stands out (0..1)."""
+    pcs, bins, weights = table
+    peaks = ndimage.maximum_filter1d(spectra, 3, axis=-1)    # a slightly sharp or flat note still counts
+    salience = (peaks[:, bins] * weights).sum(axis=2)
+    best = salience.argmax(axis=1)
+    top = salience[np.arange(len(best)), best]
+    clarity = 1 - np.median(salience, axis=1) / np.maximum(top, 1e-9)
+    return pcs[best], np.clip((clarity - 0.35) / 0.45, 0, 1)
+
+
+def _roots(chroma):
+    """The root of the triad each chroma row fits best, and how well (0..1)."""
+    c = chroma - chroma.mean(axis=1, keepdims=True)
+    c /= np.maximum(np.linalg.norm(c, axis=1, keepdims=True), 1e-9)
+    scores = c @ _TRIADS.T
+    best = scores.argmax(axis=1)
+    return best % 12, np.clip((scores[np.arange(len(best)), best] - 0.3) / 0.5, 0, 1)
+
+
+def _steady(pcs, weight, width):
+    """A note has to hold for a moment to count: each window's note is the one
+    most sounding (weighted by clarity) across `width` windows around it, and its
+    strength the clarity it held there."""
+    votes = np.zeros((len(pcs), 12), np.float32)
+    votes[np.arange(len(pcs)), pcs] = weight
+    votes = ndimage.uniform_filter1d(votes, width, axis=0, mode="nearest")
+    best = votes.argmax(axis=1)
+    return best, votes[np.arange(len(best)), best]
+
+
+def _note_bytes(pcs, strength, sounding):
+    """(how clearly << 4) | (pitch class + 1); 0 where the part is quiet or unclear."""
+    level = np.round(np.clip(strength, 0, 1) * 15).astype(np.uint8)
+    return np.where(sounding & (level > 0), (level << 4) | (pcs + 1).astype(np.uint8), 0).astype(np.uint8)
+
+
+def _windows(x, count):
+    """`count` windows of x, one every _NOTE_HOP samples, each centred on its frame."""
+    pad = np.zeros(_NOTE_SIZE // 2, np.float32)
+    x = np.concatenate([pad, x, pad, np.zeros(max(0, count * _NOTE_HOP - len(x)), np.float32)])
+    return np.lib.stride_tricks.sliding_window_view(x, _NOTE_SIZE)[::_NOTE_HOP][:count]
+
+
+def notes(audio, parts=None):
+    """Which note each part is on: uint8 (frames, 3) for NOTE_PARTS, frame for
+    frame with envelope(). Each is (how clearly, 0..15) << 4 | (pitch class + 1),
+    C = 0 .. B = 11, or 0: no note to speak of (the part is quiet or unpitched).
+
+    With stems: the bass stem's note, the chord of the rest of the music (the
+    mix less drums, bass and voice) and the voice's note. Without: the low end of
+    the mix for the bass and the whole mix for the chord, and no voice.
+    """
+    total = len(audio) // BLOCK
+    count = -(-total // NOTE_EVERY)
+    if not count:
+        return np.zeros((0, 3), np.uint8)
+    names = ("bass", "chord", "vocal") if parts is not None else ("bass", "chord")
+    signals = {name: [] for name in names}
+    for start in range(0, total * BLOCK, CHUNK):
+        end = min(start + CHUNK, total * BLOCK)
+        mix = _mono(audio, start, end, _NOTE_DOWN)
+        if parts is not None:
+            drums, bass, vocals = (_mono(parts[i], start, end, _NOTE_DOWN) for i in range(3))
+            signals["bass"].append(bass)
+            signals["chord"].append(mix - drums - bass - vocals)
+            signals["vocal"].append(vocals)
+        else:
+            signals["bass"].append(mix)
+            signals["chord"].append(mix)
+    out = np.zeros((count, 3), np.uint8)
+    for column, name in enumerate(names):
+        windows = _windows(np.concatenate(signals.pop(name)), count)
+        pcs = np.zeros(count, np.int64)
+        clarity = np.zeros(count, np.float32)
+        rms = np.zeros(count, np.float32)
+        chroma = np.zeros((count, 12), np.float32)
+        for a in range(0, count, 512):
+            batch = windows[a:a + 512]
+            rms[a:a + 512] = np.sqrt(np.mean(np.square(batch), axis=1))
+            spectra = _spectra(batch)
+            if name == "chord":
+                chroma[a:a + 512] = np.square(spectra) @ _CHROMA     # magnitude: the noise floor stays low
+            else:
+                table = _VOICE if name == "vocal" else _BASS if parts is not None else _MIX_BASS
+                pcs[a:a + 512], clarity[a:a + 512] = _pitch(spectra, table)
+        if name == "chord":
+            pcs, clarity = _roots(ndimage.uniform_filter1d(chroma, 7, axis=0, mode="nearest"))
+        pcs, strength = _steady(pcs, clarity, {"bass": 3, "chord": 5, "vocal": 5}[name])
+        loud = rms[rms > 3e-4]
+        floor = max(3e-4, 0.1 * float(np.percentile(loud, 95))) if len(loud) else 1.0
+        out[:, column] = _note_bytes(pcs, strength, rms > floor)
+    return np.repeat(out, NOTE_EVERY, axis=0)[:total]
+
+
+def light(audio, parts=None):
+    """A deck's whole light: envelope() and notes() side by side, uint8 (frames, 9)."""
+    return np.concatenate([envelope(audio, parts), notes(audio, parts)], axis=1)
+
+
+class NoteMeter:
+    """Notes for the room's ordinary player, which has no stems: the bass and the
+    chord off the mix, block by block as it is decoded (notes(), live)."""
+
+    #: Down to 6 kHz with a low-pass worked out only at the samples kept (a plain
+    #: filter at 48 kHz cost more than everything else here on the event loop).
+    TAPS = 128
+    _KEPT = np.arange(0, BLOCK, _NOTE_DOWN)[:, None] + np.arange(TAPS)[None, :]
+
+    def __init__(self):
+        self.fir = signal.firwin(self.TAPS, 0.42 * _NOTE_RATE, fs=SR).astype(np.float32)[::-1].copy()
+        self.reset()
+
+    def reset(self):
+        self.tail = np.zeros(self.TAPS - 1, np.float32)
+        self.buffer = np.zeros(_NOTE_SIZE, np.float32)
+        self.blocks = 0
+        self.chroma = np.zeros(12, np.float32)
+        self.votes = {"bass": deque(maxlen=3), "chord": deque(maxlen=5)}
+        self.peak = 1e-3
+        self.notes = bytes(3)
+
+    def frame(self, x):
+        """One block of the mix (float mono at 48 kHz): the notes now, 3 bytes like notes()'."""
+        z = np.concatenate([self.tail, np.asarray(x, np.float32)])
+        self.tail = z[1 - self.TAPS:]
+        y = z[self._KEPT] @ self.fir
+        self.buffer = np.concatenate([self.buffer[len(y):], y])
+        self.blocks += 1
+        if self.blocks % NOTE_EVERY:
+            return self.notes
+        rms = float(np.sqrt(np.mean(np.square(self.buffer))))
+        self.peak = max(rms, self.peak * 0.9993 ** NOTE_EVERY)
+        spectra = _spectra(self.buffer[None, :])
+        self.chroma += (np.square(spectra[0]) @ _CHROMA - self.chroma) * 0.25
+        bass, bass_clarity = _pitch(spectra, _MIX_BASS)
+        root, root_clarity = _roots(self.chroma[None, :])
+        picks, strengths = [], []
+        for name, pc, clarity in (("bass", bass[0], bass_clarity[0]), ("chord", root[0], root_clarity[0])):
+            # _steady(), as the windows come: the note most sounding over the last few.
+            votes = self.votes[name]
+            votes.append((int(pc), float(clarity)))
+            tally = [0.0] * 12
+            for p, c in votes:
+                tally[p] += c
+            best = max(range(12), key=tally.__getitem__)
+            picks.append(best)
+            strengths.append(tally[best] / votes.maxlen)
+        sounding = rms > max(3e-4, 0.1 * self.peak)
+        self.notes = bytes(_note_bytes(np.array(picks), np.array(strengths), sounding)) + bytes(1)
+        return self.notes
+
+
 def _db_gain(value):
     return 0.0 if value <= KILL_DB + 0.5 else 10 ** (min(value, 6.0) / 20)
 
 
 def deck_frame(engine, deck, ahead):
-    """What one deck adds to the light `ahead` seconds from now (6 floats), or None."""
+    """What one deck adds to the light `ahead` seconds from now: (6 floats, its
+    notes as 3 bytes or None for a light without them), or None."""
     env = getattr(deck, "light", None)
     if env is None or not deck.loaded or deck.rate_now == 0.0:
         return None
@@ -145,7 +371,8 @@ def deck_frame(engine, deck, ahead):
     i = int((deck.pos + deck.rate_now * ahead * SR) // BLOCK)
     if not 0 <= i < len(env):
         return None
-    kick, snare, bass, vocals, melody, level = env[i] / 255.0
+    kick, snare, bass, vocals, melody, level = env[i, :6] / 255.0
+    notes = bytes(env[i, 6:9]) if env.shape[1] >= 9 else None
     g = deck.stem_now if deck.stems is not None and deck.use_stems else {}
     drums_g, bass_g, vocals_g, other_g = (g.get(name, 1.0) for name in ("drums", "bass", "vocals", "other"))
     lows, mids, highs = (_db_gain(deck.eq.get(band, 0.0)) for band in ("low", "mid", "hi"))
@@ -157,29 +384,44 @@ def deck_frame(engine, deck, ahead):
             highs *= (1 + deck.color) ** 2
             mids *= 1 + 0.6 * deck.color
     parts = max(drums_g, bass_g, vocals_g, other_g)
-    return (kick * drums_g * lows * gain, snare * drums_g * highs * gain, bass * bass_g * lows * gain,
-            vocals * vocals_g * mids * gain, melody * other_g * mids * gain,
-            level * parts * (lows + mids + highs) / 3 * gain)
+    values = (kick * drums_g * lows * gain, snare * drums_g * highs * gain, bass * bass_g * lows * gain,
+              vocals * vocals_g * mids * gain, melody * other_g * mids * gain,
+              level * parts * (lows + mids + highs) / 3 * gain)
+    return values, notes
+
+
+#: Each of NOTE_PARTS is the note of the part lit by this channel: a part the
+#: room can't hear (muted, killed, faded out) has no note.
+_NOTE_CHANNELS = (CHANNELS.index("bass"), CHANNELS.index("melody"), CHANNELS.index("vocals"))
+_NOTE_HEARD = 0.05
 
 
 def frame(engine, ahead=LOOKAHEAD):
-    """The room's light `ahead` seconds from now: (6 floats 0..1, beat, bpm, stems)."""
+    """The room's light `ahead` seconds from now: (6 floats 0..1, notes (3 bytes,
+    see notes(); each part's from the deck it sounds loudest on), beat, bpm, stems)."""
     values = [0.0] * 6
+    notes = [0, 0, 0]
+    loudest = [_NOTE_HEARD] * 3
     stems_on = False
     for deck in engine.decks.values():
         got = deck_frame(engine, deck, ahead)
         if got is None:
             continue
+        got, deck_notes = got
         stems_on = stems_on or deck.stems is not None
         for i, v in enumerate(got):
             if v > values[i]:
                 values[i] = v
+        for k, channel in enumerate(_NOTE_CHANNELS):
+            if got[channel] > loudest[k]:
+                loudest[k] = got[channel]
+                notes[k] = deck_notes[k] if deck_notes is not None else 0
     beat = bpm = None
     m = engine.master()
     if m is not None and m.loaded and m.playing and m.bpm:
         beat = m.beat_at(m.seconds + m.rate_now * ahead)
         bpm = m.live_bpm()
-    return values, beat, bpm, stems_on
+    return values, bytes(notes), beat, bpm, stems_on
 
 
 class Feed:
@@ -194,7 +436,7 @@ class Feed:
     RESYNC_MS = 60
 
     def __init__(self):
-        self.frames = []           # [t ms, bytes(6)], None between runs
+        self.frames = []           # [t ms, bytes(6), notes bytes(3) or None], None between runs
         self.clock = None          # t ms of the last frame added
         self.beat = None           # (beat, bpm) at the first frame waiting
         self.stems = False
@@ -205,7 +447,7 @@ class Feed:
         # then the audio side skips the light work altogether.
         self.wanted = True
 
-    def add(self, t_ms, values, beat=None, bpm=None, stems=False):
+    def add(self, t_ms, values, beat=None, bpm=None, stems=False, notes=None):
         # Frames keep the audio's clock, one block apart, the way a listener
         # plays the blocks; the sender's own jitter is not the music's.
         expected = None if self.clock is None else self.clock + FRAME_MS
@@ -221,7 +463,8 @@ class Feed:
         if self.beat is None and beat is not None and bpm:
             self.beat = (beat - len(self._run()) * bpm / 60 * FRAME_MS / 1000, bpm)
         self.stems = self.stems or stems
-        self.frames.append([t_ms, bytes(int(max(0.0, min(1.0, v)) * 255 + 0.5) for v in values)])
+        self.frames.append([t_ms, bytes(int(max(0.0, min(1.0, v)) * 255 + 0.5) for v in values),
+                            bytes(notes) if notes is not None else None])
         del self.frames[:-200]     # nobody took them for 4 s: keep only the last
 
     def _run(self):
@@ -246,8 +489,11 @@ class Feed:
                 run.append(item)
                 continue
             if run:
-                out.append({"t": "club", "at": int(run[0][0]),
-                            "f": base64.b64encode(b"".join(f for _, f in run)).decode()})
+                message = {"t": "club", "at": int(run[0][0]), "f": base64.b64encode(b"".join(f for _, f, _ in run)).decode()}
+                if any(n for _, _, n in run):
+                    # Each frame's notes beside it, 3 bytes a frame (none known: 0s).
+                    message["n"] = base64.b64encode(b"".join(n or bytes(3) for _, _, n in run)).decode()
+                out.append(message)
             run = []
         if out:
             beat = self.beat
@@ -281,16 +527,24 @@ class PlayerMeter:
 
     def __init__(self):
         self.window = np.hanning(BLOCK).astype(np.float32)
+        self.note_meter = NoteMeter()
         self.reset()
 
     def reset(self):
         self.peaks = np.full(6, 1e-3)
         self.body = 0.0
+        self.note_meter.reset()
+
+    @property
+    def notes(self):
+        """The notes of the block last measured (3 bytes, see notes())."""
+        return self.note_meter.notes
 
     def frame(self, pcm):
         x = np.frombuffer(pcm, "<i2").reshape(-1, 2).astype(np.float32).mean(axis=1) / 32768.0
         if len(x) != BLOCK:
             return [0.0] * 6
+        self.note_meter.frame(x)
         power = np.abs(np.fft.rfft(x * self.window)) ** 2   # bins 50 Hz wide
         low = math.sqrt(power[1:4].sum())
         mid = math.sqrt(power[6:61].sum())
