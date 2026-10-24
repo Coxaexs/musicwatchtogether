@@ -40,6 +40,7 @@ import time
 import numpy as np
 from scipy import signal
 
+import club
 import mixer
 import realdj
 import samples
@@ -496,6 +497,8 @@ class Deck:
         # and they are part of "other".
         self.extra = None
         self.stems_status = None    # None | separating | ready | failed
+        # The club's light envelope (club.envelope): uint8 (frames, 6), or None.
+        self.light = None
         self.stem_gain = stems.StemGains()
         self.stem_now = dict(self.stem_gain)
         self.use_stems = True       # the room's STEMS switch
@@ -1147,6 +1150,8 @@ class DJEngine:
         self.paused = False          # the whole set paused: its clock stands still
         self.frames = 0
         self.last_render = 0.0
+        # A Hoffle room's booth lights its club (club.Feed); None elsewhere.
+        self.light = None
 
     # ---- musical clock ----
 
@@ -1424,7 +1429,7 @@ class DJEngine:
         """Empty a deck (Real DJ's layer deck when its phrase is over)."""
         deck = self.decks[name]
         deck.playing = False
-        deck.audio = deck.stems = deck.extra = deck.wave = None
+        deck.audio = deck.stems = deck.extra = deck.wave = deck.light = None
         deck.info, deck.meta = {}, {}
         deck.sync = False
         deck.stem_gain = stems.StemGains()
@@ -1460,6 +1465,8 @@ class DJEngine:
         if name in bank:
             self.voices.append([bank[name], 0])
             self.voices = self.voices[-6:]
+            if self.light is not None:
+                self.light.event("sample", time.time() * 1000, name=name)
 
     def _run_automations(self):
         if not self.automations:
@@ -1630,6 +1637,10 @@ class DJEngine:
                 mix[over] = sign * (0.8 + 0.2 * np.tanh((np.abs(mix[over]) - 0.8) / 0.2))
             peak = np.abs(mix).max(axis=0)
             self.master_level = [max(self.master_level[i] * 0.82, float(peak[i])) for i in (0, 1)]
+            if (self.light is not None and self.light.wanted and not self.paused
+                    and any(d.playing for d in self.decks.values())):
+                values, beat, bpm, lit_by_stems = club.frame(self)
+                self.light.add(time.time() * 1000 + club.LOOKAHEAD * 1000, values, beat, bpm, lit_by_stems)
             return (np.clip(mix, -1, 1) * 32767).astype("<i2").tobytes()
 
     # ---- state ----
@@ -1865,6 +1876,7 @@ class DJSession:
             deck.audio = audio
             deck.stems = cached_stems
             deck.extra = cached_extra
+            deck.light = None
             deck.stems_status = ("ready" if cached_stems is not None
                                  else "separating" if self._stems_wanted() else None)
             deck.meta = dict(meta)
@@ -1899,6 +1911,7 @@ class DJSession:
             del self.history[30:]
         logger.info("DJ %s: deck %s loaded %r (%s bpm, %s)", self.key, deck_name,
                     item.get("title"), meta.get("bpm"), meta.get("camelot"))
+        self._light_up(deck, token)
         if self._stems_wanted() and cached_stems is None:
             self.stem_tasks[deck_name] = asyncio.create_task(self._separate(deck, token, audio))
 
@@ -1968,6 +1981,26 @@ class DJSession:
             deck.stems_status = "ready"
             # Fade any gains already set in from the full mix, no jump.
             deck.stem_now = dict(stems.StemGains())
+        self._light_up(deck, token)
+
+    def _light_up(self, deck, token):
+        """The club's light envelope for a deck's song, in the background (Hoffle
+        booths only): from its stems when it has them, else from the mix. A song
+        whose stems arrive later is lit again from them."""
+        if self.engine.light is None:
+            return
+        audio, parts = deck.audio, deck.stems
+
+        async def run():
+            try:
+                env = await asyncio.get_running_loop().run_in_executor(None, club.envelope, audio, parts)
+            except Exception:
+                logger.exception("DJ %s: light envelope failed on %s", self.key, deck.name)
+                return
+            with self.engine.lock:
+                if deck.load_token == token and deck.audio is audio:
+                    deck.light = env
+        asyncio.create_task(run())
 
     def _audible(self, deck):
         return self.engine._channel_gain(deck) * self.engine.master_volume > 0.02
@@ -2060,6 +2093,27 @@ class DJSession:
         except Exception as error:
             logger.debug("DJ %s: on-air report failed: %s", self.key, error)
 
+    def _club_info(self):
+        """What the club's LED wall and DJ panel show of the booth (club.Feed.info)."""
+        feed = self.engine.light
+        if feed is None:
+            return
+        engine = self.engine
+        with engine.lock:
+            tr = engine.transition
+            m = engine.master()
+            waiting = next((d for d in (engine.decks[n] for n in DECKS)
+                            if d is not m and d.loaded and not d.playing and not d.ended), None)
+            feed.info = {
+                "mode": ("real" if self.mode == "real" else "auto") if self.auto else "hands",
+                "vibe": self.vibe,
+                "mix": ({"style": tr.label, "progress": round(tr.progress, 2)}
+                        if tr is not None and tr.started and not tr.done else None),
+                "next": (waiting.info.get("title") if waiting else None) or (self.real.next_title if self.real else None),
+                "key": m.meta.get("camelot") if m is not None and m.loaded else None,
+                "paused": self.paused,
+            }
+
     def _follow_karaoke(self):
         """Mirror the room's karaoke setting onto the decks (checked every 2 s)."""
         now = time.monotonic()
@@ -2080,6 +2134,7 @@ class DJSession:
         if self.restoring:
             return
         await self._report()
+        self._club_info()
         self.save_state()
         with engine.lock:
             events, engine.events = engine.events, []
@@ -2171,7 +2226,10 @@ class DJSession:
             self.resume()
             return
         if op == "skip":
-            await self.skip()
+            await self.skip(body.get("style"))
+            return
+        if op == "club_move":
+            self.notice = club.perform(self, str(body.get("move") or ""))
             return
         if self.paused and op in ("play", "cue", "mix", "scratch", "brake"):
             self.resume()                  # a hand on the decks picks the set back up
@@ -2516,8 +2574,12 @@ class DJSession:
 
     # ---- skip (the room's skip button) ----
 
-    async def skip(self):
+    async def skip(self, style=None):
         """Mix into the next song now: a short mix (at most SKIP_BEATS) from the next bar.
+
+        style: the club's MIX buttons pick how (any of STYLES, played at its
+        own length); a stem style without stems on both songs falls back to
+        the booth's own pick.
 
         A mix already under way finishes at once. With nothing ready on the
         other deck the next song is loaded first (Real DJ's pick in Real DJ
@@ -2560,10 +2622,13 @@ class DJSession:
                 return                         # the set moved on by itself meanwhile
             if self.real is not None:
                 self.real.plan = None          # Real DJ plans again after this mix
-            style = choose_style(out, inn)
-            beats = min(STYLES[style][1], SKIP_BEATS)
+            chosen = style if style in STYLES and style != "auto" else None
+            if chosen in STEM_STYLES and not (out.has_stems and inn.has_stems):
+                chosen = None
+            style = chosen or choose_style(out, inn)
+            beats = STYLES[style][1] if chosen else min(STYLES[style][1], SKIP_BEATS)
             self._manual_mix({"to": inn.name, "style": style, "beats": beats})
-        self.notice = f"Skipping: {STYLES[style][0].lower()} into {inn.info.get('title') or 'the next song'}"
+        self.notice = f"{'Mixing' if chosen else 'Skipping'}: {STYLES[style][0].lower()} into {inn.info.get('title') or 'the next song'}"
         logger.info("DJ %s: skip, %s into %r over %s beats", self.key, style, inn.info.get("title"), beats)
 
     # ---- pause / resume ----
@@ -3076,6 +3141,7 @@ async def start_huddle(channel_id, auto=True, restore=False):
         session.auto = auto or session.auto
         return session
     session = DJSession(key, "huddle", HuddleCrate(channel_id), auto=auto)
+    session.engine.light = club.Feed()     # the room's club lights follow the booth
     session.restoring = restore            # held until restore() has put the decks back
     sessions[key] = session
     manager = huddle_voice.MANAGER

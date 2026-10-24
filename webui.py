@@ -26,6 +26,7 @@ import time
 import aiohttp
 from aiohttp import web
 
+import club
 import config
 import dj
 import huddle
@@ -1204,6 +1205,10 @@ class WebUI:
                     session = await dj.start_huddle(huddle.channel_id_from(key), auto=auto)
                 else:
                     session = await dj.start_discord(player, auto=auto)
+            elif op == 'club':
+                if player is not None:
+                    raise ValueError('The club is in Hoffle rooms.')
+                session = await self._start_club(key, body.get('vibe'))
             elif op == 'stop':
                 session = dj.sessions.get(key)
                 if session:
@@ -1223,6 +1228,33 @@ class WebUI:
         if body.get('full'):
             state['catalog'] = dj.catalog()
         return web.json_response(state)
+
+    async def _start_club(self, key, vibe=None):
+        """A night in a Hoffle room's club: the booth on air with Real DJ in club
+        mode and stems on, and a shuffled handful of stemmed songs in the room's
+        queue for it to pick from (unless the queue is well stocked already)."""
+        import huddle_voice
+        if not huddle_voice.MANAGER:
+            raise RuntimeError('Huddle voice publishing is not running on the bot.')
+        await huddle.room_state(key)  # KeyError for an unknown room
+        channel_id = huddle.channel_id_from(key)
+        session = await dj.start_huddle(channel_id, auto=True)
+        await session.handle({'op': 'auto', 'mode': 'real', 'on': True,
+                              'vibe': vibe if vibe in ('chill', 'club', 'hype') else 'club'})
+        if stems.enabled() and not session.stems_on:
+            session.set_stems(True)
+        room = huddle_voice.MANAGER.players.get(channel_id) or {}
+        queued = [room.get('track')] + list(room.get('queue') or [])
+        queued = [track for track in queued if track]
+        if len(queued) < 8:
+            names = [t.get('pageUrl') or t.get('query') for t in queued] + [t.get('title') for t in queued]
+            picks = club.night_entries(stems_playlist_entries(await self._refresh_stems_library()), names)
+            if picks:
+                await huddle.play_many(key, picks, STEMS_PLAYLIST)
+                session.notice = f'Queued {len(picks)} stemmed songs for tonight'
+            elif not queued:
+                session.notice = 'No stemmed songs yet: queue anything and Real DJ will play it'
+        return session
 
     async def api_guild_state(self, request):
         requested = request.match_info.get('guild_id', '')

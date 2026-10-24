@@ -13,7 +13,7 @@ import logging
 import sys
 import time
 from types import SimpleNamespace
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 import numpy as np
@@ -28,6 +28,7 @@ from aiortc import (
 from aiortc.contrib.media import MediaRelay
 from aiortc.sdp import candidate_from_sdp
 
+import club
 import config
 import dj
 import huddle
@@ -125,6 +126,12 @@ class RoomAudioTrack(MediaStreamTrack):
         self._src_pos = 0.0
         # A live DJ booth (dj.DJEngine) replaces the FFmpeg source entirely.
         self.dj = None
+        # The club's lights for the ordinary player (club.Feed, set by the
+        # publisher), measured off the decoded blocks waiting to be sent.
+        self.light = None
+        self.meter = club.PlayerMeter()
+        #: AutoMix's analysis of the song playing (its beat grid), or None.
+        self.analysis = None
 
     async def configure(
         self,
@@ -141,6 +148,8 @@ class RoomAudioTrack(MediaStreamTrack):
             await self._stop_process()
             self._paused = paused
             self._url = url
+            if track_id != self.track_id:
+                self.meter.reset()
             self.track_id = track_id
             self._start_pos = self._src_pos = max(0.0, position_seconds)
             if paused or not url:
@@ -295,6 +304,21 @@ class RoomAudioTrack(MediaStreamTrack):
             await self._stop_process()
         super().stop()
 
+    def _light_ahead(self):
+        """The club's light LOOKAHEAD ahead of this block: from the decoded
+        block that will be sent then (FFmpeg keeps seconds of them queued)."""
+        queue = getattr(self._frames, "_queue", None)
+        if not queue:
+            return
+        ahead = min(len(queue) - 1, int(club.LOOKAHEAD * SAMPLE_RATE / SAMPLES_PER_FRAME))
+        item = queue[ahead]
+        if not isinstance(item, bytes):
+            return                       # a mix marker: the next block will do
+        values = self.meter.frame(item)
+        position = self._src_pos - (len(queue) - ahead) * SAMPLES_PER_FRAME / SAMPLE_RATE
+        beat, bpm = club.player_beat(self.analysis, position)
+        self.light.add(time.time() * 1000 + ahead * 1000 * SAMPLES_PER_FRAME / SAMPLE_RATE, values, beat, bpm)
+
     async def recv(self):
         loop = asyncio.get_running_loop()
         frame_duration = SAMPLES_PER_FRAME / SAMPLE_RATE
@@ -340,6 +364,8 @@ class RoomAudioTrack(MediaStreamTrack):
                 data = item if isinstance(item, bytes) else data
             except asyncio.TimeoutError:
                 pass
+            if self.light is not None and self.light.wanted:
+                self._light_ahead()
 
         if self._volume < 0.999 and data.strip(b"\0"):
             # Vectorised: the per-sample Python loop cost ~0.4 ms of every
@@ -371,7 +397,12 @@ class RoomPublisher:
         self.mix_task = None
         self.last_player = None
         self.karaoke_tasks = {}          # track id -> instrumental prep task
+        # The club's lights while the ordinary player plays (the booth has its own).
+        self.lights = club.Feed()
+        self.source.light = self.lights
+        self.light_socket = None
         self.task = asyncio.create_task(self._run())
+        self.light_task = asyncio.create_task(self._lights())
 
     async def _update_dj(self, session, player: dict):
         """The booth is on air: keep the room's own player out of the way."""
@@ -400,6 +431,13 @@ class RoomPublisher:
         self.last_player = player
         track = player.get("track") or {}
         track_id = track.get("id")
+        if track_id != getattr(self, "_analysis_for", None):
+            # The beat grid AutoMix has for the song, if any: the lights' beat.
+            self._analysis_for = track_id
+            keys = [key for key in _mix_keys(track) if key]
+            self.source.analysis = mixer.cache.get(*keys) if keys else None
+        upcoming = (player.get("queue") or [{}])[0]
+        self.lights.info = {"mode": "player", "next": upcoming.get("title") or None}
         settings = huddle.settings_for(self.channel_id)
         settings_key = tuple(sorted(settings.items()))
         url = str(track.get("audioUrl") or "")
@@ -576,6 +614,11 @@ class RoomPublisher:
             self.mix_task.cancel()
         if self.websocket and not self.websocket.closed:
             await self.websocket.close()
+        if self.light_socket and not self.light_socket.closed:
+            await self.light_socket.close()
+        if self.light_task is not asyncio.current_task():
+            self.light_task.cancel()
+            await asyncio.gather(self.light_task, return_exceptions=True)
         for peer in list(self.peers.values()):
             await peer.close()
         self.peers.clear()
@@ -629,6 +672,67 @@ class RoomPublisher:
             self.websocket = None
             if self.active:
                 await asyncio.sleep(2)
+
+    def _light_feed(self):
+        """Where the room's light comes from: the booth while it is on air."""
+        engine = self.source.dj
+        if engine is not None and engine.light is not None:
+            return engine.light
+        return self.lights
+
+    async def _lights(self):
+        """The club's light feed (club.py) to the room's hub shard.
+
+        A socket of its own, which only sends and which the hub keeps out of
+        the room's roster. Light goes out while someone has the club open;
+        told nobody has (club-idle) it waits a few seconds and tries again,
+        or sooner when someone opens it (club-wake).
+        """
+        query = urlencode({"room": self.channel_id, "feed": "1"})
+        url = f"{_socket_url()}?{query}"
+        while self.active:
+            try:
+                async with aiohttp.ClientSession(headers=self.headers) as session:
+                    async with session.ws_connect(url, heartbeat=20) as websocket:
+                        self.light_socket = websocket
+                        idle = {"until": 0.0}
+
+                        async def listen():
+                            async for message in websocket:
+                                if message.type != aiohttp.WSMsgType.TEXT:
+                                    if message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                        return
+                                    continue
+                                try:
+                                    kind = json.loads(message.data).get("t")
+                                except (ValueError, AttributeError):
+                                    continue
+                                if kind == "club-idle":
+                                    idle["until"] = time.monotonic() + 5
+                                elif kind == "club-wake":
+                                    idle["until"] = 0.0
+
+                        reader = asyncio.create_task(listen())
+                        try:
+                            while self.active and not websocket.closed and not reader.done():
+                                await asyncio.sleep(club.SEND_EVERY)
+                                feed = self._light_feed()
+                                feed.wanted = time.monotonic() >= idle["until"]
+                                messages = feed.take()
+                                if not messages or not feed.wanted:
+                                    continue
+                                for message in messages:
+                                    await websocket.send_str(club.wire(message))
+                        finally:
+                            reader.cancel()
+            except asyncio.CancelledError:
+                break
+            except Exception as error:
+                if self.active:
+                    logger.debug("Club lights for %s reconnecting: %s", self.channel_id, error)
+            self.light_socket = None
+            if self.active:
+                await asyncio.sleep(3)
 
     async def _message(self, payload: dict):
         if payload.get("t") != "signal":
