@@ -420,12 +420,198 @@ def frame(engine, ahead=LOOKAHEAD):
             if got[channel] > loudest[k]:
                 loudest[k] = got[channel]
                 notes[k] = deck_notes[k] if deck_notes is not None else 0
+    for got in loop_frames(engine, ahead):
+        for i, v in enumerate(got):
+            if v > values[i]:
+                values[i] = v
     beat = bpm = None
     m = engine.master()
     if m is not None and m.loaded and m.playing and m.bpm:
         beat = m.beat_at(m.seconds + m.rate_now * ahead)
         bpm = m.live_bpm()
     return values, bytes(notes), beat, bpm, stems_on
+
+
+def loop_frames(engine, ahead=LOOKAHEAD):
+    """What the borrowed loops over a mix (dj.LoopVoice) add to the light `ahead`
+    seconds from now: 6 floats each. A drum groove lights the kick and the hats,
+    a bass line the bass, a guitar or piano riff the music."""
+    out = []
+    for voice in list(getattr(engine, "loops", ()) or ()):
+        env = getattr(voice, "light", None)
+        deck = engine.decks.get(voice.deck)
+        if env is None or deck is None or not deck.playing or not deck.bpm:
+            continue
+        beat = deck.beat_at(deck.seconds + deck.rate_now * ahead)
+        if not voice.start <= beat < voice.end:
+            continue
+        i = int(voice.place(beat) // BLOCK)
+        if not 0 <= i < len(env):
+            continue
+        g = voice.gain_at(beat) * max(0.0, voice.cut) * engine.master_volume * 0.85
+        kick, snare, bass, _vocals, melody, level = env[i, :6] / 255.0
+        got = [0.0] * 6
+        if voice.part == "drums":
+            got[0], got[1] = kick * g, snare * g
+        elif voice.part == "bass":
+            got[2] = level * g
+        else:
+            got[4] = max(melody, level) * g
+        got[5] = level * g
+        out.append(got)
+    return out
+
+
+# --------------------------------------------------------------------------
+# The song's map
+# --------------------------------------------------------------------------
+#
+# Beside the light as it plays, the room gets each song's map once: how hard
+# every bar of it goes and where its sections change, so the lights know a
+# chorus is coming before it comes and can land it on its first beat. A
+# verse closes the rig down, the bar before a chorus squeezes it, and the
+# chorus throws it open.
+
+#: Section levels: 0 quiet (intro, breakdown), 1 verse, 2 lift, 3 chorus / drop.
+MAP_TIERS = (0.4, 0.62, 0.82)
+#: Section names, as sent (a section's fifth number; 0: not known). The lights play some differently: a solo
+#: gets a spotlight, a bridge its own colours.
+SECTION_NAMES = ("", "intro", "verse", "prechorus", "chorus", "postchorus", "drop", "build", "bridge", "break",
+                 "breakdown", "solo", "instrumental", "outro")
+_NAMED_TIER = {"chorus": 3, "postchorus": 3, "drop": 3, "prechorus": 2, "build": 2, "solo": 2, "verse": 1}
+MAP_RESEND_S = 8.0
+_BAR_VOCAL, _BAR_DRUMS = 1, 2
+
+
+def bar_phase(downbeats, bpm, first_beat):
+    """Which beat of the grid (0..3) the song's bars start on, from where its bars really start (downbeats, seconds),
+    or 0 when that can't be told (too few on the grid, or no agreement)."""
+    if not downbeats or not bpm:
+        return 0
+    beat = 60.0 / bpm
+    votes = [0] * 4
+    for d in downbeats:
+        b = (d - first_beat) / beat
+        if abs(b - round(b)) < 0.25:
+            votes[int(round(b)) % 4] += 1
+    best = max(range(4), key=votes.__getitem__)
+    return best if votes[best] >= max(4, 0.5 * sum(votes)) else 0
+
+
+def song_map(env, bpm, first_beat, duration, named=None, phase=0):
+    """A song's map from its light (uint8 (frames, 6+)): {"bpm", "bars" (base64,
+    one byte a bar from beat 0: (how hard, 0..15) << 4 | flags), "sec" ([first
+    bar, bars, level 0..3, flags, name] each, name an index of SECTION_NAMES),
+    "dyn" (how far apart its quiet and loud parts are, 0..1)}, or None without a
+    beat grid.
+
+    named: the song's sections by name ([{label, at (seconds), energy}], from
+    djbrain.sections()), when someone (Gemini) listened to it: then those are
+    the sections, each one's level from its name, kept in step with how hard
+    its bars really go. Without, sections come from how hard the bars go.
+
+    phase: the grid's beat the song's bars start on (bar_phase()): bar k is
+    then beats phase + 4k .. phase + 4k + 4 (sent as "phase")."""
+    if env is None or not bpm or len(env) < 50:
+        return None
+    phase = int(phase) % 4
+    first_beat = first_beat + phase * 60.0 / bpm
+    bar_frames = 4 * 60.0 / bpm * 1000 / FRAME_MS
+    start = first_beat * 1000 / FRAME_MS
+    count = int((min(duration * 1000 / FRAME_MS, len(env)) - start) // bar_frames)
+    if count < 4:
+        return None
+    x = env[:, :6].astype(np.float32) / 255.0
+    edges = np.round(start + np.arange(count + 1) * bar_frames).astype(np.int64).clip(0, len(env))
+    cs = np.concatenate([np.zeros((1, 6), np.float32), np.cumsum(x, axis=0)])
+    means = (cs[edges[1:]] - cs[edges[:-1]]) / np.maximum(1, np.diff(edges))[:, None]
+    kick, snare, bass, vocals, melody, level = means.T
+    raw = 0.45 * level + 0.25 * kick + 0.15 * bass + 0.15 * snare
+    ref = float(np.percentile(raw, 95)) or 1e-6
+    hard = np.clip(raw / ref, 0, 1)
+    flags = ((vocals > 0.22) * _BAR_VOCAL + (kick > 0.12) * _BAR_DRUMS).astype(np.uint8)
+    bars = (np.round(hard * 15).astype(np.uint8) << 4) | flags
+    # Sections: the song's four-bar blocks by level, a block out of step with
+    # both its neighbours taken in with them, and runs of a level joined up.
+    blocks = []
+    for b in range(0, count, 4):
+        h = float(hard[b:b + 4].mean())
+        blocks.append(sum(h >= t for t in MAP_TIERS))
+    for i in range(1, len(blocks) - 1):
+        if blocks[i - 1] == blocks[i + 1] and abs(blocks[i] - blocks[i - 1]) == 1:
+            blocks[i] = blocks[i - 1]
+    sections = []
+    for i, tier in enumerate(blocks):
+        bar = i * 4
+        length = min(4, count - bar)
+        f = int(np.bitwise_or.reduce(flags[bar:bar + length])) if length else 0
+        if sections and sections[-1][2] == tier:
+            sections[-1][1] += length
+            sections[-1][3] |= f
+        else:
+            sections.append([bar, length, tier, f])
+    labelled = _named_sections(named, hard, flags, first_beat, 4 * 60.0 / bpm, count)
+    if labelled:
+        sections = labelled
+    else:
+        sections = [sec + [0] for sec in sections]
+    lo, hi = np.percentile(hard, (10, 90))
+    return {"bpm": round(float(bpm), 2), "bars": base64.b64encode(bars.tobytes()).decode(),
+            "sec": sections[:64], "dyn": round(float(hi - lo), 3), "named": bool(labelled), "phase": phase}
+
+
+def _named_sections(named, hard, flags, first_beat, bar_seconds, count):
+    """song_map's sections from named ones: [[first bar, bars, level, flags, name]], or None when they don't fit
+    the song (too few, or most of them out of step with the music)."""
+    starts = []
+    for item in named or ():
+        label = str(item.get("label") or "")
+        if label not in SECTION_NAMES or not isinstance(item.get("at"), (int, float)):
+            continue
+        bar = int(round((float(item["at"]) - first_beat) / bar_seconds))
+        bar = max(0, min(count - 1, bar))
+        if starts and bar <= starts[-1][0]:
+            continue
+        starts.append((bar, label, item.get("energy")))
+    if len(starts) < 3:
+        return None
+    if starts[0][0] > 0:
+        starts.insert(0, (0, "intro", None))
+    out, agree = [], 0
+    for i, (bar, label, energy) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else count
+        if end <= bar:
+            continue
+        h = float(hard[bar:end].mean())
+        tier = _NAMED_TIER.get(label)
+        if tier is None:                     # intro, bridge, break, outro...: by how much they go
+            e = energy / 10 if isinstance(energy, (int, float)) else h
+            tier = 2 if e >= 0.75 and h >= 0.62 else 1 if e >= 0.45 or h >= 0.5 else 0
+        level_by_ear = sum(h >= t for t in MAP_TIERS)
+        if abs(level_by_ear - tier) <= 1:
+            agree += 1
+        # A chorus that hardly goes, or a verse going flat out: meet the music halfway.
+        if tier == 3 and h < 0.45:
+            tier = 2
+        elif tier <= 1 and h >= 0.88:
+            tier = 2
+        f = int(np.bitwise_or.reduce(flags[bar:end]))
+        out.append([bar, end - bar, tier, f, SECTION_NAMES.index(label)])
+    return out if agree >= 0.6 * len(out) else None
+
+
+def song_mood(meta, song, heard=None):
+    """What a song feels like, for the lights' colours: its energy, its key's mode,
+    how much it moves between quiet and loud, and (heard: djbrain.mood(), when
+    Gemini listened to it) its mood words and the palette they lean to."""
+    camelot = (meta or {}).get("camelot") or ""
+    mood = {"energy": round(float((meta or {}).get("energy") or 0.5), 3),
+            "minor": camelot.endswith("A") if camelot else None,
+            "dyn": (song or {}).get("dyn")}
+    if heard:
+        mood.update(words=list(heard.get("words") or [])[:3], name=heard.get("name"))
+    return mood
+
 
 
 class Feed:
@@ -450,6 +636,43 @@ class Feed:
         # Somebody has the club open (the publisher hears so from the hub): until
         # then the audio side skips the light work altogether.
         self.wanted = True
+        self.song = None           # the leading song's id at the first frame waiting
+        self.map = None            # a song's map waiting to go
+        self.map_sent = (None, 0.0)
+
+    def lead(self, deck):
+        """The deck that leads the light now: its song's id goes with the beat, and
+        its map (worked out once per song) goes out when the song changes and
+        every few seconds, for anyone who opens the club later."""
+        if deck is None or not getattr(deck, "loaded", False):
+            return
+        song = f"{deck.name}{deck.wave_id}"
+        if self.song is None:
+            self.song = song
+        env = getattr(deck, "light", None)
+        if env is None:
+            return
+        cached = getattr(deck, "light_map", None)
+        # Worked out again when the song's light is (its stems arrived) or its tempo is corrected.
+        if cached is None or cached[0] != (song, deck.bpm, id(env)):
+            keys = (getattr(deck, "info", None) or {}).get("keys")
+            try:
+                import djbrain
+                named, heard, bars = djbrain.sections(keys), djbrain.mood(keys), djbrain.downbeats(keys)
+            except Exception:
+                named, heard, bars = None, None, None
+            made = song_map(env, deck.bpm, deck.first_beat, deck.duration, named, bar_phase(bars, deck.bpm, deck.first_beat))
+            if made is not None:
+                made = dict(made, id=song, mood=song_mood(deck.meta, made, heard))
+            deck.light_map = cached = ((song, deck.bpm, id(env)), made)
+        made = cached[1]
+        if made is None:
+            return
+        sent, at = self.map_sent
+        now = time.time()
+        if sent != song or now - at > MAP_RESEND_S:
+            self.map = made
+            self.map_sent = (song, now)
 
     def add(self, t_ms, values, beat=None, bpm=None, stems=False, notes=None):
         # Frames keep the audio's clock, one block apart, the way a listener
@@ -504,18 +727,25 @@ class Feed:
             last = out[-1]
             if beat is not None:
                 last["b"], last["bpm"] = round(beat[0], 3), round(beat[1], 2)
+                if self.song:
+                    last["w"] = self.song
             last["stems"] = self.stems
         if self.events:
             if not out:
                 out.append({"t": "club", "at": int(now * 1000), "f": ""})
             out[-1]["ev"] = self.events
+        if self.map is not None:
+            if not out:
+                out.append({"t": "club", "at": int(now * 1000), "f": ""})
+            out[-1]["map"] = self.map
+            self.map = None
         info, sent_at = self.info_sent
         if self.info is not None and (self.info != info or now - sent_at > 1.0):
             if not out:
                 out.append({"t": "club", "at": int(now * 1000), "f": ""})
             out[-1]["info"] = self.info
             self.info_sent = (self.info, now)
-        self.frames, self.beat, self.stems, self.events = [], None, False, []
+        self.frames, self.beat, self.stems, self.events, self.song = [], None, False, [], None
         return out
 
 
@@ -824,3 +1054,97 @@ def night_entries(entries, playing=(), count=30, rng=None):
             if entry.get("url") and entry["url"].lower() not in taken and (entry.get("title") or "").lower() not in taken]
     rng.shuffle(pool)
     return pool[:count]
+
+
+# --------------------------------------------------------------------------
+# Borrowed parts over a song (the club's loop pads, Real DJ's remix touch)
+# --------------------------------------------------------------------------
+#
+# A part of another song (loops.py) takes over from the song's own for a few
+# bars: its drums swapped for another groove, its bass line for another, its
+# music under the vocal for another song's guitar or piano riff, in its key.
+
+BORROW_PARTS = ("guitar", "piano", "bass", "drums")
+BORROW_BEATS = 32
+#: The song's own controls each borrowed part stands in for (with stems).
+_OWN_PART = {"drums": ("drums",), "bass": ("bass",), "guitar": ("other",), "piano": ("other",)}
+
+
+def prepare_borrow(deck, part, rng=None, exclude=()):
+    """A borrowed `part` rendered for a playing deck, its notes checked against the song's own music (the next
+    minute of it): a spec for lay_borrow(), or None when nothing fits. Slow (renders): not under the engine lock."""
+    import loops
+    import realdj
+    if not deck.loaded or not deck.bpm:
+        return None
+    rng = rng or random.Random()
+    own = realdj._digest(deck)
+    t0 = deck.seconds
+    against = [(deck, t0, min(deck.duration, t0 + 60.0))] if part != "drums" else []
+    gains = [(-0.25, 0.0), (0.0, 1.0), (BORROW_BEATS - 1.0, 1.0), (float(BORROW_BEATS), 0.0)]
+    return realdj._fitting_riff((part,), deck.live_bpm(), None if part == "drums" else deck.meta.get("camelot"),
+                                deck.meta.get("energy"), set(exclude) | ({own} if own else set()), rng,
+                                0.0, float(BORROW_BEATS), gains, 1.0, against)
+
+
+def lay_borrow(session, deck, spec, start, beats=BORROW_BEATS):
+    """Play a prepared borrowed part on `deck` from its beat `start` for `beats` beats, the song's own part stepping
+    out while it plays (with stems; without, the borrowed part plays on top). Under the engine lock."""
+    import loops
+    from dj import LoopVoice
+    engine = session.engine
+    gains = [(start + b, g) for b, g in spec["gains"] if b < beats] + [(start + beats - 1.0, 1.0), (start + beats, 0.0)]
+    voice = LoopVoice(spec["audio"], spec["beats"], deck.name, start, start + beats, sorted(gains), spec["part"], spec.get("title"))
+    voice.light = spec.get("light")
+    voice.loop_id = spec.get("id")
+    engine.add_loop(voice)
+    if deck.stems is not None and deck.use_stems:
+        names = _OWN_PART[spec["part"]]
+        saved = {name: deck.stem_gain[name] for name in names}
+        if spec["part"] in ("guitar", "piano") and deck.extra is not None:
+            saved.update({name: deck.stem_gain[name] for name in ("guitar", "piano")})
+
+        def out():
+            deck.stem_gain.update({name: 0.0 for name in saved})
+
+        def back():
+            deck.stem_gain.update(saved)
+        engine.schedule(deck.name, start, start + beats, out, back)
+    loops.remember(spec.get("id"), deck.info.get("title"))
+    feed = getattr(engine, "light", None)
+    if feed is not None:
+        now_beat = deck.beat_at(deck.seconds)
+        feed.event("loop", _beat_ms(deck, start, now_beat), until=int(_beat_ms(deck, start + beats, now_beat)), name=spec["part"])
+    return voice
+
+
+async def borrow(session, part):
+    """The club's loop pad: another song's `part` over the song that leads, from its next bar for eight bars."""
+    import asyncio
+    import loops
+    if part not in BORROW_PARTS:
+        raise ValueError("Unknown part.")
+    if not loops.enabled():
+        raise ValueError("The loop crate is empty or switched off.")
+    engine = session.engine
+    with engine.lock:
+        m = engine.master()
+        tr = engine.transition
+        if tr is not None and tr.started and not getattr(tr, "done", False):
+            raise ValueError("A mix is under way: try that once it's done.")
+        if m is None or not m.playing or not m.bpm:
+            raise ValueError("Nothing with a beat is playing.")
+        if any(v.deck == m.name and v.end > m.beat_at(m.seconds) for v in engine.loops):
+            raise ValueError("A borrowed part is already playing.")
+    spec = await asyncio.get_running_loop().run_in_executor(None, prepare_borrow, m, part)
+    if spec is None:
+        raise ValueError(f"No {part} in the crate fits this song.")
+    with engine.lock:
+        if not m.playing or engine.master() is not m:
+            raise ValueError("The song changed: try again.")
+        now_beat = m.beat_at(m.seconds)
+        bar = math.ceil(now_beat / 4 + 1e-6) * 4
+        if bar - now_beat < 0.75:
+            bar += 4
+        lay_borrow(session, m, spec, bar)
+    return f"{part.capitalize()} from {spec.get('title') or 'another song'} on the next bar"

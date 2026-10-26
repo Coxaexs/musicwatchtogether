@@ -44,6 +44,7 @@ body:not([data-mode=simple]) .simple-only{display:none!important}
 .pill.stemsw.on{background:#ff4fa3;border-color:#ff4fa3;color:#2a0016;box-shadow:0 0 16px #ff4fa366}
 .pill.stemsw:disabled{opacity:.35;cursor:not-allowed}
 .pill.real.on{background:linear-gradient(90deg,#ff3d5a,#ff8a1c);border-color:#ff5a3d;color:#fff;box-shadow:0 0 16px #ff3d5a77}
+.pill.autoplay.on{background:#2fe07a;border-color:#2fe07a;color:#05230f;box-shadow:0 0 16px #2fe07a55}
 .pill.end:hover{border-color:var(--red);color:var(--red)}
 @keyframes blink{50%{opacity:.35}}
 
@@ -278,6 +279,9 @@ body:not(.realmode) .realonly{display:none!important}
   <button class="pill stemsw" id="stemsTop" title="Split songs into drums, bass, vocals and melody for stem controls and stem mixes">STEMS</button>
   <button class="pill auto" id="autoTop" title="Auto DJ mixes the queue for you, in order">AUTO DJ</button>
   <button class="pill real" id="realTop" title="Real DJ performs a set: picks songs from the queue, plays their best part, mashups, loop rolls and drops">REAL DJ</button>
+  <button class="pill autoplay" id="autoplayTop" title="Autoplay: when the queue runs out, the set carries on with stemmed songs from the library">AUTOPLAY</button>
+  <select id="stationTop" title="Mood: the DJ picks songs from the whole library for this mood, and mixes in its style" aria-label="Mood"><option value="">Any mood</option></select>
+  <a class="pill" id="loopsTop" href="#" style="text-decoration:none;color:inherit" title="The loop crate: listen to the riffs and grooves Real DJ borrows from other songs, and turn down the bad ones">LOOPS</a>
   <button class="pill end" id="endBtn">END SET</button>
 </header>
 
@@ -328,6 +332,7 @@ const apiUrl=base+'api/guilds/'+encodeURIComponent(guildId)+'/dj';
 let token=new URLSearchParams(location.hash.slice(1)).get('token')||'';
 try{ if(token) sessionStorage.setItem('dj_token:'+guildId,token); else token=sessionStorage.getItem('dj_token:'+guildId)||''; }catch(_){}
 if(location.hash) history.replaceState(null,'',location.pathname+location.search);
+$('#loopsTop').href=base+'dj/loops/?guild_id='+encodeURIComponent(guildId)+(token?'#token='+encodeURIComponent(token):'');
 
 const DECKS=['A','B'];
 const HOT=['#ff3b6b','#ff8a1c','#ffd21c','#35d05f','#1cc8ff','#3b6bff','#b04bff','#ff4bd8'];
@@ -592,6 +597,8 @@ function wire(){
   $$('#threeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',three:b.dataset.v==='3'}).then(r=>r&&toast(b.dataset.v==='3'?'3 songs: a third song sings over the beat for a phrase, then plays next.':'2 songs: back to back.')));
   $('#autoTop').onclick=modeBtn('auto','Auto DJ: the queue in order, smooth mixes.');
   $('#realTop').onclick=modeBtn('real','Real DJ: picking songs and playing their best parts.');
+  $('#stationTop').onchange=e=>api({op:'auto',station:e.target.value||null});
+  $('#autoplayTop').onclick=()=>{const on=!(S&&S.auto&&S.auto.autoplay);api({op:'auto',autoplay:on}).then(r=>r&&toast(on?'Autoplay: when the queue runs out, songs from the library keep it going.':'Autoplay off: the set ends with the queue.'))};
   $$('#autoMode button').forEach(b=>b.onclick=()=>api({op:'auto',mode:b.dataset.v}).then(r=>r&&toast(b.dataset.v==='real'?'Real DJ: picking songs and playing the best parts.':'Auto DJ: the queue in order.')));
   $('#autoBeats').onchange=()=>api({op:'auto',beats:$('#autoBeats').value?+$('#autoBeats').value:null});
   $('#endBtn').onclick=()=>{if(confirm('End the DJ set? The room goes back to its normal queue.'))api({op:'stop'})};
@@ -824,6 +831,10 @@ function renderAuto(){
     if(ri._h!==html){ri._h=html;ri.innerHTML=html}}
   else if(ri._h!==''){ri._h='';ri.innerHTML=''}
   $('#autoSwitch').classList.toggle('on',a.on);$('#autoTop').classList.toggle('on',a.on&&!real);$('#realTop').classList.toggle('on',a.on&&real);
+  $('#autoplayTop').classList.toggle('on',!!a.autoplay);
+  const st=$('#stationTop');
+  if(a.stations&&st.options.length<2){a.stations.forEach(x=>{const o=document.createElement('option');o.value=x.id;o.textContent=`${x.emoji} ${x.label}`;st.appendChild(o)})}
+  if(document.activeElement!==st)st.value=a.station||'';
   const chips=$('#styleChips');
   if(CAT&&!chips.children.length){chips.innerHTML=CAT.styles.map(s=>`<button data-style="${s.id}">${esc(s.label)}</button>`).join('');
     $$('button',chips).forEach(b=>b.onclick=()=>api({op:'auto',style:b.dataset.style}))}

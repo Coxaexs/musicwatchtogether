@@ -42,7 +42,9 @@ import numpy as np
 
 import club
 import djbrain
+import loops as loop_crate
 import mixer
+import stations
 import stems
 
 SR = 48_000                   # dj.SR (dj imports this module, so not from there)
@@ -155,6 +157,132 @@ def _with_brain(deck, s):
     return s
 
 
+# --------------------------------------------------------------------------
+# The song's own bars and sections (the Colab structure run, djbrain.structure)
+# --------------------------------------------------------------------------
+
+#: Where a song's sections start, weighted for lining phrases up with them: a chorus counts double.
+_SECTION_WEIGHT = {"chorus": 2.0}
+
+
+def fit_bars(downbeats):
+    """A steady grid through a song's downbeats: (seconds a bar, the first downbeat's time), fitted so stray
+    downbeats (a missed or doubled one) don't pull it; None when the song doesn't keep a steady enough tempo
+    (fewer than 70% of its downbeats within 70 ms of the grid)."""
+    d = np.asarray(sorted(downbeats), np.float64)
+    if len(d) < 16:
+        return None
+    gaps = np.diff(d)
+    bar = float(np.median(gaps))
+    if bar <= 0.5 or bar > 6.0:
+        return None
+    index = np.concatenate([[0.0], np.cumsum(np.maximum(1.0, np.round(gaps / bar)))])
+    keep = np.ones(len(d), bool)
+    for _ in range(3):
+        slope, start = np.polyfit(index[keep], d[keep], 1)
+        miss = np.abs(d - (start + slope * index))
+        keep = miss < max(0.07, 3 * float(np.median(miss)))
+    on = float(np.mean(miss < 0.07))
+    return (float(slope), float(start)) if on >= 0.7 else None
+
+
+def aligned_grid(meta, keys):
+    """A song's analysis with its beat grid moved onto the song's real bars and phrases, from the structure run.
+
+    * The tempo and the first beat are fitted to the song's downbeats (fit_bars): the analysis's tempo is often a
+      few tenths of a percent off, which over a song drifts the grid a beat or two from the music. The analysis's
+      beat level stays (a song it counts in half time stays in half time).
+    * Beat 0 is then the first beat of a bar, and the grid is moved on by whole bars so that every 32 beats a phrase
+      starts where most of the song's sections do (choruses counting double).
+
+    Real DJ counts its phrases, mixes, rolls and drops from beat 0, so they then land on the song's own bar lines.
+    Without a steady fit only the bar is put right (bar_phase); without a structure, or with DJ_BRAIN=0, `meta`
+    comes back unchanged. The move is noted as "grid_fix". Never raises."""
+    try:
+        scale = float(meta.get("bpm_scale") or 1.0)
+        bpm = float(meta.get("bpm") or 0) * scale
+        if not bpm or (meta.get("bpm_confidence") or 0) < 0.15:
+            return meta
+        downbeats = djbrain.downbeats(keys)
+        if len(downbeats) < 8:
+            return meta
+        fitted = fit_bars(downbeats)
+        fix = {}
+        if fitted is not None:
+            bar, bar0 = fitted
+            # The analysis's beats per bar: 4 at its tempo, or 2 / 8 when it counts the song in double / half time.
+            per_bar = min((2, 4, 8), key=lambda n: abs(math.log((60.0 * n / bar) / bpm)))
+            new_bpm = 60.0 * per_bar / bar
+            if abs(math.log(new_bpm / bpm)) > 0.03:
+                fitted = None             # a different tempo altogether: leave it to the analysis
+        if fitted is not None:
+            beat = bar / per_bar
+            first = bar0
+            fix.update(tempo=round(new_bpm / bpm - 1, 5))
+            meta = dict(meta, bpm=round(new_bpm / scale, 4))
+            beats_per_bar = per_bar
+        else:
+            beat = 60.0 / bpm
+            first = float(meta.get("first_beat") or 0.0)
+            phase = club.bar_phase(downbeats, bpm, first)
+            on_grid = sum(1 for d in downbeats if abs((d - first) / beat - round((d - first) / beat)) < 0.25)
+            if on_grid < 0.5 * len(downbeats):
+                return meta               # a drifting tempo: the grid stays as it was
+            first += phase * beat
+            fix.update(phase=phase)
+            beats_per_bar = 4
+        starts = [(s, label) for s, _e, label in (djbrain.structure(keys) or {}).get("segments") or []
+                  if label not in ("start", "end") and isinstance(s, (int, float))]
+        bars = [(round((s - first) / (beats_per_bar * beat)), _SECTION_WEIGHT.get(label, 1.0)) for s, label in starts]
+
+        per_phrase = max(1, 32 // beats_per_bar)          # bars in Real DJ's 32-beat phrase
+
+        def score(shift):
+            return sum(w for n, w in bars if (n - shift) % per_phrase == 0)
+        shift = max(range(per_phrase), key=lambda k: score(k) - 0.01 * k)
+        if score(shift) < score(0) + 2:
+            shift = 0                     # not clearly better than where it is
+        first += shift * beats_per_bar * beat
+        # The first phrase as early in the song as it can be: whole phrases back while they still start in it.
+        phrase = 32 * beat
+        while first - phrase >= -beat:
+            first -= phrase
+        fix.update(bars=shift)
+        return dict(meta, first_beat=round(first, 4), grid_fix=fix)
+    except Exception:
+        logger.debug("Grid alignment skipped", exc_info=True)
+        return meta
+
+
+def _phrase_labels(deck, phrases, phrase_s):
+    """Each phrase's section name (the one covering most of it, if it covers 40%), from the structure run, else
+    Gemini's sections when the AI switch is on; None for a song with neither."""
+    keys = (getattr(deck, "info", None) or {}).get("keys")
+    found = djbrain.structure(keys)
+    spans = []
+    if found:
+        spans = [(float(s), float(e), str(label)) for s, e, label in found.get("segments") or []
+                 if label not in ("start", "end")]
+    elif _ai(deck):
+        named = djbrain.sections(keys)
+        for i, item in enumerate(named):
+            end = named[i + 1]["at"] if i + 1 < len(named) else deck.duration
+            spans.append((float(item["at"]), float(end), str(item["label"])))
+    if len(spans) < 3:
+        return None
+    labels = []
+    for p in phrases:
+        t0, t1 = p["start"], p["start"] + phrase_s
+        cover = {}
+        for s, e, label in spans:
+            overlap = min(t1, e) - max(t0, s)
+            if overlap > 0:
+                cover[label] = cover.get(label, 0.0) + overlap
+        best = max(cover, key=cover.get) if cover else None
+        labels.append(best if best and cover[best] >= 0.4 * phrase_s else None)
+    return labels
+
+
 def _structure(deck):
     if not deck.loaded or not deck.bpm:
         return None
@@ -189,6 +317,12 @@ def _structure(deck):
     cut = max(0.72, min(0.88, energies[int(len(energies) * 0.7)] - 1e-6))
     for p in phrases:
         p["big"] = p["energy"] >= cut
+    # A song whose sections are known: its big phrases are its choruses (and drops), not just its loudest.
+    labels = _phrase_labels(deck, phrases, phrase_s)
+    if labels and any(label in ("chorus", "drop") for label in labels):
+        for p, label in zip(phrases, labels):
+            p["label"] = label
+            p["big"] = label in ("chorus", "drop")
     big = [i for i, p in enumerate(phrases) if p["big"]] or [int(np.argmax([p["energy"] for p in phrases]))]
     first_big = big[0]
     # In: one phrase before the first big one, so the transition builds into it.
@@ -320,16 +454,19 @@ def sound_similarity(out, inn):
     return djbrain.similarity((getattr(out, "info", None) or {}).get("keys"), (getattr(inn, "info", None) or {}).get("keys"))
 
 
-def pick_next(items, out_deck, minutes, history, rng=random, lift=0.0):
+def pick_next(items, out_deck, minutes, history, rng=random, lift=0.0, station=None):
     """Index of the crate item to play next (or None for an empty crate).
 
     lift: how far the crowd moves the set's energy target (club.CROWD_LIFT at most).
+    station: the mood station the set plays to (stations.py): its songs first, and the set's energy arc around
+    the station's own energy (a sad night stays low, a party high).
     """
     if not items:
         return None
     out_meta = dict(out_deck.meta or {}, live_bpm=out_deck.live_bpm()) if out_deck else {}
     out_keys = (getattr(out_deck, "info", None) or {}).get("keys") if out_deck and _ai(out_deck) else None
-    target = min(0.95, max(0.1, energy_target(minutes) + lift))
+    centre = stations.STATIONS[station]["energy"] - 0.5 if station in stations.STATIONS else 0.0
+    target = min(0.95, max(0.1, energy_target(minutes) * (0.6 if station else 1.0) + (0.2 if station else 0.0) + centre + lift))
     played = {(h.get("title") or "").lower() for h in history[:40]}
     recent = [(h.get("artist") or "").lower() for h in history[:2]]
     best = None
@@ -343,6 +480,8 @@ def pick_next(items, out_deck, minutes, history, rng=random, lift=0.0):
             score += 0.8
         if stems.enabled() and stems.lookup(item.get("keys") or []):
             score -= 0.25           # stems ready: the fancy transitions are possible
+        if station:
+            score += stations.score(item.get("keys"), station)
         if out_keys:                # offline analysis: songs that sound like what is playing flow better
             score += djbrain.vibe_bonus(djbrain.similarity(out_keys, item.get("keys")))
         score += index * 0.004 + rng.random() * 0.15   # a hint of the queue's order, a hint of chance
@@ -369,12 +508,14 @@ class Plan:
         self.in_cue = in_cue           # seconds into the incoming song
         self.ride = ride               # outgoing pitch (%) to walk to before mixing
         self.why = why
+        self.loops = []                # borrowed parts to play over the mix (_loop_spec)
 
     def json(self):
         return {"style": self.style, "beats": self.beats, "start_beat": self.start_beat,
                 "in_cue": round(self.in_cue, 2), "ride": round(self.ride, 2), "why": self.why,
                 "label": self.label, "move": self.move,
-                "hooks": [{"beat": b, "length": l, "repeats": r, "time": t} for b, l, r, t in self.hooks]}
+                "hooks": [{"beat": b, "length": l, "repeats": r, "time": t} for b, l, r, t in self.hooks],
+                "loops": [{"part": x["part"], "title": x.get("title"), "shift": x.get("shift")} for x in self.loops]}
 
 
 DROP_STYLES = ("loop_roll", "echo", "cut")
@@ -815,16 +956,90 @@ def classic_script(style, beats):
     return sorted(frames, key=lambda frame: frame["at"])
 
 
-ROUTINE_LABELS = {"trade": "Back and forth", "tease": "Hook tease"}
+def dj_refill_below():
+    from dj import REFILL_BELOW
+    return REFILL_BELOW
+
+
+def borrow_script(clash, riff_part):
+    """A borrowed groove over one phrase: parts of two other songs from the loop
+    crate (loops.py) carry the mix.
+
+      beat 0   a drum groove from another song takes over the old song's drums
+      beat 8   the old song's bass and music leave: its vocal rides the borrowed
+               drums and a borrowed riff (guitar, piano or bass) in its key
+      beat 16  the new song's drums take over from the borrowed ones
+      beat 24  the new bass and music come in, the riff makes way, the new
+               vocal comes in and the new song lands on the next phrase
+
+    With clashing keys the riff is in the new song's key, so it waits for the
+    old vocal to go (beat 16) and the old vocal sings over the drums alone.
+    Returns (keyframes, beats, drum gains, riff gains): gains are (beat, level)
+    points from the routine's start.
+    """
+    frames = [_frame(0, 1, xf=0.5, out_drums=0.0), _frame(7, 1, out_bass=0.0, out_other=0.0)]
+    if clash:
+        frames += [_frame(13, 2, out_vocals=0.0), _frame(15, 1, in_drums=1.0)]
+    else:
+        frames += [_frame(15, 1, out_vocals=0.0, in_drums=1.0)]
+    frames += [_frame(23, 1, in_bass=1.0), _frame(24, 4, in_other=1.0), _frame(29, 2, in_vocals=1.0),
+               _frame(31, 1, xf=1.0)]
+    drums = [(-0.25, 0.0), (0.25, 1.0), (15.0, 1.0), (16.0, 0.0)]
+    riff_in = 16 if clash else 8
+    if riff_part == "bass":
+        riff = [(riff_in - 0.25, 0.0), (riff_in, 1.0), (23.0, 1.0), (24.0, 0.0)]
+    else:
+        riff = [(riff_in - 0.5, 0.0), (riff_in, 0.9), (24.0, 0.9), (28.0, 0.35), (30.0, 0.0)]
+    return sorted(frames, key=lambda frame: frame["at"]), PHRASE + 2, drums, riff
+
+
+# How likely a drum bridge gets a borrowed riff over its middle, by vibe.
+RIFF_CHANCE = {"chill": 0.35, "club": 0.5, "hype": 0.6}
+
+
+def _digest(deck):
+    try:
+        return stems.lookup([k for k in (getattr(deck, "info", None) or {}).get("keys") or [] if k])
+    except Exception:
+        return None
+
+
+def _riff_parts(out, inn, so, si, start):
+    """The parts to borrow a riff of, the likeliest to suit first: a guitar for
+    songs with guitars in, else keys, else a bass line."""
+    guitar = max(_guitar(so, start), max((p.get("guitar") or 0) for p in si["phrases"]) if si else 0)
+    return ("guitar", "piano", "bass") if guitar >= 0.2 else ("piano", "guitar", "bass")
+
+
+def _loop_spec(choice, bpm, start, end, gains, level=1.0):
+    """A chosen loop rendered for a plan: what tick() turns into a dj.LoopVoice."""
+    audio = loop_crate.render(choice, bpm) * level
+    light = club.envelope(np.clip(audio * 32767, -32768, 32767).astype(np.int16))
+    return {"audio": audio, "light": light, "beats": loop_crate.LOOP_BEATS * choice["factor"], "start": start,
+            "end": end, "gains": gains, **loop_crate.describe(choice), "id": choice["loop"]["id"]}
+
+
+def _fitting_riff(parts, bpm, key, energy, exclude, rng, start, end, gains, level, against, keys_also=None):
+    """A riff for a plan, rendered: the crate's best for these songs, moved to the key where its notes agree with
+    the music it will play over (`against`: (deck, t0, t1) windows of the songs under it). None when none does."""
+    choice = loop_crate.pick(parts, bpm, key, energy, exclude, rng, keys_also=keys_also, against=against)
+    if choice is None:
+        return None
+    spec = _loop_spec(choice, bpm, start, end, gains, level)
+    spec["harmony"] = None if choice.get("harmony") is None else round(choice["harmony"], 2)
+    return spec
+
+
+ROUTINE_LABELS = {"trade": "Back and forth", "tease": "Hook tease", "borrow": "Borrowed groove"}
 
 # How much each vibe likes each move (multiplies its score).
 TASTE = {
     "chill": {"trade": 0.85, "tease": 0.5, "mashup": 1.2, "stem_swap": 1.3, "acapella": 1.0,
-              "drum_bridge": 1.0, "guitar_ride": 1.25, "drop": 0.12, "blend": 1.0},
+              "drum_bridge": 1.0, "guitar_ride": 1.25, "drop": 0.12, "blend": 1.0, "borrow": 0.9},
     "club": {"trade": 1.15, "tease": 1.1, "mashup": 1.0, "stem_swap": 0.95, "acapella": 0.9,
-             "drum_bridge": 1.0, "guitar_ride": 1.0, "drop": 0.75, "blend": 0.7},
+             "drum_bridge": 1.0, "guitar_ride": 1.0, "drop": 0.75, "blend": 0.7, "borrow": 1.15},
     "hype": {"trade": 1.0, "tease": 1.45, "mashup": 0.9, "stem_swap": 0.8, "acapella": 0.85,
-             "drum_bridge": 1.0, "guitar_ride": 0.85, "drop": 1.25, "blend": 0.5},
+             "drum_bridge": 1.0, "guitar_ride": 0.85, "drop": 1.25, "blend": 0.5, "borrow": 1.05},
 }
 
 
@@ -880,6 +1095,14 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
     earliest = max(int(math.ceil((current + 6) / P)), first_big + 1)
     ideal_end = so["exit"]
     candidates = []
+    # The loop crate: a drum groove and a riff from other songs, for a borrowed groove.
+    exclude = {d for d in (_digest(out), _digest(inn)) if d}
+    energy = ((out.meta.get("energy") or 0.5) + (inn.meta.get("energy") or 0.5)) / 2
+    try:
+        borrowed_drums = loop_crate.pick(("drums",), out.live_bpm(), None, energy, exclude, rng)
+    except Exception:
+        logger.debug("Loop crate unavailable", exc_info=True)
+        borrowed_drums = None
 
     def consider(move, start, overlap, landing, base, why, **extra):
         if start < earliest or start + overlap > count:
@@ -942,6 +1165,16 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
                         "guitar ride: the old guitar carries on over the new drums and bass")
         else:
             classic("drum_bridge", start, 1, 1, 1.4, "keys clash: only the drums overlap")
+        if borrowed_drums is not None:
+            parts = _riff_parts(out, inn, so, si, start)
+            riff = loop_crate.pick(parts, out.live_bpm(), inn.meta.get("camelot") if clash else out.meta.get("camelot"),
+                                   energy, exclude | {borrowed_drums["loop"]["digest"]}, rng,
+                                   keys_also=None if clash else inn.meta.get("camelot"))
+            if riff is not None:
+                consider("borrow", start, 1, 1, 1.15 + 0.35 * sing0 + 0.15 * (riff["loop"].get("score", 2) - 2),
+                         f"borrowed groove: drums from {borrowed_drums['loop'].get('title')}, "
+                         f"{riff['loop']['part']} from {riff['loop'].get('title')}",
+                         drums=borrowed_drums, riff=riff, script=borrow_script(clash, riff["loop"]["part"]))
         tease_hook = _hook_in(hooks, b0 + 8, b0 + P - 6)
         if tease_hook:
             cue, _ = _landing(si, 1)
@@ -954,13 +1187,21 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
                          hook=tease_hook, script=script)
         if lift > 0.15 or vibe == "hype":
             consider("loop_roll", start, 0, 0, 0.5 + 1.5 * max(0.0, lift), "loop roll into the new song's big moment")
-    if not candidates:
-        return None
-    score, move, start, cue, why, extra = max(candidates, key=lambda c: c[0])
+    for score, move, start, cue, why, extra in sorted(candidates, key=lambda c: -c[0]):
+        plan = _make_plan(out, inn, si, gap, score, move, start, cue, why, extra, clash, exclude, energy, rng, vibe)
+        if plan is not None:
+            return plan
+    return None
+
+
+def _make_plan(out, inn, si, gap, score, move, start, cue, why, extra, clash, exclude, energy, rng, vibe):
+    """The Plan for plan_with_stems' chosen candidate, or None when its loops can't be had (the next one is tried)."""
+    from dj import ROUTINE, STYLES
+    P = PHRASE
     start_beat = start * P
     hook = extra.get("hook")
-    if move in ("trade", "tease"):
-        script, beats = extra["script"]
+    if move in ("trade", "tease", "borrow"):
+        script, beats = extra["script"][:2]
         hooks_to_loop = []
         if hook:
             reps = 3 if hook["length"] == 1 else 2
@@ -985,6 +1226,44 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
         want = inn.bpm / (out.bpm or inn.bpm)
         factor = min((0.5, 1.0, 2.0), key=lambda f: abs(math.log(want * f)))
         plan.ride = max(-RIDE_MAX, min(RIDE_MAX, (want * factor - 1) * 100 * 0.6))
+    # The tempo the old song will be at when the mix starts (a tempo ride walks it there).
+    bpm = out.bpm * (1 + plan.ride / 100) if plan.ride else out.live_bpm()
+    # Where the new song will be, `b` beats into the mix (it plays from its cue from the start, synced).
+    in_at = lambda b: plan.in_cue + b * inn.beat_seconds
+    out_at = lambda b: out.time_of_beat(start_beat + b)
+    if move == "borrow":
+        _, _, drum_gains, riff_gains = extra["script"]
+        r0, r1 = riff_gains[0][0], riff_gains[-1][0]
+        # The riff has to agree with the old vocal it rides (not with clashing keys: it waits for the vocal to go)
+        # and with the new song it hands over to.
+        against = ([] if clash else [(out, out_at(max(r0, 8)), out_at(16))]) + [(inn, in_at(max(r0, 16)), in_at(r1))]
+        try:
+            first = extra["riff"]["loop"]["part"]
+            riff = _fitting_riff((first,) + tuple(p for p in ("guitar", "piano", "bass") if p != first),
+                                 bpm, inn.meta.get("camelot") if clash else out.meta.get("camelot"), energy,
+                                 exclude | {extra["drums"]["loop"]["digest"]}, rng, r0, r1, riff_gains, 0.95, against,
+                                 keys_also=None if clash else inn.meta.get("camelot"))
+            if riff is None:
+                logger.info("Borrowed groove skipped: no riff sits with these songs")
+                return None
+            plan.loops = [_loop_spec(extra["drums"], bpm, 0, 16, drum_gains), riff]
+            if riff["title"] != extra["riff"]["loop"].get("title"):
+                why = f"borrowed groove: drums from {extra['drums']['loop'].get('title')}, {riff['part']} from {riff['title']}"
+        except Exception as error:
+            logger.info("Borrowed groove skipped: its loops could not be rendered (%s)", error)
+            return None
+    elif move == "drum_bridge" and rng.random() < RIFF_CHANCE.get(vibe, 0.5):
+        # Over the bridge's middle, where only drums and bass play: a riff from another song in the new song's key.
+        try:
+            gains = [(13.5, 0.0), (14.5, 0.85), (22.0, 0.85), (25.0, 0.0)]
+            riff = _fitting_riff(("guitar", "piano"), bpm, inn.meta.get("camelot"), energy, exclude, rng,
+                                 13.5, 25.0, gains, 1.0, [(inn, in_at(13.5), in_at(25.0))])
+            if riff is not None:
+                plan.loops = [riff]
+                why += f", with a {riff['part']} riff from {riff['title']}"
+        except Exception as error:
+            logger.info("Drum bridge riff skipped (%s)", error)
+            plan.loops = []
     plan.why = f"{why} (keys {out.meta.get('camelot')}→{inn.meta.get('camelot')}, score {score:.2f})"
     return plan
 
@@ -1017,6 +1296,8 @@ class RealDJ:
         self.crowd = getattr(session, "crowd", None)   # club.Crowd: the club's say (Huddle rooms)
         self.lift = 0.0                # the crowd's push on the energy of the next songs
         self.drop_wanted = None        # when the crowd cheered for a drop (monotonic)
+        self.borrow_for = None         # (deck, wave id) a borrowed part was prepared for, and the part (club.prepare_borrow)
+        self.borrow_spec = None
 
     def minutes(self):
         return (time.monotonic() - self.started_at) / 60
@@ -1053,6 +1334,7 @@ class RealDJ:
         if not other.loaded or session._loading(other.name):
             return
         await self._third_song(m)
+        await self._prepare_borrow(m)
         plan_key = (other.name, other.wave_id, other.has_stems, m.has_stems)
         fresh = None
         if self.plan_for != plan_key or self.plan is None:
@@ -1100,8 +1382,56 @@ class RealDJ:
                 for beat, length, repeats, at in plan.hooks:
                     self._hook_loop(m, beat, length, repeats, at=at)
                     self.touches = (self.touches + ["hook_repeat"])[-20:]
+                self._lay_loops(m, plan, engine.transition)
                 self._started(plan, plan.move)
                 self._schedule_horn(other)
+
+    def _lay_loops(self, m, plan, tr):
+        """The plan's borrowed parts, on the old song's beat, for the mix just set up."""
+        from dj import LoopVoice
+        engine = self.session.engine
+        feed = getattr(engine, "light", None)
+        now_beat = m.beat_at(m.seconds)
+        for spec in plan.loops:
+            b = plan.start_beat
+            voice = LoopVoice(spec["audio"], spec["beats"], m.name, b + spec["start"], b + spec["end"],
+                              [(b + beat, level) for beat, level in spec["gains"]], spec["part"], spec.get("title"), tr)
+            voice.light = spec.get("light")
+            voice.loop_id = spec.get("id")
+            engine.add_loop(voice)
+            loop_crate.remember(spec.get("id"), m.info.get("title"))
+            self.touches = (self.touches + [f"loop_{spec['part']}"])[-20:]
+            if feed is not None:
+                feed.event("loop", club._beat_ms(m, voice.start, now_beat), until=int(club._beat_ms(m, voice.end, now_beat)),
+                           name=spec["part"])
+            logger.info("Real DJ %s: %s from %r over the mix, beats %.0f-%.0f (%+d semitones)", self.session.key,
+                        spec["part"], spec.get("title"), voice.start, voice.end, spec.get("shift") or 0)
+
+    async def _prepare_borrow(self, m):
+        """Ready a borrowed part for the playing song (once a song, in the background) for _flourish's remix touch:
+        another song's drums, its bass line, or a guitar or piano riff whose notes agree with this song's."""
+        key = (m.name, m.wave_id)
+        if (self.borrow_for and self.borrow_for[0] == key) or not m.has_stems or not m.bpm or not loop_crate.enabled():
+            return
+        options = [("drums", 2.0), ("bass", 1.0)]
+        guitar = m.stem_presence("guitar", m.seconds, m.seconds + 60) if m.extra is not None else None
+        options += [("guitar", 2.0)] if guitar is not None and guitar >= 0.2 else [("piano", 0.8), ("guitar", 0.8)]
+        total = sum(w for _, w in options)
+        pick = self.rng.random() * total
+        part = options[-1][0]
+        for name, weight in options:
+            pick -= weight
+            if pick <= 0:
+                part = name
+                break
+        self.borrow_for, self.borrow_spec = (key, part), None
+        try:
+            spec = await asyncio.get_running_loop().run_in_executor(None, club.prepare_borrow, m, part, self.rng)
+        except Exception:
+            logger.info("Real DJ %s: no borrowed %s for %r", self.session.key, part, m.info.get("title"), exc_info=True)
+            return
+        if self.borrow_for and self.borrow_for[0] == key:
+            self.borrow_spec = spec
 
     def _transition_samples(self, style):
         """Sampler hits for a transition: a riser into a drop, an 808 on it."""
@@ -1170,8 +1500,9 @@ class RealDJ:
         if any(session._loading(d) for d in DECKS):
             return
         items = session.crate.items()
-        index = pick_next(items, None, self.minutes(), session.history, self.rng, self.lift)
+        index = pick_next(items, None, self.minutes(), session.history, self.rng, self.lift, session.station)
         if index is None:
+            await session.refill_crate()        # autoplay: songs from the library, for the next tick
             return
         item = await session.crate.take(index)
         if item:
@@ -1186,9 +1517,11 @@ class RealDJ:
             session.load_in_background(deck.name, item)
             return
         items = session.crate.items()
-        index = pick_next(items, out, self.minutes(), session.history, self.rng, self.lift)
+        if len(items) < dj_refill_below():
+            await session.refill_crate()            # autoplay: more to choose from by the song after this one
+        index = pick_next(items, out, self.minutes(), session.history, self.rng, self.lift, session.station)
         if index is None:
-            item = await session._next_item()       # Discord: Smart Autoplay
+            item = await session._next_item()       # Discord: Smart Autoplay; Hoffle: the library, next tick
         else:
             item = await session.crate.take(index)
         if item:
@@ -1305,6 +1638,13 @@ class RealDJ:
             options += [("echo", 3)]
         if calm and self.vibe != "chill":
             options += [("flanger", 2)]
+        # A remix touch: the next eight bars (a verse, not the big part) get another song's drums, bass line or riff.
+        spec = self.borrow_spec if self.borrow_for and self.borrow_for[0] == (m.name, m.wave_id) else None
+        # A verse, a solo, an instrumental part (by name when the song's sections are known), never a chorus.
+        fits = nxt and not nxt["big"] and nxt.get("label", "verse") in ("verse", "solo", "inst", "bridge", "break", None)
+        if (spec is not None and fits and boundary + club.BORROW_BEATS <= plan.start_beat - 8
+                and not engine.loops):
+            options += [("borrow", {"chill": 0.5, "club": 1.6, "hype": 2.2}.get(self.vibe, 1.0))]
         options += [("sweep", 1.5), ("slip_loop", 1 if self.vibe != "chill" else 0)]
         options = [(k, w) for k, w in options if w > 0]
         if suggested:       # a DJ listened to this song and put a touch here: favour it (if the engine can do it now)
@@ -1328,6 +1668,10 @@ class RealDJ:
         elif kind == "hook_repeat":
             self._hook_loop(m, hook["beat"], hook["length"], 3 if hook["length"] == 1 else 2,
                             drop_drums=True, at=hook.get("time"))
+        elif kind == "borrow":
+            club.lay_borrow(self.session, m, spec, boundary)
+            self.borrow_spec = None          # once a song
+            logger.info("Real DJ %s: %s from %r over the next eight bars", self.session.key, spec["part"], spec.get("title"))
         else:
             getattr(self, "_fl_" + kind)(m, boundary, nxt)
         self.touches = (self.touches + [kind])[-20:]

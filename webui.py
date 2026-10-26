@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import shutil
@@ -540,6 +541,52 @@ def stems_playlist_entries(library):
             'karaoke': bool(song.get('karaoke')),
         })
     return entries[:200]
+
+
+#: Autoplay leaves near-silent tracks (a speech, an ambient interlude) out of a club or hype night.
+AUTOPLAY_MIN_ENERGY = 0.15
+
+
+def autoplay_entries(entries, vibe='club'):
+    """The library songs autoplay may queue for a DJ set, best first: songs the bot has analysed (so Real DJ can
+    match their tempo, key and energy; it ranks a song it knows nothing about last), then the rest. Outside a
+    chill set, songs it knows to be near silent are left out."""
+    known, unknown = [], []
+    for entry in entries:
+        meta = mixer.cache.get(mixer.track_key(entry.get('url'))) or {}
+        if not meta.get('bpm') or (meta.get('bpm_confidence') or 0) < 0.3:
+            unknown.append(entry)
+        elif vibe != 'chill' and (meta.get('energy') or 0) < AUTOPLAY_MIN_ENERGY:
+            continue
+        else:
+            known.append(entry)
+    return known if len(known) >= 16 else known + unknown
+
+
+def station_entries(station, stemmed, taken=(), count=16, rng=None):
+    """Songs for a mood station (stations.py), shuffled: the ones with stems first (the fancy mixes need them), then
+    the station's other songs; none the set has played or the queue holds."""
+    import stations
+    rng = rng or random.Random()
+    taken = {str(x).lower() for x in taken if x}
+    by_id = {}
+    for entry in stemmed:
+        vid = (mixer.track_key(entry.get('url')) or '')[3:]
+        if vid:
+            by_id[vid] = entry
+    with_stems, without = [], []
+    for vid, title, _rank in stations.songs(station):
+        entry = by_id.get(vid)
+        url = f"https://www.youtube.com/watch?v={vid}"
+        if (title or '').lower() in taken or url.lower() in taken or (entry and (entry.get('title') or '').lower() in taken):
+            continue
+        if entry:
+            with_stems.append(entry)
+        elif title:
+            without.append({'title': title, 'url': url, 'source_type': 'youtube', 'thumbnail': _thumbnail_from_url(url)})
+    rng.shuffle(with_stems)
+    rng.shuffle(without)
+    return (with_stems + without)[:count]
 
 
 def _thumbnail_from_url(url, thumbnail=None):
@@ -1208,7 +1255,7 @@ class WebUI:
             elif op == 'club':
                 if player is not None:
                     raise ValueError('The club is in Hoffle rooms.')
-                session = await self._start_club(key, body.get('vibe'), body.get('mode'))
+                session = await self._start_club(key, body.get('vibe'), body.get('mode'), body.get('station'))
             elif op == 'stop':
                 session = dj.sessions.get(key)
                 if session:
@@ -1229,7 +1276,24 @@ class WebUI:
             state['catalog'] = dj.catalog()
         return web.json_response(state)
 
-    async def _start_club(self, key, vibe=None, mode=None):
+    async def _refill_dj_queue(self, session, count=16):
+        """Autoplay for a Hoffle room's DJ set (dj.refill): when its queue runs low, a shuffled handful of stemmed
+        songs from the library that the set hasn't played and the queue doesn't hold. Real DJ then picks the one
+        that fits best each time, as from any queue. Returns how many were queued."""
+        library = await self._refresh_stems_library()
+        items = session.crate.items()
+        taken = [i.get('query') for i in items] + [i.get('title') for i in items] + sorted(session.played)
+        if getattr(session, 'station', None):
+            picks = station_entries(session.station, stems_playlist_entries(library), taken, count)
+        else:
+            entries = autoplay_entries(stems_playlist_entries(library), getattr(session, 'vibe', 'club'))
+            picks = club.night_entries(entries, taken, count=count)
+        if not picks:
+            return 0
+        await huddle.play_many(session.key, picks, STEMS_PLAYLIST)
+        return len(picks)
+
+    async def _start_club(self, key, vibe=None, mode=None, station=None):
         """A night in a Hoffle room's club: the booth on air with Real DJ in club
         mode (or Auto DJ, mixing the queue in order) and stems on, and a
         shuffled handful of stemmed songs in the room's queue for it to pick
@@ -1245,6 +1309,12 @@ class WebUI:
                               'vibe': vibe if vibe in ('chill', 'club', 'hype') else 'club'})
         if stems.enabled() and not session.stems_on:
             session.set_stems(True)
+        if station:
+            # A night to a mood: the station sets the vibe and brings its own songs (no shuffled handful).
+            await session.handle({'op': 'auto', 'station': station})
+            session.station_fresh = False
+            await session.refill_crate()
+            return session
         room = huddle_voice.MANAGER.players.get(channel_id) or {}
         queued = [room.get('track')] + list(room.get('queue') or [])
         queued = [track for track in queued if track]
@@ -2453,6 +2523,9 @@ async def start_web_server(bot):
         app.router.add_get('/dj/', ui.dj_page)
         app.router.add_get('/api/guilds/{guild_id}/dj', ui.api_dj_state)
         app.router.add_post('/api/guilds/{guild_id}/dj', ui.api_dj_action)
+        import loops_ui
+        loops_ui.setup(app)          # the loop crate's page: listen to and rate Real DJ's borrowed loops
+        dj.refill = ui._refill_dj_queue
         dj.resolver = _resolve_audio
         dj.fallback_resolver = _resolve_direct
     else:
