@@ -37,6 +37,7 @@ import stations
 import stem_mixes
 import stems
 from music import Song, get_autocomplete_suggestions, state_store
+from musixmatch import MusixmatchLyrics
 from security import SlidingWindowLimiter, client_identity
 from storage import save_bytes_atomic, save_json
 
@@ -673,6 +674,7 @@ class WebUI:
         self.bot = bot
         self.lyrics_cache = {}
         self.playlist_lock = None
+        self._musixmatch = None
 
     def _playlist_lock(self):
         if self.playlist_lock is None:
@@ -2150,6 +2152,18 @@ class WebUI:
         if not cog:
             return web.json_response({'track': None, 'lines': [], 'lyrics': None})
 
+        # Musixmatch spends requests from a small monthly plan, so only Hoffle's
+        # /lyricsnow for the song that is playing asks for it (musixmatch=1),
+        # and only Hoffle's master-password session may: dashboard invite
+        # links reach this endpoint too.
+        mxm = self.musixmatch() if (request.query.get('musixmatch') == '1'
+                                    and self._authorized_admin(request)) else None
+        terms = cog._musixmatch_terms(query, artist) if mxm else None
+        if mxm:
+            found, _known = mxm.cached(*terms, duration)
+            if found and found['lines']:
+                return web.json_response(self._musixmatch_json(cog, terms, found))
+
         # Only Huddle's /lyrics and /lyricsnow call this, so a person is asking:
         # look again even if the play-time prefetch missed a few minutes ago.
         synced = await cog._fetch_synced_lyrics(query, artist, duration, fresh=True)
@@ -2162,7 +2176,15 @@ class WebUI:
                 'loose': bool(synced.get('loose')),
             })
 
+        found = None
+        if mxm:
+            found = await mxm.lookup(*terms, duration)
+            if found and found['lines']:
+                return web.json_response(self._musixmatch_json(cog, terms, found))
+
         plain = await cog._fetch_lyrics(query, artist, duration)
+        if not plain and found and found.get('lyrics'):
+            return web.json_response(self._musixmatch_json(cog, terms, found))
         if not plain:
             return web.json_response({'track': None, 'lines': [], 'lyrics': None})
         return web.json_response({
@@ -2172,6 +2194,57 @@ class WebUI:
             'lyrics': plain.get('lyrics'),
             'synced': False,
             'loose': bool(plain.get('loose')),
+        })
+
+    def musixmatch(self):
+        if self._musixmatch is None:
+            self._musixmatch = MusixmatchLyrics(
+                DATA_DIR, getattr(config, 'MUSIXMATCH_API_KEY', ''),
+                getattr(config, 'MUSIXMATCH_HOST', 'musixmatch-lyrics-songs.p.rapidapi.com'),
+                monthly_limit=getattr(config, 'MUSIXMATCH_MONTHLY_LIMIT', 300),
+                daily_limit=getattr(config, 'MUSIXMATCH_DAILY_LIMIT', 30),
+                logger=logger)
+        return self._musixmatch
+
+    @staticmethod
+    def _musixmatch_json(cog, terms, found):
+        track, artist = terms
+        matched_track, matched_artist = found.get('track') or '', found.get('artist') or ''
+        loose = bool(matched_track and not cog._is_query_match(track, matched_track)) or bool(
+            artist and matched_artist and not cog._lyrics_artist_matches(artist, matched_artist))
+        data = {
+            'track': matched_track or track,
+            'artist': matched_artist or artist,
+            'lines': found.get('lines') or [],
+            'synced': bool(found.get('lines')),
+            'loose': loose,
+            'source': 'musixmatch',
+        }
+        if found.get('lines'):
+            if found.get('version_length'):
+                data['version_length'] = found['version_length']
+        else:
+            data['lyrics'] = found.get('lyrics')
+        return data
+
+    async def api_musixmatch_usage(self, request):
+        """How much of the Musixmatch plan is left (for the owner, read-only)."""
+        mxm = self.musixmatch()
+        usage = mxm.usage()
+        now = time.time()
+        calls = [float(stamp) for stamp in usage.get('calls') or []]
+        return web.json_response({
+            'configured': bool(mxm.api_key),
+            'can_send_now': mxm.left(usage, now),
+            'left_this_month': mxm.budget(usage, now)[0],
+            'left_today': mxm.budget(usage, now)[1],
+            'plan_remaining': usage.get('remaining'),
+            'plan_limit': usage.get('limit'),
+            'plan_resets_at': usage.get('reset_at'),
+            'sent_last_24h': sum(1 for stamp in calls if stamp > now - 86400),
+            'sent_last_30d': sum(1 for stamp in calls if stamp > now - 30 * 86400),
+            'daily_limit': mxm.daily_limit,
+            'blocked_until': usage.get('blocked_until'),
         })
 
     async def api_playlists(self, request):
@@ -2613,6 +2686,7 @@ async def start_web_server(bot):
     asyncio.ensure_future(_warm_top_songs())
     app.router.add_get('/api/autocomplete', ui.api_autocomplete)
     app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
+    app.router.add_get('/api/admin/musixmatch', ui.api_musixmatch_usage)
     app.router.add_get('/api/stems/status', ui.api_stems_status)
     app.router.add_get('/api/library/songs', ui.api_library_songs)
     app.router.add_post('/api/library/delete', ui.api_library_delete)

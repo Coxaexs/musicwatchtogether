@@ -5216,6 +5216,36 @@ class MusicCog(commands.Cog):
         artists = self._lyrics_artist_candidates_for_song(song)
         return artists[0] if artists else None
 
+    def _musixmatch_terms(self, query: str, artist: Optional[str] = None) -> tuple[str, Optional[str]]:
+        """The one (song, artist) pair to ask Musixmatch about.
+
+        Each question spends a request from a small monthly plan, so the
+        title is tidied harder than for lrclib: file extensions, every bracket
+        tag, "feat." credits and upload-channel suffixes go, and an
+        "Artist - Song" title wins over an unrelated upload channel.
+        """
+        title = re.sub(r'\.(?:mp3|m4a|flac|ogg|opus|wav|webm|aac)$', '',
+                       (query or '').strip(), flags=re.IGNORECASE)
+        track, artist = self._lyrics_search_context(title, artist)
+        track = re.sub(r'\s*[\[(][^\])]*[\])]', '', track).strip() or track
+        feat = re.compile(r'\s+(?:ft\.?|feat\.?|featuring)\s+.*$', re.IGNORECASE)
+        parts = [part.strip() for part in re.split(r'\s+[-–—|]\s+', track, maxsplit=1)]
+        if len(parts) == 2 and all(parts):
+            left, right = (feat.sub('', part).strip() or part for part in parts)
+            if artist and self._lyrics_artist_matches(artist, right) \
+                    and not self._lyrics_artist_matches(artist, left):
+                track = left                    # "Song — Artist" (Spotify)
+            else:
+                artist, track = left, right     # "Artist - Song"
+        track = feat.sub('', track).strip(' -–—|') or track
+        names = []
+        for name in self._dedupe_artist_names(artist or ''):
+            name = re.sub(r'\s*-\s*topic$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'(?<=[a-z0-9])vevo$', '', name, flags=re.IGNORECASE).strip()
+            if name:
+                names.append(name)
+        return track, ', '.join(self._dedupe_artist_names(names)[:3]) or None
+
     async def _fetch_synced_lyrics_for_song(self, song: Song,
                                             query: Optional[str] = None,
                                             fresh: bool = False) -> Optional[dict]:

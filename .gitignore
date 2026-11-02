@@ -2,6 +2,7 @@
 .env
 .env.local
 *.key
+secrets/
 friend.conf
 friend*.conf
 *.pem
@@ -19,6 +20,7 @@ venv/
 # ---- large media / caches ----
 musics/
 lyrics/
+musixmatch/
 watch_cache/
 stems_cache/
 dj_settings.json

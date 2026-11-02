@@ -77,6 +77,48 @@ LIDARR_API_KEY = os.getenv("LIDARR_API_KEY")
 # Enable detailed cache lookup logging when set to '1'
 CACHE_LOOKUP_DEBUG = os.getenv("CACHE_LOOKUP_DEBUG", "0")
 
+# ---- Musixmatch (RapidAPI) lyrics fallback ----
+# The API key is never stored in plain text. It lives encrypted in
+# secrets/lyrics_api_key.enc and is decrypted at runtime with
+# secrets/lyrics_api.key (both are gitignored, never committed).
+MUSIXMATCH_HOST = os.getenv("MUSIXMATCH_HOST", "musixmatch-lyrics-songs.p.rapidapi.com")
+
+
+def _load_encrypted_secret(enc_name, key_name):
+    """Decrypt a secret from secrets/<enc_name> using secrets/<key_name>.
+
+    Returns the plaintext string, or None if the files are missing or
+    decryption fails (caller falls back to an env var / empty string).
+    """
+    bot_dir = os.path.dirname(os.path.abspath(__file__))
+    enc_path = os.path.join(bot_dir, "secrets", enc_name)
+    key_path = os.path.join(bot_dir, "secrets", key_name)
+    if not (os.path.exists(enc_path) and os.path.exists(key_path)):
+        return None
+    try:
+        # Imported here so a build without cryptography still starts.
+        from cryptography.fernet import Fernet, InvalidToken
+    except ImportError:
+        return None
+    try:
+        with open(key_path, "rb") as f:
+            fernet = Fernet(f.read())
+        with open(enc_path, "rb") as f:
+            return fernet.decrypt(f.read()).decode()
+    except (InvalidToken, ValueError, OSError):
+        return None
+
+
+MUSIXMATCH_API_KEY = (
+    _load_encrypted_secret("lyrics_api_key.enc", "lyrics_api.key")
+    or os.getenv("MUSIXMATCH_API_KEY", "")
+)
+# Only Hoffle's /lyricsnow uses it (see musixmatch.py). RapidAPI's own
+# remaining-count wins once it has answered; until then we count our own
+# requests against MONTHLY_LIMIT. DAILY_LIMIT keeps one day from using it all.
+MUSIXMATCH_MONTHLY_LIMIT = int(os.getenv("MUSIXMATCH_MONTHLY_LIMIT", "300"))
+MUSIXMATCH_DAILY_LIMIT = int(os.getenv("MUSIXMATCH_DAILY_LIMIT", "30"))
+
 # Role name that can always skip songs without a vote
 DJ_ROLE_NAME = os.getenv("DJ_ROLE_NAME", "DJ")
 
