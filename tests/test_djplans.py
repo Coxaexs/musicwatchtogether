@@ -186,13 +186,13 @@ class Engine(unittest.TestCase):
 
     def test_the_booth_switch_reaches_the_decks_state_and_snapshot(self):
         session = dj.DJSession("t", "test", Crate([]))
+        self.assertTrue(session.state()["auto"]["ai"])            # on by default
+        self.assertTrue(all(d.ai for d in session.engine.decks.values()))
+        asyncio.run(session.handle({"op": "auto", "ai": False}))
         self.assertFalse(session.state()["auto"]["ai"])
         self.assertFalse(any(d.ai for d in session.engine.decks.values()))
         asyncio.run(session.handle({"op": "auto", "ai": True}))
-        self.assertTrue(session.state()["auto"]["ai"])
         self.assertTrue(all(d.ai for d in session.engine.decks.values()))
-        asyncio.run(session.handle({"op": "auto", "ai": False}))
-        self.assertFalse(any(d.ai for d in session.engine.decks.values()))
 
     def test_default_exit_without_notes(self):
         _, deck = self.deck()

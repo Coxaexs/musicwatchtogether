@@ -10,6 +10,7 @@ Nothing here runs unless HUDDLE_BASE_URL and HUDDLE_BOT_TOKEN are configured,
 so a bot with no Huddle beside it behaves exactly as before.
 """
 
+import asyncio
 import logging
 import json
 import os
@@ -49,6 +50,7 @@ _DEFAULT_SETTINGS = {
     'audio_filter': None,
     'crossfade_seconds': 0,
     'karaoke_mode': False,
+    'radio': None,           # a mood radio station (stations.py id) the room plays forever, or None
 }
 
 
@@ -217,6 +219,11 @@ def _song_json(track, requester=None):
     }
 
 
+def _radio_stations():
+    import stations
+    return stations.catalog()
+
+
 def _stems_available():
     import stems              # late: stems imports config, which is fine, but keep huddle light
     return stems.enabled()
@@ -277,6 +284,8 @@ async def room_state(guild_id):
         'automix': settings['automix'],
         'automix_blend_seconds': settings['automix_blend'],
         'karaoke': settings['karaoke_mode'],
+        'radio': settings.get('radio'),
+        'radio_stations': _radio_stations(),
         'idle_disconnect_minutes': 0,
         'sleep_timer_ends_at': 0,
         'is_247': False,
@@ -353,6 +362,46 @@ async def play_many(guild_id, entries, playlist_name, cover=None, start_now=Fals
     return await room_state(guild_id)
 
 
+async def _room_player(guild_id):
+    channel_id = channel_id_from(guild_id)
+    for server in await fetch_servers(force=True):
+        for room in server.get('voiceChannels') or []:
+            if room.get('id') == channel_id:
+                return room.get('player') or {}
+    raise KeyError(guild_id)
+
+
+async def radio_next(guild_id, player=None, now=False):
+    """Queue the next song of the room's mood radio (settings 'radio'): the next of its shuffled lap through the
+    station (stations.radio_next), skipping what the room heard lately (its queue, the stats log) or disliked.
+    `now` plays it at once in place of the queue, like a playlist's ▶. Returns its title, or None when the radio
+    is off or has no songs."""
+    import stations
+    station = settings_for(guild_id).get('radio')
+    if station not in stations.STATIONS:
+        return None
+    if player is None:
+        player = await _room_player(guild_id)
+    tracks = [player.get('track')] + list(player.get('queue') or [])
+    recent = [t.get(k) for t in reversed([t for t in tracks if t]) for k in ('pageUrl', 'query', 'title')]
+    recent += [p.get('url') for p in await asyncio.to_thread(played, guild_id, 250)]
+    never = [e.get('url') for entries in _read_json(_DISLIKES_FILE, {}).values() for e in entries or ()
+             if str(e.get('guild_id')) == guild_id]
+    pick = await asyncio.to_thread(stations.radio_next, guild_id, station, recent, never)
+    if not pick:
+        return None
+    vid, title = pick
+    url = f'https://www.youtube.com/watch?v={vid}'
+    if now:
+        await play_many(guild_id, [{'title': stations.clean_title(title) or url, 'url': url, 'source_type': 'youtube',
+                                    'thumbnail': f'https://i.ytimg.com/vi/{vid}/hqdefault.jpg'}],
+                        f'📻 {stations.label(station)} radio', start_now=True)
+    else:
+        await play(guild_id, url, requested_by=f'📻 {stations.label(station)} radio')
+    logger.info('Radio %s for %s: %s', station, guild_id, title)
+    return title
+
+
 async def resolve(channel_id, track_id):
     """Ask Huddle to look up the audio for one queued placeholder."""
     return await _request('POST', '/api/bot/player', {
@@ -389,6 +438,19 @@ async def action(guild_id, body):
         state['report'] = stats(guild_id, wrapped=name == 'wrapped')
         return state
     settings = settings_for(guild_id)
+    if name == 'radio':
+        import stations
+        raw = str(body.get('station') or 'off').strip()
+        station = None if raw.lower() in ('off', 'none', 'stop') else stations.station_id(raw)
+        if station is None and raw.lower() not in ('off', 'none', 'stop'):
+            raise ValueError('Unknown radio station. Try: ' + ', '.join(stations.STATIONS))
+        update_settings(guild_id, radio=station)
+        player = await _room_player(guild_id) if station else {}
+        if station and body.get('now'):
+            await radio_next(guild_id, player, now=True)    # the web player's ▶: the station, right now
+        elif station and not player.get('queue'):
+            await radio_next(guild_id, player)      # its first song now (or next, after the one playing)
+        return await room_state(guild_id)
     if name in ('autoplay', 'artist_diversity', 'vibe_match', 'automix', 'karaoke'):
         key = 'karaoke_mode' if name == 'karaoke' else name
         enabled = body.get('enabled')

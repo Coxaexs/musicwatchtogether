@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import shutil
@@ -32,6 +33,7 @@ import dj
 import huddle
 import mixer
 import songlib
+import stations
 import stem_mixes
 import stems
 from music import Song, get_autocomplete_suggestions, state_store
@@ -521,7 +523,7 @@ def _duration_text(seconds):
     return f'{hours}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes}:{seconds:02d}'
 
 
-def stems_playlist_entries(library):
+def stems_playlist_entries(library, limit=200):
     """The automatic "Stemmed songs" playlist: every song that has stems and a
     YouTube link to play it from, most recently used first. Songs only known by
     a search (no YouTube id in the stems index) are left out, since there is
@@ -539,7 +541,68 @@ def stems_playlist_entries(library):
             'thumbnail': _thumbnail_from_url(url),
             'karaoke': bool(song.get('karaoke')),
         })
-    return entries[:200]
+    return entries[:limit] if limit else entries
+
+
+#: Autoplay leaves near-silent tracks (a speech, an ambient interlude) out of a club or hype night.
+AUTOPLAY_MIN_ENERGY = 0.15
+
+
+def autoplay_entries(entries, vibe='club'):
+    """The library songs autoplay may queue for a DJ set, best first: songs the bot has analysed (so Real DJ can
+    match their tempo, key and energy; it ranks a song it knows nothing about last), then the rest. Outside a
+    chill set, songs it knows to be near silent are left out."""
+    known, unknown = [], []
+    for entry in entries:
+        meta = mixer.cache.get(mixer.track_key(entry.get('url'))) or {}
+        if not meta.get('bpm') or (meta.get('bpm_confidence') or 0) < 0.3:
+            unknown.append(entry)
+        elif vibe != 'chill' and (meta.get('energy') or 0) < AUTOPLAY_MIN_ENERGY:
+            continue
+        else:
+            known.append(entry)
+    return known if len(known) >= 16 else known + unknown
+
+
+def station_entries(station, stemmed, taken=(), count=16, rng=None, heard=()):
+    """Songs for a mood station (stations.py), shuffled: the ones with stems first (the fancy mixes need them), then
+    the station's other songs; none the set has played or the queue holds. `stemmed` is the whole stems library
+    (stems_playlist_entries(library, limit=None)), not just its most recent songs, or a station only ever sees the
+    handful it played lately. `heard` is what the room played lately (huddle.played, newest first): those songs
+    come after every fresh one, the longest ago first, so a station goes round all of itself before repeating."""
+    import stations
+    rng = rng or random.Random()
+    taken = {str(x).lower() for x in taken if x}
+    by_id = {}
+    for entry in stemmed:
+        vid = (mixer.track_key(entry.get('url')) or '')[3:]
+        if vid:
+            by_id[vid] = entry
+    ago = {}                         # youtube id or title -> how many plays ago
+    for n, value in enumerate(heard):
+        value = str(value or '').lower()
+        for key in (value, stations.youtube_id(value)):
+            if key and key not in ago:
+                ago[key] = n
+    with_stems, without, stale = [], [], []
+    for vid, title, _rank in stations.songs(station):
+        entry = by_id.get(vid)
+        url = f"https://www.youtube.com/watch?v={vid}"
+        names = {(title or '').lower(), url.lower(), (entry.get('title') or '').lower() if entry else ''} - {''}
+        if names & taken:
+            continue
+        if not entry and not title:
+            continue
+        song = entry or {'title': title, 'url': url, 'source_type': 'youtube', 'thumbnail': _thumbnail_from_url(url)}
+        last = min([ago[k] for k in names | {vid.lower()} if k in ago], default=None)
+        if last is not None:
+            stale.append((-last, rng.random(), song))
+        else:
+            (with_stems if entry else without).append(song)
+    rng.shuffle(with_stems)
+    rng.shuffle(without)
+    stale.sort(key=lambda x: x[:2])
+    return (with_stems + without + [song for *_k, song in stale])[:count]
 
 
 def _thumbnail_from_url(url, thumbnail=None):
@@ -756,6 +819,8 @@ class WebUI:
             'volume': int(player.volume * 100),
             'loop': 'song' if player.loop else ('queue' if player.loop_queue else 'off'),
             'autoplay': player.autoplay,
+            'radio': getattr(player, 'radio', None),
+            'radio_stations': stations.catalog(),
             'artist_diversity': player.artist_diversity,
             'vibe_match': player.vibe_match,
             'audio_filter': player.audio_filter or 'off',
@@ -1208,7 +1273,7 @@ class WebUI:
             elif op == 'club':
                 if player is not None:
                     raise ValueError('The club is in Hoffle rooms.')
-                session = await self._start_club(key, body.get('vibe'), body.get('mode'))
+                session = await self._start_club(key, body.get('vibe'), body.get('mode'), body.get('station'))
             elif op == 'stop':
                 session = dj.sessions.get(key)
                 if session:
@@ -1229,7 +1294,27 @@ class WebUI:
             state['catalog'] = dj.catalog()
         return web.json_response(state)
 
-    async def _start_club(self, key, vibe=None, mode=None):
+    async def _refill_dj_queue(self, session, count=16):
+        """Autoplay for a Hoffle room's DJ set (dj.refill): when its queue runs low, a shuffled handful of stemmed
+        songs from the library that the set hasn't played and the queue doesn't hold. Real DJ then picks the one
+        that fits best each time, as from any queue. Returns how many were queued."""
+        library = await self._refresh_stems_library()
+        items = session.crate.items()
+        taken = [i.get('query') for i in items] + [i.get('title') for i in items] + sorted(session.played)
+        if getattr(session, 'station', None):
+            plays = await asyncio.to_thread(huddle.played, session.key, 250)
+            heard = [value for play in plays for value in (play.get('url'), play.get('title'))]
+            picks = station_entries(session.station, stems_playlist_entries(library, limit=None), taken, count,
+                                    heard=heard)
+        else:
+            entries = autoplay_entries(stems_playlist_entries(library), getattr(session, 'vibe', 'club'))
+            picks = club.night_entries(entries, taken, count=count)
+        if not picks:
+            return 0
+        await huddle.play_many(session.key, picks, STEMS_PLAYLIST)
+        return len(picks)
+
+    async def _start_club(self, key, vibe=None, mode=None, station=None):
         """A night in a Hoffle room's club: the booth on air with Real DJ in club
         mode (or Auto DJ, mixing the queue in order) and stems on, and a
         shuffled handful of stemmed songs in the room's queue for it to pick
@@ -1245,6 +1330,12 @@ class WebUI:
                               'vibe': vibe if vibe in ('chill', 'club', 'hype') else 'club'})
         if stems.enabled() and not session.stems_on:
             session.set_stems(True)
+        if station:
+            # A night to a mood: the station sets the vibe and brings its own songs (no shuffled handful).
+            await session.handle({'op': 'auto', 'station': station})
+            session.station_fresh = False
+            await session.refill_crate()
+            return session
         room = huddle_voice.MANAGER.players.get(channel_id) or {}
         queued = [room.get('track')] + list(room.get('queue') or [])
         queued = [track for track in queued if track]
@@ -1493,11 +1584,29 @@ class WebUI:
                 cog.save_player_settings(player)
             elif action == 'autoplay':
                 player.autoplay = not player.autoplay
+                if not player.autoplay:
+                    player.radio = None         # the radio rides autoplay
                 if player.autoplay:
                     player.schedule_autoplay_prefetch()
                 else:
                     player.cancel_autoplay_prefetch()
                 cog.save_player_settings(player)
+            elif action == 'radio':
+                raw = str(body.get('station') or 'off')
+                station = None if raw.lower() == 'off' else stations.station_id(raw)
+                cog.set_radio(player, station)
+                if station and body.get('now') and vc and vc.is_connected():
+                    # The web player's ▶ on a station: it plays now, in place of the queue, like a playlist.
+                    player.queue.clear()
+                    player.loop = player.loop_queue = False
+                    player.clear_preloads()
+                    if vc.is_playing() or vc.is_paused():
+                        vc.stop()
+                    else:
+                        await player.play_next()
+                elif station and vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused() \
+                        and not player.queue:
+                    await player.play_next()
             elif action == 'artist_diversity':
                 cog.set_artist_diversity(player, not player.artist_diversity)
             elif action == 'vibe_match':
@@ -1760,6 +1869,11 @@ class WebUI:
             return web.json_response(
                 {'error': 'No results found for that query.'}, status=404)
 
+        def song_key(url):
+            # Camelot, from AutoMix's analysis: Hoffle's singing voice tunes to it.
+            key = mixer.track_key(url) if url else None
+            return (mixer.cache.get(key) or {}).get('camelot') if key else None
+
         def duration_seconds(value):
             if isinstance(value, (int, float)):
                 return value
@@ -1778,6 +1892,7 @@ class WebUI:
                 'thumbnail': song.thumbnail,
                 'page_url': song.url,
                 'source_type': song.source_type,
+                'key': song_key(song.url),
                 # Lazy Spotify entries use this form; yt-dlp needs the search
                 # text rather than the pseudo URL.
                 'resolve_query': (
@@ -2453,6 +2568,9 @@ async def start_web_server(bot):
         app.router.add_get('/dj/', ui.dj_page)
         app.router.add_get('/api/guilds/{guild_id}/dj', ui.api_dj_state)
         app.router.add_post('/api/guilds/{guild_id}/dj', ui.api_dj_action)
+        import loops_ui
+        loops_ui.setup(app)          # the loop crate's page: listen to and rate Real DJ's borrowed loops
+        dj.refill = ui._refill_dj_queue
         dj.resolver = _resolve_audio
         dj.fallback_resolver = _resolve_direct
     else:
@@ -2621,6 +2739,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .setting .setting-title { font-size: 14px; font-weight: 600; }
   .setting .setting-desc { color: var(--muted); font-size: 12px; margin-top: 3px; }
   .setting button { min-width: 82px; }
+  .setting.radio-setting { flex-wrap: wrap; }
+  .radio-moods { display: flex; flex-wrap: wrap; gap: 6px; width: 100%; }
+  .setting .radio-moods button { min-width: 0; padding: 6px 10px; font-size: 12px; }
   .setting select { min-width: 110px; max-width: 170px; background: var(--panel2);
                     color: var(--text); border: 1px solid var(--border);
                     border-radius: 8px; padding: 8px; }
@@ -2680,6 +2801,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     -webkit-backdrop-filter: blur(26px) saturate(1.35); backdrop-filter: blur(26px) saturate(1.35);
   }
   .playlist-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(190px,1fr)); gap: 14px; }
+  .station-head { margin: 4px 0 10px; } .station-head h3 { margin: 0 0 2px; font-size: 16px; }
+  .station-head p { margin: 0; color: var(--muted); font-size: 13px; }
+  .station-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(230px,1fr)); gap: 10px; margin-bottom: 22px; }
+  .station-card { display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: 14px;
+    background: color-mix(in srgb, var(--text) 4%, transparent); border: 1px solid color-mix(in srgb, var(--text) 10%, transparent); }
+  .station-card.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .station-emoji { font-size: 28px; width: 44px; height: 44px; display: grid; place-items: center;
+    border-radius: 12px; background: color-mix(in srgb, var(--text) 7%, transparent); flex: none; }
+  .station-text { flex: 1; min-width: 0; } .station-text .playlist-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .station-live { color: var(--accent); font-weight: 600; }
+  .station-card button { flex: none; }
   .playlist-card { min-width: 0; padding: 12px; border-radius: 18px; background: var(--panel2);
                    border: 1px solid var(--border2); transition: transform .2s, border-color .2s; }
   .playlist-card:hover { transform: translateY(-3px); border-color: var(--accent); }
@@ -3084,6 +3216,17 @@ function renderViewNav() {
   if (settingsBtn) settingsBtn.style.display = activeView === 'player' ? '' : 'none';
 }
 
+function radioSettingHTML(s) {
+  const moods = (s.radio_stations || []).filter(m => m.songs);
+  if (!moods.length) return '';
+  const on = moods.find(m => m.id === s.radio);
+  return `<div class="setting radio-setting">
+      <div class="setting-text"><div class="setting-title">📻 Mood radio${on ? ': ' + esc(on.emoji + ' ' + on.label) : ''}</div>
+        <div class="setting-desc">Endless songs from the library that fit a mood, one after another when the queue runs out. No repeats until the station has played them all.</div></div>
+      <div class="radio-moods">${moods.map(m => `<button class="${m.id === s.radio ? 'toggled' : ''}" title="${m.songs} songs" onclick="act('radio',{station:'${m.id === s.radio ? 'off' : m.id}'})">${esc(m.emoji + ' ' + m.label)}</button>`).join('')}${on ? `<button onclick="act('radio',{station:'off'})">Off</button>` : ''}</div>
+    </div>`;
+}
+
 function playerControlsHTML(s) {
   const current = s.current;
   return `<div class="controls">
@@ -3102,6 +3245,23 @@ function playerControlsHTML(s) {
     <div class="vol">🔊 <input type="range" min="0" max="100" value="${s.volume}" onchange="act('volume',{level:+this.value})"><span>${s.volume}%</span></div>
     <div class="bottom-progress" onclick="seekProgress(event)"><div id="bottomPbar"></div></div>
   </div>`;
+}
+
+// The DJ's mood stations: not playlists but endless radios. ▶ plays one now (in place of the queue); it then
+// goes through every song of the mood in a shuffled order, and shuffles again for the next lap.
+function stationCardsHTML() {
+  const moods = ((state && state.radio_stations) || []).filter(m => m.songs);
+  if (!moods.length) return '';
+  const on = state.radio;
+  return `<div class="station-head"><h3>📻 Stations</h3><p>Endless mood radio: every song of the mood, shuffled, then shuffled again.</p></div>
+    <div class="station-grid">${moods.map(m => `<article class="station-card${m.id === on ? ' on' : ''}">
+      <div class="station-emoji" aria-hidden="true">${esc(m.emoji)}</div>
+      <div class="station-text"><div class="playlist-name">${esc(m.label)}</div>
+        <div class="playlist-meta">${m.id === on ? '<span class="station-live">● On air</span> · ' : ''}${m.songs} songs · endless</div></div>
+      ${m.id === on
+        ? `<button onclick="act('radio',{station:'off'})" title="Stop the radio (the song playing finishes)">■ Stop</button>`
+        : `<button class="primary" onclick="act('radio',{station:'${m.id}',now:true});toast('📻 ${esc(m.label)} radio')" title="Play this station now, in place of the queue">▶ Play</button>`}
+    </article>`).join('')}</div>`;
 }
 
 function playlistCardsHTML() {
@@ -3145,6 +3305,7 @@ function renderPlaylistPage() {
       <button class="primary" onclick="createPlaylist()">＋ Create</button></div>
       <div class="spotify-import"><input id="spotifyImportUrl" placeholder="Spotify playlist or album link" aria-label="Spotify playlist or album link" onkeydown="if(event.key==='Enter')importSpotifyPlaylist()">
       <button id="spotifyImportBtn" onclick="importSpotifyPlaylist()">♫ Import Spotify</button></div></div></div>
+      ${stationCardsHTML()}
       <div class="playlist-grid">${playlistCardsHTML()}</div></section>`;
   } else {
     const cover = playlist.cover ? `style="background-image:url('${cssUrl(mediaUrl(playlist.cover))}')"` : '';
@@ -3720,6 +3881,7 @@ function render() {
         <option value="queue" ${s.loop==='queue'?'selected':''}>Queue</option>
       </select>
     </div>
+    ${radioSettingHTML(s)}
     <div class="setting">
       <div class="setting-text"><div class="setting-title">Smart Autoplay</div>
         <div class="setting-desc">Keep playing related music when the queue runs out.</div></div>

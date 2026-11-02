@@ -397,6 +397,52 @@ def pinned():
 
 _library_cache = (None, [])
 
+#: Each stems file's length in frames, by path and size, kept on disk: ffprobing every FLAC took about a minute for
+#: 800 songs, and library() reads them all again whenever the cache changes. The files are write-once, so the size
+#: tells a rebuilt one apart. (Beside CACHE_DIR, not in it: writing there would change library()'s stamp.)
+def _frames_file():
+    return CACHE_DIR.rstrip("/\\") + "_frames.json"
+
+_frames_memo = None
+_frames_dirty = False
+_frames_lock = threading.Lock()
+
+
+def _frames_of(digest, path, size):
+    """stem_frames(digest), from the memo when it measured this same file."""
+    global _frames_memo, _frames_dirty
+    with _frames_lock:
+        if _frames_memo is None:
+            try:
+                with open(_frames_file(), encoding="utf-8") as f:
+                    _frames_memo = json.load(f)
+            except (OSError, ValueError):
+                _frames_memo = {}
+        known = _frames_memo.get(path)
+    if known and known[0] == size:
+        return known[1]
+    frames = stem_frames(digest)
+    with _frames_lock:
+        _frames_memo[path] = [size, frames]
+        _frames_dirty = True
+    return frames
+
+
+def _save_frames():
+    global _frames_dirty
+    with _frames_lock:
+        if not _frames_dirty:
+            return
+        _frames_dirty = False
+        data = json.dumps(_frames_memo)
+    tmp = _frames_file() + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, _frames_file())
+    except OSError:
+        logger.debug("Could not save the stems frame memo", exc_info=True)
+
 
 def library():
     """Every song with stems on disk, most recently used first.
@@ -430,8 +476,9 @@ def library():
     for digest, song in songs.items():
         path = _stem_file(digest)
         try:
-            used = os.path.getmtime(path)
-            frames = stem_frames(digest)
+            st = os.stat(path)
+            used = st.st_mtime
+            frames = _frames_of(digest, path, st.st_size)
         except (OSError, ValueError, IndexError, TypeError):
             continue
         song.update(
@@ -444,6 +491,7 @@ def library():
         )
         out.append(song)
     out.sort(key=lambda song: song["used"], reverse=True)
+    _save_frames()
     _library_cache = (stamp, out)
     return [dict(item) for item in out]
 

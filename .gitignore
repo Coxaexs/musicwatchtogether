@@ -72,3 +72,8 @@ musicbot.sqlite3*
 .claude/
 dislikes.json
 youtube-cookies.txt
+
+# ---- the loop crate (rebuilt by loops.py build; ratings are live) ----
+loops/
+radio_bags.json
+stems_cache_frames.json

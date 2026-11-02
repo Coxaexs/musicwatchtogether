@@ -44,6 +44,7 @@ import club
 import mixer
 import realdj
 import samples
+import stations
 import stems
 
 logger = logging.getLogger("MusicBot.DJ")
@@ -526,7 +527,7 @@ class Deck:
         self.vinyl = True
         self.slip = False
         self.sync = False
-        self.ai = False             # set by the session's experimental AI switch
+        self.ai = True              # set by the session's AI switch (on unless the booth turns it off)
 
     def reset_track_state(self):
         self.pos = 0.0              # playhead, in samples (float)
@@ -955,6 +956,54 @@ def rewind_gesture(deck, to_seconds, engine=None, on_restart=None):
     return Gesture(deck, "rewind", rate, seconds, slip=False, after=after)
 
 
+class LoopVoice:
+    """A loop from the crate (loops.py) playing over a mix, locked to one deck's beat.
+
+    `audio` is the loop, float32 (n, 2), exactly `beats` beats of that deck's
+    tempo long; it plays from the deck's beat `start` to `end`, round and round,
+    at the level its `gains` say ((beat, level) points, straight lines between).
+    Where in the loop it is comes from the deck's own beat every block, so it
+    stays on the beat through a tempo ride or a nudge. It belongs to a mix
+    (`transition`): if that mix is called off, the loop fades out at once.
+    """
+
+    def __init__(self, audio, beats, deck, start, end, gains, part, title=None, transition=None):
+        self.audio = np.asarray(audio, np.float32)
+        self.beats = float(beats)
+        self.deck = deck
+        self.start = float(start)
+        self.end = float(end)
+        self.gains = sorted(gains)
+        self.part = part
+        self.title = title
+        self.transition = transition
+        self.cut = 1.0                 # the fade when its mix is called off
+        self.heard = False
+        self.level = 0.0
+        self.loop_id = None            # its id in the crate, to rate it from the booth or the club
+        # Its own light (club.envelope of the loop), read where the loop will be.
+        self.light = None
+
+    def gain_at(self, beat):
+        points = self.gains
+        if not points:
+            return 1.0
+        if beat <= points[0][0]:
+            return points[0][1]
+        for (b0, g0), (b1, g1) in zip(points, points[1:]):
+            if beat <= b1:
+                return g0 + (g1 - g0) * ((beat - b0) / (b1 - b0) if b1 > b0 else 1.0)
+        return points[-1][1]
+
+    def place(self, beat):
+        """Sample position in the loop at the deck's `beat`."""
+        return ((beat - self.start) % self.beats) / self.beats * len(self.audio)
+
+    def json(self):
+        return {"part": self.part, "title": self.title, "start": round(self.start, 2), "end": round(self.end, 2),
+                "on": self.heard, "id": self.loop_id}
+
+
 class Transition:
     """A scripted mix from one deck to the other, driven by the real controls."""
 
@@ -1139,6 +1188,7 @@ class DJEngine:
         self.fx = BeatFX()
         self.sampler_volume = 0.7
         self.voices = []             # [sample array, offset]
+        self.loops = []              # LoopVoice: borrowed parts over a mix (loops.py)
         self.transition = None
         self.tempo_release = None    # (deck, pitch at start, beats, elapsed)
         self.events = []             # ("ended", deck) / ("transition_done", tr) for Auto DJ
@@ -1363,6 +1413,47 @@ class DJEngine:
             # Guitar / piano only when the script set them; otherwise they follow "other".
             deck.stem_gain.update({stem: _clamp(values[prefix + stem], 0.0, 1.0)
                                    for stem in stems.ALL_CONTROLS if prefix + stem in values})
+
+    def add_loop(self, voice):
+        """Play a LoopVoice over the mix (at most three at a time)."""
+        self.loops = (self.loops + [voice])[-3:]
+
+    def _render_loops(self, mix):
+        """Add the loops sounding in this block to the mix."""
+        if not self.loops:
+            return
+        keep = []
+        for voice in self.loops:
+            deck = self.decks.get(voice.deck)
+            if deck is None or not deck.loaded or not deck.playing or not deck.bpm:
+                continue
+            if voice.transition is not None and self.transition is not voice.transition and not voice.transition.done:
+                voice.cut -= BLOCK / SR / 0.3      # its mix was called off: out over 0.3 s
+                if voice.cut <= 0:
+                    continue
+            b1 = deck.beat_at(deck.seconds)          # the deck has read this block already
+            step = BLOCK / SR * deck.rate_now / deck.beat_seconds
+            b0 = b1 - step
+            if b0 >= voice.end:
+                continue
+            keep.append(voice)
+            if b1 <= voice.start or step <= 0:
+                voice.level = 0.0
+                continue
+            beats = b0 + (np.arange(BLOCK, dtype=np.float64) / BLOCK) * step
+            pos = ((beats - voice.start) % voice.beats) / voice.beats * len(voice.audio)
+            i = pos.astype(np.int64)
+            frac = (pos - i)[:, None].astype(np.float32)
+            n = len(voice.audio)
+            chunk = voice.audio[i % n] * (1 - frac) + voice.audio[(i + 1) % n] * frac
+            g0, g1 = voice.gain_at(b0), voice.gain_at(b1)
+            gain = np.linspace(g0, g1, BLOCK, dtype=np.float32)[:, None] * max(0.0, voice.cut)
+            gain *= ((beats >= voice.start) & (beats < voice.end))[:, None]
+            mix += chunk * gain
+            voice.level = float(max(g0, g1) * max(0.0, voice.cut))
+            if not voice.heard and voice.level > 0.05:
+                voice.heard = True
+        self.loops = keep
 
     def schedule(self, deck_name, start_beat, end_beat, on, off):
         """Run on() when deck_name reaches start_beat and off() at end_beat."""
@@ -1618,6 +1709,7 @@ class DJEngine:
                 if fx_target == deck.name:
                     channel = self.fx.process(channel, beat_seconds, beat_pos, 1 / (beat_seconds * SR))
                 mix += channel * self._xf_gain(deck)
+            self._render_loops(mix)
             if fx_target == "master":
                 mix = self.fx.process(mix, beat_seconds, beat_pos, 1 / (beat_seconds * SR))
             mix *= self.master_volume
@@ -1640,6 +1732,7 @@ class DJEngine:
             if (self.light is not None and self.light.wanted and not self.paused
                     and any(d.playing for d in self.decks.values())):
                 values, notes, beat, bpm, lit_by_stems = club.frame(self)
+                self.light.lead(self.master())
                 self.light.add(time.time() * 1000 + club.LOOKAHEAD * 1000, values, beat, bpm, lit_by_stems, notes)
             return (np.clip(mix, -1, 1) * 32767).astype("<i2").tobytes()
 
@@ -1657,6 +1750,7 @@ class DJEngine:
                 "fx": {"type": self.fx.type, "beat": self.fx.beat, "level": self.fx.level,
                        "on": self.fx.on, "target": self.fx.target},
                 "transition": self.transition.json() if self.transition else None,
+                "loops": [voice.json() for voice in self.loops],
                 "rendering": time.monotonic() - self.last_render < 0.5,
             }
 
@@ -1672,6 +1766,15 @@ stems.pause_background = lambda: any(s.live and s.active for s in list(sessions.
 
 #: async (query) -> {"audio_url", "page_url", "title"?, ...}; set by webui
 resolver = None
+#: async (session) -> int: adds songs from the library (stemmed songs not played tonight) to a Hoffle room's queue
+#: when its set runs dry, and says how many; set by webui. See DJSession.refill_crate.
+refill = None
+#: Snapshots carry this with the AI switch; older ones predate AI being on by default (see _restore).
+AI_DEFAULT_V = 2
+#: At most one top-up in this many seconds (the queue the hub sends back takes a moment to arrive).
+REFILL_EVERY_S = 45.0
+#: Real DJ tops the queue up before it is quite empty, so it still has songs to choose the next one from.
+REFILL_BELOW = 3
 #: same, but straight from the bot's yt-dlp; used to retry a failed link
 fallback_resolver = None
 
@@ -1693,7 +1796,8 @@ class DiscordCrate:
                 "thumbnail": song.thumbnail, "duration": song.duration,
                 "query": query if song.source_type != "local" else None,
                 "file": self.resolve_file(song),
-                "keys": [mixer.track_key(url), mixer.track_key(query)]}
+                "keys": [mixer.track_key(url), mixer.track_key(query)],
+                "next": bool(getattr(song, "play_next", False))}
 
     async def take(self, index=0):
         queue = self.player.queue
@@ -1705,6 +1809,16 @@ class DiscordCrate:
         if hasattr(self.player, "long_history"):
             self.player.long_history.appendleft(song)
         return {**self._item(song), "song": song}
+
+    async def put_back(self, item):
+        """A song taken for the next deck goes back to the front of the queue (a /playnext took its place)."""
+        song = item.get("song")
+        if song is None:
+            return
+        song.play_next = False
+        if self.player.history and self.player.history[0] is song:
+            self.player.history.popleft()
+        self.player.queue.appendleft(song)
 
     async def add(self, query, requester=None):
         cog = self.player.bot.get_cog("MusicCog")
@@ -1745,7 +1859,8 @@ class HuddleCrate:
                 "query": track.get("pageUrl") or track.get("query") or track.get("title"),
                 "keys": [mixer.track_key(track.get("pageUrl")), mixer.track_key(track.get("query"))],
                 # A planned playlist transition out of this song (cut points, booth style).
-                "mix": track.get("mix") if isinstance(track.get("mix"), dict) else None}
+                "mix": track.get("mix") if isinstance(track.get("mix"), dict) else None,
+                "next": bool(track.get("playNext"))}       # /playnext: forced, see DJSession._force_play_next
 
     def items(self):
         return [self._item(track) for _, track in self._tracks()[:100]]
@@ -1766,7 +1881,17 @@ class HuddleCrate:
             player = self._player()
             if player.get("queue"):
                 player["queue"] = [t for t in player["queue"] if t.get("id") != track.get("id")]
-        return self._item(track)
+        return {**self._item(track), "hub_track": track}
+
+    async def put_back(self, item):
+        """A song taken for the next deck goes back to the front of the queue (a /playnext took its place)."""
+        import huddle
+        track = item.get("hub_track")
+        if not track:
+            return
+        await huddle._request("POST", "/api/bot/player", {
+            "channelId": self.channel_id,
+            "action": {"name": "playnext", "track": {**track, "playNext": False}}})
 
     async def add(self, query, requester=None):
         import huddle
@@ -1787,13 +1912,20 @@ class DJSession:
         room = getattr(crate, "channel_id", None) if kind == "huddle" else None
         self.crowd = club.crowd(room) if room else None   # the club's say, for Real DJ
         self.three = False               # Real DJ: 3 songs (layer a third song's vocal)
-        self.ai = False                  # experimental: Real DJ uses the offline AI analysis (djbrain)
+        self.ai = True                   # beta, on by default: Real DJ uses the offline AI analysis (djbrain)
         self.paused = False              # the whole set paused (pause / resume)
         self.paused_decks = []           # what was playing when it was paused
         self.saved_at = 0.0              # monotonic time of the last snapshot
         self.restoring = False           # bringing a set back: the tick waits
         self.auto_style = "auto"
         self.auto_beats = None           # None = the style's default
+        # Autoplay: when the queue runs dry, the set carries on with songs from the library (Hoffle rooms).
+        self.autoplay = True
+        self.station = None              # the mood station the set plays to (stations.py), or None: any song
+        self.station_fresh = False       # just chosen: bring its songs on the next tick
+        self.refilled_at = -math.inf
+        self.refilling = False           # a refill is waiting on the library (one at a time)
+        self.played = set()              # every song played this set (lower-cased titles), not to come round again
         self.history = []
         self.live = False                # engine is the room's output
         self.active = True
@@ -1866,6 +1998,9 @@ class DJSession:
                 keys.append(mixer.track_key(resolved.get("page_url")))
                 audio = await loop.run_in_executor(None, decode_track, source)
             meta, wave = await loop.run_in_executor(None, analyze_buffer, audio, keys)
+            # The beat grid on the song's real bars and phrases, when the structure run knows them (off the lock:
+            # the first look reads the structure file).
+            meta = await loop.run_in_executor(None, realdj.aligned_grid, dict(meta), keys)
         except Exception as error:
             with self.engine.lock:
                 if deck.load_token == token:
@@ -1887,7 +2022,9 @@ class DJSession:
             deck.info = {"title": item.get("title"), "artist": item.get("artist"),
                          "thumbnail": item.get("thumbnail"),
                          "song": item.get("song"), "query": item.get("query"),
-                         "keys": keys, "mix": item.get("mix")}
+                         "keys": keys, "mix": item.get("mix"),
+                         # for _force_play_next: whether it was asked for, and how to give it back
+                         "next": bool(item.get("next")), "hub_track": item.get("hub_track")}
             deck.loading = None
             deck.error = None
             deck.reset_track_state()
@@ -1910,6 +2047,8 @@ class DJSession:
             deck.playing = play
             self.history.insert(0, {"title": deck.info["title"], "artist": deck.info["artist"],
                                     "thumbnail": deck.info["thumbnail"], "at": time.time()})
+            if deck.info.get("title"):
+                self.played.add(str(deck.info["title"]).lower())
             del self.history[30:]
         logger.info("DJ %s: deck %s loaded %r (%s bpm, %s)", self.key, deck_name,
                     item.get("title"), meta.get("bpm"), meta.get("camelot"))
@@ -1944,7 +2083,7 @@ class DJSession:
                     tr.style, tr.label = "blend", STYLES["blend"][0]
 
     def set_ai(self, on):
-        """The experimental AI switch: Real DJ uses the offline analysis (sound similarity, Gemini exits, entries,
+        """The AI switch (beta, on by default): Real DJ uses the offline analysis (sound similarity, Gemini exits, entries,
         hooks and effect moves) while it is on, and behaves exactly as before while it is off."""
         self.ai = bool(on)
         for deck in self.engine.decks.values():
@@ -2038,8 +2177,89 @@ class DJSession:
         task = self.load_tasks.get(deck_name)
         return bool(task and not task.done())
 
+    def set_station(self, station):
+        """Play to a mood station (stations.STATIONS id), or to none. The set takes the station's vibe, and autoplay
+        brings the station's songs at once rather than when the queue runs low."""
+        station = station if station in stations.STATIONS else None
+        if station == self.station:
+            return
+        self.station = station
+        self.refilled_at = -math.inf
+        self.station_fresh = True
+        if station:
+            s = stations.STATIONS[station]
+            self.vibe = s["vibe"]
+            if self.real:
+                self.real.vibe = self.vibe
+                self.real.plan_for = None        # plan the next mix again, for the new mood
+            self.notice = f"{s['emoji']} {s['label']}: the next songs are picked for the mood"
+        else:
+            self.notice = "Any mood: the queue and the whole library again"
+        logger.info("DJ %s: station %s", self.key, station or "none")
+
+    async def refill_crate(self):
+        """Autoplay: top the room's queue up with songs from the library (refill), at most once in REFILL_EVERY_S.
+        Returns how many were added; they reach the crate a moment later, with the hub's next queue update."""
+        if self.kind != "huddle" or not (self.autoplay or self.station) or refill is None:
+            return 0
+        now = time.monotonic()
+        if self.refilling or now - self.refilled_at < REFILL_EVERY_S:
+            return 0             # one at a time: a mood picked mid-refill is read when that refill picks its songs
+        self.refilled_at = now
+        self.refilling = True
+        try:
+            count = await refill(self)
+        except Exception:
+            logger.warning("DJ %s: could not top the queue up from the library", self.key, exc_info=True)
+            return 0
+        finally:
+            self.refilling = False
+        if count:
+            self.notice = f"Autoplay: {count} songs from the library to keep the night going"
+            logger.info("DJ %s: the queue ran low; %d songs from the library added", self.key, count)
+        return count
+
+    async def _force_play_next(self):
+        """/playnext is forced. Both modes load the next song on the other deck seconds into the current one, so a
+        request made after that would wait a whole song: while that deck is only cued (not playing, no mix under
+        way), the request takes its place and the song it bumps goes back to the front of the queue. Once a mix is
+        audible the request comes right after it (pick_next / the queue's front)."""
+        engine = self.engine
+        with engine.lock:
+            playing = [d for d in engine.decks.values() if d.playing]
+            if not playing or engine.transition:
+                return
+            m = engine.master() or playing[0]
+            other = engine.decks["B" if m.name == "A" else "A"]
+            cued = other.loaded and not other.ended and not other.playing
+            info = dict(other.info or {})
+        if not cued or self._loading(other.name) or info.get("next"):
+            return
+        items = self.crate.items()
+        index = next((i for i, item in enumerate(items) if item.get("next")), None)
+        if index is None:
+            return
+        item = await self.crate.take(index)
+        if not item:
+            return
+        put_back = getattr(self.crate, "put_back", None)
+        if put_back and (info.get("hub_track") or info.get("song")):
+            try:
+                await put_back(info)
+            except Exception:
+                logger.warning("DJ %s: could not put %r back in the queue", self.key, info.get("title"), exc_info=True)
+        if self.real is not None:
+            self.real.next_title = item.get("title")
+            self.real.plan_for = None            # plan the mix again, into the requested song
+        self.notice = f"Play next: {item.get('title') or 'your song'}"
+        logger.info("DJ %s: play next %r instead of %r", self.key, item.get("title"), info.get("title"))
+        self.load_in_background(other.name, item)
+
     async def _next_item(self):
         item = await self.crate.take(0)
+        if not item and self.kind == "huddle":
+            await self.refill_crate()        # the next tick finds them
+            return None
         if item or self.kind != "discord":
             return item
         # Empty crate on Discord: fall back to Smart Autoplay's pick.
@@ -2064,10 +2284,14 @@ class DJSession:
             deck = next((d for d in decks if d.loaded and d.playing and self._audible(d)), None)
             if not deck:
                 return None            # _report keeps the last song, stopped
+            # The key, for Hoffle's karaoke tuner: the decks play like vinyl, so a tempo-matched song is bent
+            # off its key by its pitch fader.
             return {"id": f"dj:{deck.name}:{deck.wave_id}", "title": deck.info.get("title") or "",
                     "artist": deck.info.get("artist") or "", "thumbnail": deck.info.get("thumbnail"),
                     "duration": round(deck.duration, 2), "positionMs": round(deck.seconds * 1000),
-                    "paused": not deck.playing}
+                    "paused": not deck.playing, "key": (deck.meta or {}).get("camelot"),
+                    "keyShift": round(12 * math.log2(max(0.5, deck.base_rate())), 1),
+                    "karaoke": bool(deck.karaoke)}
 
     async def _report(self):
         """Tell the room what is on air, when it changes or its clock drifts."""
@@ -2115,6 +2339,8 @@ class DJSession:
                 "key": m.meta.get("camelot") if m is not None and m.loaded else None,
                 "paused": self.paused,
                 "crowd": self.crowd.info() if self.crowd else None,
+                "loop": next(({"part": v.part, "title": v.title, "id": v.loop_id} for v in engine.loops if v.level > 0.05), None),
+                "station": self.station,
             }
         if not upcoming and self.mode != "real":
             # Auto DJ plays the queue in order: its next song is the queue's first.
@@ -2152,6 +2378,10 @@ class DJSession:
             return
         if not self.auto or not self.live:
             return
+        if self.station_fresh:
+            self.station_fresh = False
+            await self.refill_crate()        # a new mood: its songs now, so the very next pick can be one
+        await self._force_play_next()
         if self.mode == "real":
             if self.real is None:
                 self.real = realdj.RealDJ(self, vibe=self.vibe)
@@ -2241,6 +2471,18 @@ class DJSession:
         if op == "club_move":
             self.notice = club.perform(self, str(body.get("move") or ""))
             return
+        if op == "club_loop":
+            # The club's loop pads: another song's guitar, piano, bass or drums over this one for eight bars.
+            self.notice = await club.borrow(self, str(body.get("part") or ""))
+            return
+        if op == "loop_vote":
+            import loops
+            try:
+                loops.vote(str(body.get("id") or ""), body.get("vote"))
+            except LookupError:
+                raise ValueError("That loop isn't in the crate any more.")
+            self.notice = "That loop won't be played again." if body.get("vote") == "down" else "Thanks!"
+            return
         if self.paused and op in ("play", "cue", "mix", "scratch", "brake"):
             self.resume()                  # a hand on the decks picks the set back up
         if op in ("load", "load_next"):
@@ -2289,6 +2531,10 @@ class DJSession:
                 self.three = bool(body["three"])
                 if self.real:
                     self.real.three = self.three
+            if "autoplay" in body:
+                self.autoplay = bool(body["autoplay"])
+            if "station" in body:
+                self.set_station(body["station"])
             if "ai" in body:
                 self.set_ai(bool(body["ai"]))
             if "on" in body:
@@ -2570,7 +2816,8 @@ class DJSession:
             "kind": self.kind,
             "live": self.live,
             "auto": {"on": self.auto, "style": self.auto_style, "beats": self.auto_beats,
-                     "mode": self.mode, "vibe": self.vibe, "three": self.three, "ai": self.ai,
+                     "mode": self.mode, "vibe": self.vibe, "three": self.three, "ai": self.ai, "autoplay": self.autoplay,
+                     "station": self.station, "stations": stations.catalog(),
                      "real": self.real.state() if self.real else None},
             "stems": {"on": self.stems_on, "available": stems.enabled()},
             "paused": self.paused,
@@ -2694,7 +2941,8 @@ class DJSession:
                                "position": round(d.seconds, 2),
                                "playing": bool(playing and name == on_air)}
         snap = {"kind": self.kind, "auto": self.auto, "mode": self.mode, "vibe": self.vibe,
-                "three": self.three, "ai": self.ai, "stems": self.stems_on, "paused": self.paused,
+                "three": self.three, "ai": self.ai, "ai_v": AI_DEFAULT_V, "stems": self.stems_on, "paused": self.paused,
+                "autoplay": self.autoplay, "played": sorted(self.played)[-300:], "station": self.station,
                 "decks": decks, "on_air": on_air if on_air in decks else None, "saved_at": time.time()}
         if self.kind == "huddle":
             import huddle
@@ -2733,7 +2981,11 @@ class DJSession:
         if snap.get("vibe") in realdj.VIBES:
             self.vibe = snap["vibe"]
         self.three = bool(snap.get("three"))
-        self.set_ai(bool(snap.get("ai")))
+        self.autoplay = bool(snap.get("autoplay", True))
+        self.station = snap.get("station") if snap.get("station") in stations.STATIONS else None
+        self.played.update(str(t) for t in snap.get("played") or [] if t)
+        # Sets saved before AI became the default (no ai_v) stored "off" only because it was; they get it on too.
+        self.set_ai(bool(snap.get("ai")) if snap.get("ai_v") == AI_DEFAULT_V else True)
         self.auto = bool(snap.get("auto", True))
         if snap.get("stems") is not None and bool(snap["stems"]) != self.stems_on:
             self.set_stems(bool(snap["stems"]))

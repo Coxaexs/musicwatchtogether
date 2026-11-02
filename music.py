@@ -29,6 +29,7 @@ from urllib.parse import quote
 import config
 import dj
 import mixer
+import stations
 import stems
 from storage import SQLiteDocumentStore, load_json, save_json, share_with_group
 
@@ -2158,6 +2159,8 @@ class MusicPlayer:
         self.web_playlist_started_at: float = 0.0
         self._suppress_after = False  # Set during /seek so after_playing doesn't advance the queue
         self.autoplay = False  # Keep playing related music when the queue runs out
+        self.radio = None  # A mood radio station (stations.py id): autoplay then plays its songs, forever
+        self.autoplay_before_radio = False  # what autoplay goes back to when the radio stops
         # When enabled, Smart Autoplay changes to a related artist after three
         # consecutive tracks by the same artist. This is a persistent,
         # per-server preference managed by MusicCog.
@@ -3399,6 +3402,8 @@ class MusicCog(commands.Cog):
             'loop': player.loop,
             'loop_queue': player.loop_queue,
             'autoplay': player.autoplay,
+            'radio': player.radio,
+            'autoplay_before_radio': player.autoplay_before_radio,
             'artist_diversity': player.artist_diversity,
             'vibe_match': player.vibe_match,
             'audio_filter': player.audio_filter,
@@ -3421,6 +3426,8 @@ class MusicCog(commands.Cog):
             player.loop = bool(settings.get('loop', False))
             player.loop_queue = bool(settings.get('loop_queue', False))
             player.autoplay = bool(settings.get('autoplay', False))
+            player.radio = settings.get('radio') if player.autoplay and settings.get('radio') in stations.STATIONS else None
+            player.autoplay_before_radio = bool(settings.get('autoplay_before_radio', False))
             player.artist_diversity = bool(settings.get('artist_diversity', True))
             player.vibe_match = bool(settings.get('vibe_match', True))
             audio_filter = settings.get('audio_filter')
@@ -3762,8 +3769,51 @@ class MusicCog(commands.Cog):
         )
         return song
 
+    def set_radio(self, player: MusicPlayer, station: Optional[str]):
+        """Turn a mood radio on (a stations.STATIONS id) or off (None). It rides Smart Autoplay: on, autoplay is on
+        and every pick comes from the station; off, autoplay goes back to what it was before."""
+        station = station if station in stations.STATIONS else None
+        if station and not player.radio:
+            player.autoplay_before_radio = player.autoplay
+        elif not station and player.radio:
+            player.autoplay = player.autoplay_before_radio
+        player.radio = station
+        if station:
+            player.autoplay = True
+        player._autoplay_candidate = None   # a pick prepared for the old mood
+        player._autoplay_candidate_for_key = None
+        if player.autoplay:
+            player.schedule_autoplay_prefetch()
+        else:
+            player.cancel_autoplay_prefetch()
+        self.save_player_settings(player)
+
+    async def _radio_song(self, player: MusicPlayer) -> Optional[Song]:
+        """The next song of the player's mood radio: the next of this server's shuffled lap through the station
+        (stations.radio_next), skipping what it heard lately or disliked, looked up so it has its length and art.
+        A few tries, in case a video is gone."""
+        heard = ([player.current] if player.current else []) + list(player.queue) + list(player.long_history)
+        recent = [value for song in heard for value in (song.url, song.title)]
+        disliked_urls, _titles, _artists = self._dislike_index(player.guild.id)
+        for _ in range(3):
+            pick = await asyncio.to_thread(stations.radio_next, player.guild.id, player.radio, recent, disliked_urls)
+            if not pick:
+                return None
+            vid, _title = pick
+            song = await self.process_youtube(f"https://www.youtube.com/watch?v={vid}", player.guild.me)
+            if song:
+                song.autoplay = True
+                song.autoplay_reason = f"📻 {stations.label(player.radio)} radio"
+                return song
+            recent.insert(0, vid)
+        return None
+
     async def pick_autoplay_recommendation(self, player: MusicPlayer) -> Optional[Song]:
         """Rank local and catalogue candidates in one explainable pool."""
+        if getattr(player, 'radio', None):
+            song = await self._radio_song(player)
+            if song:
+                return song
         seed = player.current or (player.history[0] if player.history else None)
         artist = self._song_artist(seed)
         if not artist:
@@ -4358,6 +4408,7 @@ class MusicCog(commands.Cog):
                 return
 
             for song in reversed(songs_added):
+                song.play_next = True       # the DJ booth plays it next too, not when it fits (dj.py)
                 player.queue.appendleft(song)
 
             vc = interaction.guild.voice_client
@@ -6152,6 +6203,8 @@ class MusicCog(commands.Cog):
     async def autoplay(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild)
         player.autoplay = not player.autoplay
+        if not player.autoplay:
+            player.radio = None
         self.save_player_settings(player)
 
         if not player.autoplay:
@@ -6170,6 +6223,36 @@ class MusicCog(commands.Cog):
         vc = interaction.guild.voice_client
         if vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused() and not player.queue:
             player.last_message_channel = interaction.channel
+            await player.play_next()
+
+    @app_commands.command(name="radio", description="A mood radio: endless songs from the library that fit a mood")
+    @app_commands.describe(mood="The mood to play forever, or Off")
+    @app_commands.choices(mood=[
+        *(app_commands.Choice(name=f"{s['emoji']} {s['label']}", value=sid) for sid, s in stations.STATIONS.items()),
+        app_commands.Choice(name="Off", value="off"),
+    ])
+    async def radio(self, interaction: discord.Interaction, mood: str):
+        player = self.get_player(interaction.guild)
+        if mood == 'off':
+            was = player.radio
+            self.set_radio(player, None)
+            await interaction.response.send_message(
+                f"📻 {stations.label(was)} radio is **off**." if was else "📻 No radio was on.")
+            return
+        count = next((s['songs'] for s in stations.catalog() if s['id'] == mood), 0)
+        if not count:
+            await interaction.response.send_message("❌ That station has no songs yet.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        if not await self.ensure_voice(interaction):
+            return
+        player.last_message_channel = interaction.channel
+        self.set_radio(player, mood)
+        await interaction.followup.send(
+            f"📻 **{stations.label(mood)} radio** is on: {count} songs that fit the mood, picked one by one "
+            f"when the queue runs out, no repeats until it has played them all. `/radio Off` stops it.")
+        vc = interaction.guild.voice_client
+        if vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused() and not player.queue:
             await player.play_next()
 
     def _settings_embed(self, player: MusicPlayer, notices: Optional[list[str]] = None,
@@ -6326,6 +6409,8 @@ class MusicCog(commands.Cog):
 
         if autoplay is not None:
             player.autoplay = autoplay
+            if not autoplay:
+                player.radio = None
             if autoplay:
                 player.schedule_autoplay_prefetch()
             else:

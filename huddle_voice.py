@@ -10,12 +10,15 @@ import gc
 from fractions import Fraction
 import json
 import logging
+import os
+import socket
 import sys
 import time
 from types import SimpleNamespace
 from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
+import aioice.ice
 import numpy as np
 from av import AudioFrame
 import aiortc.codecs
@@ -32,6 +35,7 @@ import club
 import config
 import dj
 import huddle
+import melody
 import mixer
 from loop_watchdog import LoopWatchdog
 import stems
@@ -90,6 +94,36 @@ aiortc.codecs.CODECS["audio"][0].parameters.update(
         "maxaveragebitrate": OPUS_BITRATE,
     }
 )
+
+
+def _main_address() -> str | None:
+    """The address this machine reaches the internet from (no packet is sent)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("1.1.1.1", 9))
+            return probe.getsockname()[0]
+    except OSError:
+        return None
+
+
+_all_host_addresses = aioice.ice.get_host_addresses
+
+
+def _host_addresses(use_ipv4: bool, use_ipv6: bool) -> list[str]:
+    """Offer callers only the address they can reach this bot on.
+
+    aioice offers every interface by default: Docker bridges, Tailscale and
+    WireGuard included. That tells everyone in a call how this server's network
+    is laid out, and their relay then tries (and refuses) each of them.
+    HUDDLE_BOT_ICE_ADDRESS picks the address; otherwise the default route's.
+    """
+    addresses = _all_host_addresses(use_ipv4, use_ipv6)
+    main = os.environ.get("HUDDLE_BOT_ICE_ADDRESS") or _main_address()
+    return [main] if main in addresses else addresses
+
+
+# aioice resolves this module global each time it gathers candidates.
+aioice.ice.get_host_addresses = _host_addresses
 
 
 def _api_url(path: str) -> str:
@@ -431,6 +465,7 @@ class RoomPublisher:
         self.mix_task = None
         self.last_player = None
         self.karaoke_tasks = {}          # track id -> instrumental prep task
+        self.sung_for = {}               # track id -> what the room was told of it ("key", "melody")
         # The club's lights while the ordinary player plays (the booth has its own).
         self.lights = club.Feed()
         self.source.light = self.lights
@@ -474,6 +509,7 @@ class RoomPublisher:
         self.lights.info = {"mode": "player", "next": upcoming.get("title") or None, "mix": self.source.mix_info}
         settings = huddle.settings_for(self.channel_id)
         settings_key = tuple(sorted(settings.items()))
+        self._sing_along(track, bool(settings.get("karaoke_mode") or settings.get("audio_filter") == "karaoke"))
         url = str(track.get("audioUrl") or "")
         instrumental = self._karaoke(player, settings)
         if instrumental:
@@ -565,9 +601,67 @@ class RoomPublisher:
             logger.warning("Karaoke: could not split %r: %s", track.get("title"), error)
             return
         player = self.last_player or {}
+        # The stems are there now, so the melody can be read off them.
+        self.sung_for.get(track.get("id"), set()).discard("melody")
         if (player.get("track") or {}).get("id") == track.get("id") and self.source.dj is None:
             self.state_key = None            # re-sync onto the instrumental
             await self.update(player)
+
+    # ---------------------------------------------------------- singing along
+
+    def _sing_along(self, track: dict, karaoke: bool = False):
+        """Tell the room the song's key and melody, for Hoffle's singing voice,
+        and whether the room is in karaoke mode (a singer may then send the
+        song in time with their voice; see Hoffle's useVoice).
+
+        The key comes from AutoMix's analysis, the melody from the vocal stem
+        (melody.py), so only songs analysed or split have them. Each is sent
+        once per track, as a patch to it (the hub's "resolve").
+        """
+        track_id = track.get("id")
+        if not track_id or not track.get("audioUrl"):
+            return
+        told = self.sung_for.setdefault(track_id, set())
+        if len(self.sung_for) > 50:
+            for old in list(self.sung_for)[:25]:
+                if old != track_id:
+                    self.sung_for.pop(old, None)
+        patch = {}
+        camelot = (self.source.analysis or {}).get("camelot")
+        if camelot and not track.get("key") and "key" not in told:
+            told.add("key")
+            patch["key"] = camelot
+        mode = "karaoke:on" if karaoke else "karaoke:off"
+        if bool(track.get("karaoke")) != karaoke and mode not in told:
+            told.discard("karaoke:off" if karaoke else "karaoke:on")
+            told.add(mode)
+            patch["karaoke"] = karaoke
+        if patch:
+            asyncio.create_task(self._tell_track(track_id, patch))
+        if not track.get("melody") and "melody" not in told:
+            told.add("melody")
+            asyncio.create_task(self._send_melody(track))
+
+    async def _send_melody(self, track: dict):
+        digest = stems.lookup(_mix_keys(track))
+        if not digest:
+            # No stems yet; karaoke mode splits the song, and _prepare_karaoke asks again.
+            return
+        notes = await asyncio.to_thread(melody.melody, digest)
+        if notes:
+            await self._tell_track(track["id"], {"melody": notes})
+
+    async def _tell_track(self, track_id: str, patch: dict):
+        player = self.last_player or {}
+        if (player.get("track") or {}).get("id") != track_id:
+            return                           # moved on already
+        try:
+            await huddle._request("POST", "/api/bot/player", {
+                "channelId": self.channel_id,
+                "action": {"name": "resolve", "trackId": track_id, "track": patch},
+            })
+        except Exception as error:
+            logger.debug("Could not tell room %s about %s: %s", self.channel_id, track_id, error)
 
     # ---------------------------------------------------------------- mixing
 
@@ -1051,8 +1145,12 @@ class HuddleVoiceManager:
             huddle.record_play(channel_id, track)
 
         settings = huddle.settings_for(channel_id)
-        if not settings.get("autoplay") or player.get("queue"):
+        radio = settings.get("radio")
+        if not (settings.get("autoplay") or radio) or player.get("queue"):
             return
+        session = dj.sessions.get(huddle.PREFIX + channel_id) if radio else None
+        if session and session.live:
+            return  # the booth picks its own songs (its own mood stations)
         duration = float(track.get("duration") or 0)
         if not duration:
             return
@@ -1068,8 +1166,17 @@ class HuddleVoiceManager:
         if existing and not existing.done():
             return
         self.autoplay_tasks[channel_id] = asyncio.create_task(
-            self._queue_autoplay(channel_id, track)
+            self._queue_radio(channel_id, player) if radio else self._queue_autoplay(channel_id, track)
         )
+
+    async def _queue_radio(self, channel_id: str, player: dict):
+        """The room's mood radio (huddle.radio_next) wins over Smart Autoplay: one more song from its station."""
+        try:
+            await huddle.radio_next(huddle.PREFIX + channel_id, player)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("Huddle radio failed for %s: %s", channel_id, error)
 
     async def _queue_autoplay(self, channel_id: str, track: dict):
         if not self.cog or not self.song_class:

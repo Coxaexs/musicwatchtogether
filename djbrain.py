@@ -66,6 +66,7 @@ def reload():
     with _lock:
         _state.update(tried=False, songs=None, index=None, emb=None)
         _plans.update(tried=False, songs={}, mtime=None, checked=0.0)
+        _structure.update(songs={}, mtime=None, checked=0.0)
 
 
 def _load_plans():
@@ -207,3 +208,120 @@ def vibe_bonus(sim, weight=0.35):
     if sim is None:
         return 0.0
     return -max(-2.0, min(2.0, (sim - SIM_MEDIAN) / SIM_SPREAD)) * weight
+
+
+# --------------------------------------------------------------------------
+# For the club's lights: a song's sections by name, and its mood
+# --------------------------------------------------------------------------
+
+_structure = {"songs": {}, "mtime": None, "checked": 0.0}
+#: The structure model's labels (all-in-one), as the club's section names.
+_STRUCTURE_LABELS = {"intro": "intro", "verse": "verse", "chorus": "chorus", "bridge": "bridge", "break": "break",
+                     "inst": "instrumental", "solo": "solo", "outro": "outro"}
+
+
+def _load_structure():
+    """structure.json: each song's sections and downbeats from the Colab structure run (export_structure.py)."""
+    with _lock:
+        path = os.path.join(BRAIN_DIR, "structure.json")
+        now = time.monotonic()
+        if now - _structure["checked"] < PLANS_RECHECK and _structure["mtime"] is not None:
+            return bool(_structure["songs"])
+        _structure["checked"] = now
+        if os.environ.get("DJ_BRAIN", "1") == "0":
+            return False
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            _structure.update(songs={}, mtime=None)
+            return False
+        if mtime != _structure["mtime"]:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    _structure["songs"] = json.load(f).get("songs") or {}
+                logger.info("Song structure loaded: %d songs", len(_structure["songs"]))
+            except Exception:
+                logger.warning("structure.json could not be read", exc_info=True)
+                _structure["songs"] = {}
+            _structure["mtime"] = mtime
+        return bool(_structure["songs"])
+
+
+def structure(keys):
+    """A song's structure from the structure model: {"segments": [[start, end, label]], "downbeats": [seconds]}, or None."""
+    try:
+        if not _load_structure():
+            return None
+        return _structure["songs"].get(song_id(keys))
+    except Exception:
+        return None
+
+
+def sections(keys):
+    """A song's sections by name, each start in seconds: [{label, at, energy 0..10 or None}], or [].
+
+    From the structure model when it analysed the song (exact boundaries), else Gemini's notes (snapped to our grid).
+    """
+    found = structure(keys)
+    if found and len(found.get("segments") or []) >= 3:
+        out = []
+        for start, _end, label in found["segments"]:
+            name = _STRUCTURE_LABELS.get(str(label))
+            if name and isinstance(start, (int, float)):
+                out.append({"label": name, "at": float(start), "energy": None})
+        if len(out) >= 3:
+            return out
+    found = plan(keys)
+    return list(found.get("sections") or []) if found else []
+
+
+def downbeats(keys):
+    """Where a song's bars start (seconds), from the structure model, or []."""
+    found = structure(keys)
+    return [float(x) for x in (found or {}).get("downbeats") or [] if isinstance(x, (int, float))]
+
+
+#: Mood words (Gemini's) and the light palette each leans to: fierce (hot reds), blue (cold blues),
+#: bright (gold, pink, cyan), warm (amber, rose), dreamy (violet, teal).
+MOOD_WORDS = {
+    "fierce": ("aggressive", "intense", "rebellious", "angry", "dark", "defiant", "raw", "gritty", "menacing", "heavy",
+               "angsty", "furious", "edgy", "powerful", "dramatic", "fierce", "chaotic", "tense"),
+    "blue": ("melancholic", "melancholy", "sad", "reflective", "introspective", "yearning", "lonely", "somber", "mournful",
+             "bittersweet", "nostalgic", "longing", "haunting", "wistful", "heartbroken", "emotional", "brooding"),
+    "bright": ("energetic", "upbeat", "uplifting", "euphoric", "joyful", "playful", "danceable", "fun", "happy", "anthemic",
+               "confident", "groovy", "celebratory", "triumphant", "cheerful", "catchy", "carefree", "empowering", "driving",
+               "driven", "determined", "bouncy", "summery"),
+    "warm": ("romantic", "sentimental", "warm", "intimate", "tender", "soulful", "passionate", "hopeful", "loving", "gentle",
+             "sweet", "heartfelt", "sensual", "cozy"),
+    "dreamy": ("dreamy", "atmospheric", "ethereal", "hypnotic", "psychedelic", "relaxed", "chill", "calm", "mellow", "spacey",
+               "mysterious", "serene", "peaceful", "lush", "floaty", "ambient"),
+}
+_SAD = {"melancholic", "melancholy", "dark", "sad", "yearning", "angsty", "bittersweet", "brooding", "heartbroken"}
+_HARD = {"energetic", "driving", "intense", "aggressive", "powerful", "anthemic", "driven"}
+
+
+def mood_name(words):
+    """The palette a song's mood words lean to (the first word counts most), or None. Hard and sad together (an
+    angry chorus about heartbreak) is fierce."""
+    words = [str(w).strip().lower() for w in words or () if w]
+    if set(words) & _SAD and set(words) & _HARD:
+        return "fierce"
+    score = {}
+    for weight, word in zip((1.0, 0.7, 0.5), words):
+        for name, group in MOOD_WORDS.items():
+            if word in group:
+                score[name] = score.get(name, 0.0) + weight
+    if not score:
+        return None
+    best = max(score.values())
+    winners = [name for name, value in score.items() if value == best]
+    return winners[0] if len(winners) == 1 else None
+
+
+def mood(keys):
+    """A song's mood for the lights: {"words": up to three of Gemini's, "name": mood_name(...)}, or None."""
+    found = plan(keys)
+    if not found or not found.get("moods"):
+        return None
+    words = [str(w).strip().lower() for w in found["moods"][:3] if w]
+    return {"words": words, "name": mood_name(words)}
