@@ -481,12 +481,16 @@ class RoomPublisher:
             self.mix_key = None
             self.source.dj = session.engine
             logger.info("DJ booth is live in Huddle room %s", self.channel_id)
-        # Someone pressed play on the room player: pause it again, or the
-        # hub would advance through the DJ's queue on its own.
+        # Someone pressed play on the room player. The booth has the room, so
+        # that play is for the booth: a paused set carries on. The room's own
+        # player is parked again, or the hub would run through the DJ's queue.
         if player.get("track") and not player.get("paused"):
             now = time.monotonic()
             if now - getattr(self, "_dj_paused_at", 0) > 3:
                 self._dj_paused_at = now
+                if getattr(session, "paused", False):
+                    session.resume()
+                    logger.info("Play pressed in Huddle room %s: the paused DJ set carries on", self.channel_id)
                 asyncio.create_task(session.pause_hub())
 
     async def update(self, player: dict):

@@ -151,6 +151,24 @@ class ResumeTests(unittest.TestCase):
         fresh.resume()
         self.assertTrue(fresh.engine.decks["A"].playing)
 
+    def test_a_set_back_paused_still_tells_the_room_it_has_it(self):
+        old, engine, a, b = self.on_air()
+        old.pause()
+        fresh = dj.DJSession("t5", "test", routines.Crate([]))
+        asyncio.run(fresh.restore(old.snapshot()))
+        sent = []
+
+        async def report(info):
+            sent.append(info)
+        fresh.report_on_air = report
+        fresh.live = True
+        asyncio.run(fresh._report())
+        # Its song, stopped: not "nothing on air", which handed the room back
+        # to its own player while the booth kept pausing that player.
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0] and sent[0]["paused"])
+        self.assertTrue(sent[0]["id"].startswith("dj:A:"))
+
     # ---- the state file ----
 
     def test_state_is_saved_kept_on_shutdown_and_forgotten_on_stop(self):
@@ -177,3 +195,31 @@ class ResumeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoomPlayPressTests(unittest.IsolatedAsyncioTestCase):
+    """Play pressed on a Hoffle room's own player while a DJ set has the room."""
+
+    async def test_play_carries_a_paused_set_on_and_parks_the_room_player(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        import huddle_voice
+        engine = object()
+        session = SimpleNamespace(engine=engine, paused=True, resume=mock.Mock(), pause_hub=mock.AsyncMock())
+        room = SimpleNamespace(source=SimpleNamespace(dj=engine), channel_id="room-1")
+        await huddle_voice.RoomPublisher._update_dj(room, session, {"track": {"id": "t"}, "paused": False})
+        await asyncio.sleep(0)
+        session.resume.assert_called_once()
+        session.pause_hub.assert_awaited_once()
+
+    async def test_a_playing_set_just_parks_the_room_player(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        import huddle_voice
+        engine = object()
+        session = SimpleNamespace(engine=engine, paused=False, resume=mock.Mock(), pause_hub=mock.AsyncMock())
+        room = SimpleNamespace(source=SimpleNamespace(dj=engine), channel_id="room-1")
+        await huddle_voice.RoomPublisher._update_dj(room, session, {"track": {"id": "t"}, "paused": False})
+        await asyncio.sleep(0)
+        session.resume.assert_not_called()
+        session.pause_hub.assert_awaited_once()

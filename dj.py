@@ -2284,20 +2284,34 @@ class DJSession:
             deck = next((d for d in decks if d.loaded and d.playing and self._audible(d)), None)
             if not deck:
                 return None            # _report keeps the last song, stopped
-            # The key, for Hoffle's karaoke tuner: the decks play like vinyl, so a tempo-matched song is bent
-            # off its key by its pitch fader.
-            return {"id": f"dj:{deck.name}:{deck.wave_id}", "title": deck.info.get("title") or "",
-                    "artist": deck.info.get("artist") or "", "thumbnail": deck.info.get("thumbnail"),
-                    "duration": round(deck.duration, 2), "positionMs": round(deck.seconds * 1000),
-                    "paused": not deck.playing, "key": (deck.meta or {}).get("camelot"),
-                    "keyShift": round(12 * math.log2(max(0.5, deck.base_rate())), 1),
-                    "karaoke": bool(deck.karaoke)}
+            return self._deck_on_air(deck)
+
+    def _deck_on_air(self, deck, paused=None):
+        """A deck as the room's on-air song (call with the engine's lock held)."""
+        # The key, for Hoffle's karaoke tuner: the decks play like vinyl, so a tempo-matched song is bent
+        # off its key by its pitch fader.
+        return {"id": f"dj:{deck.name}:{deck.wave_id}", "title": deck.info.get("title") or "",
+                "artist": deck.info.get("artist") or "", "thumbnail": deck.info.get("thumbnail"),
+                "duration": round(deck.duration, 2), "positionMs": round(deck.seconds * 1000),
+                "paused": (not deck.playing) if paused is None else paused,
+                "key": (deck.meta or {}).get("camelot"),
+                "keyShift": round(12 * math.log2(max(0.5, deck.base_rate())), 1),
+                "karaoke": bool(deck.karaoke)}
 
     async def _report(self):
         """Tell the room what is on air, when it changes or its clock drifts."""
         if not self.report_on_air or not self.live:
             return
         info = self.on_air()
+        if not info and not self.reported and self.paused:
+            # Back after a restart with the set paused: nothing is audible, but
+            # the booth still has the room. Say so (its song, stopped), or Hoffle
+            # hands play/pause back to the room's own player, which the booth
+            # then keeps pausing.
+            with self.engine.lock:
+                deck = self.engine.master()
+                if deck is not None and deck.loaded:
+                    info = self._deck_on_air(deck, paused=True)
         now = time.monotonic()
         last = self.reported
         if last:
