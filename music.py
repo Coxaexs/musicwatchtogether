@@ -3352,6 +3352,12 @@ class FakeInteraction:
         self.followup = FakeFollowup(ctx)
 
 
+#: A last title part that names a version, not a song ("Artist - Song - Live").
+LYRICS_VERSION_WORDS = re.compile(
+    r'\b(?:remix|mix|edit|version|cover|acoustic|akustik|remaster(?:ed)?|live|canl[ıi]|instrumental|karaoke|slowed|sped up)\b',
+    re.IGNORECASE)
+
+
 class MusicCog(commands.Cog):
     """Music commands cog"""
 
@@ -5227,16 +5233,23 @@ class MusicCog(commands.Cog):
         title = re.sub(r'\.(?:mp3|m4a|flac|ogg|opus|wav|webm|aac)$', '',
                        (query or '').strip(), flags=re.IGNORECASE)
         track, artist = self._lyrics_search_context(title, artist)
+        # The known artist opened the title ("Duman - Song - Album"): what is left starts with the song.
+        named_first = bool(artist) and track != self._clean_lyrics_query(title)
         track = re.sub(r'\s*[\[(][^\])]*[\])]', '', track).strip() or track
         feat = re.compile(r'\s+(?:ft\.?|feat\.?|featuring)\s+.*$', re.IGNORECASE)
-        parts = [part.strip() for part in re.split(r'\s+[-–—|]\s+', track, maxsplit=1)]
-        if len(parts) == 2 and all(parts):
-            left, right = (feat.sub('', part).strip() or part for part in parts)
-            if artist and self._lyrics_artist_matches(artist, right) \
-                    and not self._lyrics_artist_matches(artist, left):
-                track = left                    # "Song — Artist" (Spotify)
+        parts = [part.strip() for part in re.split(r'\s+[-–—|]\s+', track) if part.strip()]
+        if len(parts) >= 2:
+            parts = [feat.sub('', part).strip() or part for part in parts]
+            if named_first:
+                track = parts[0]
+            elif artist and self._lyrics_artist_matches(artist, parts[-1]) \
+                    and not self._lyrics_artist_matches(artist, parts[0]):
+                track = parts[0]                # "Song — Artist" (Spotify)
+            elif len(parts) >= 3 and not LYRICS_VERSION_WORDS.search(parts[-1]) and not (
+                    artist and self._lyrics_artist_matches(artist, parts[0])):
+                artist, track = parts[-2], parts[-1]   # "Channel - Artist - Song"
             else:
-                artist, track = left, right     # "Artist - Song"
+                artist, track = parts[0], parts[1]     # "Artist - Song"
         track = feat.sub('', track).strip(' -–—|') or track
         names = []
         for name in self._dedupe_artist_names(artist or ''):
@@ -5395,6 +5408,10 @@ class MusicCog(commands.Cog):
         if len(parts) == 2 and parts[0].strip() and parts[1].strip():
             left, right = parts[0].strip(), parts[1].strip()
             rungs.append((f'{left} {right}', right, left, False))
+            # "Channel - Artist - Song" (an uploader's name in front)
+            inner = [part.strip() for part in re.split(r'\s+[-–—|]\s+', right, maxsplit=1)]
+            if len(inner) == 2 and all(inner) and not LYRICS_VERSION_WORDS.search(inner[1]):
+                rungs.append((f'{inner[0]} - {inner[1]}', inner[1], inner[0], False))
             rungs.append((right, right, None, True))
         else:
             rungs.append((hard or track, hard or track, None, True))
@@ -5406,9 +5423,9 @@ class MusicCog(commands.Cog):
                 out.append(rung)
         return out
 
-    async def _lrclib_search(self, text: str) -> Optional[list]:
-        """lrclib search results; None when lrclib could not be reached."""
-        url = f"https://lrclib.net/api/search?q={quote(text)}"
+    async def _lrclib_get(self, lrclib_id: int) -> Optional[dict]:
+        """One lrclib entry by its id; None when it is gone or lrclib is unreachable."""
+        url = f"https://lrclib.net/api/get/{int(lrclib_id)}"
         timeout = aiohttp.ClientTimeout(total=12)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -5418,7 +5435,33 @@ class MusicCog(commands.Cog):
                     data = await resp.json()
         except Exception:
             return None
-        return data if isinstance(data, list) else []
+        return data if isinstance(data, dict) and data.get('id') else None
+
+    async def _lrclib_search(self, text: str) -> Optional[list]:
+        """lrclib search results; None when lrclib could not be reached.
+
+        lrclib answers 503 now and then, so it is asked twice. When it stays
+        down the time is noted (_lrclib_failed_at), so a lookup does not go on
+        to spend a Musixmatch request on a song lrclib may well have.
+        """
+        url = f"https://lrclib.net/api/search?q={quote(text)}"
+        timeout = aiohttp.ClientTimeout(total=12)
+        problem = None
+        for attempt in range(2):
+            if attempt:
+                await asyncio.sleep(0.8)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, headers={'User-Agent': 'MusicBot/1.0'}) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data if isinstance(data, list) else []
+                        problem = f'HTTP {resp.status}'
+            except Exception as error:
+                problem = repr(error)
+        self._lrclib_failed_at = time.time()
+        logger.warning("lrclib did not answer a search for %r (%s)", text, problem)
+        return None
 
     def _pick_lyrics_item(self, data: list, track: str, artist: Optional[str],
                           duration_seconds: Optional[int], loose: bool,

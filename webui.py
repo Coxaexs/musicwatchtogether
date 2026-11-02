@@ -41,7 +41,7 @@ import stems
 from music import Song, get_autocomplete_suggestions, state_store, ytdl_playlist
 from musixmatch import MusixmatchLyrics
 from security import SlidingWindowLimiter, client_identity
-from storage import save_bytes_atomic, save_json
+from storage import load_json, save_bytes_atomic, save_json
 
 logger = logging.getLogger('MusicBot.WebUI')
 
@@ -606,6 +606,15 @@ def station_entries(station, stemmed, taken=(), count=16, rng=None, heard=()):
     rng.shuffle(without)
     stale.sort(key=lambda x: x[:2])
     return (with_stems + without + [song for *_k, song in stale])[:count]
+
+
+#: Lyrics someone in Hoffle picked by hand ("Wrong lyrics?"), one folder per
+#: Hoffle server, so a pick only changes that server's lyrics.
+LYRICS_PICKS_DIR = os.path.join(DATA_DIR, 'lyrics_picks')
+
+
+def _pick_scope(value):
+    return re.sub(r'[^A-Za-z0-9_-]', '', str(value or ''))[:64] or 'all'
 
 
 def _lyrics_source(source, track, artist, lrclib_id=None):
@@ -2176,6 +2185,13 @@ class WebUI:
         cog = self.cog
         if not cog:
             return web.json_response({'track': None, 'lines': [], 'lyrics': None})
+        started = time.time()
+
+        # Someone in this Hoffle server picked the right lyrics by hand: those win.
+        if self._authorized_admin(request):
+            pick = self._lyrics_pick(cog, request.query.get('pick_scope'), query, artist)
+            if pick:
+                return web.json_response(self._picked_json(pick))
 
         # Musixmatch spends requests from a small monthly plan, so only Hoffle's
         # /lyricsnow for the song that is playing asks it (musixmatch=1), and
@@ -2224,6 +2240,11 @@ class WebUI:
                 **_lyrics_source('lrclib', synced.get('track'), synced.get('artist'), synced.get('lrclib_id')),
             })
 
+        if mxm and mode == '1' and float(getattr(cog, '_lrclib_failed_at', 0) or 0) >= started:
+            # lrclib did not answer just now: a Musixmatch request could be
+            # spent on a song lrclib has. Say so; asking again soon is free.
+            return web.json_response({'track': None, 'lines': [], 'lyrics': None,
+                                      'lrclib_down': True, 'musixmatch_checked': checked})
         if mxm and mode == '1':
             found = await mxm.lookup(*terms, duration)
             checked = True
@@ -2247,6 +2268,143 @@ class WebUI:
             'musixmatch_checked': checked,
             **_lyrics_source('lrclib', plain.get('track'), plain.get('artist'), plain.get('lrclib_id')),
         })
+
+    def _lyrics_pick_path(self, cog, scope, query, artist):
+        track, artist = cog._lyrics_search_context(query, artist)
+        name = os.path.basename(cog._get_lyrics_cache_path(track, artist))
+        return os.path.join(LYRICS_PICKS_DIR, _pick_scope(scope), name)
+
+    def _lyrics_pick(self, cog, scope, query, artist):
+        pick = load_json(self._lyrics_pick_path(cog, scope, query, artist), None, logger)
+        return pick if isinstance(pick, dict) and (pick.get('lines') or pick.get('lyrics')) else None
+
+    @staticmethod
+    def _picked_json(pick):
+        lines = pick.get('lines') or []
+        return {
+            'track': pick.get('track'),
+            'artist': pick.get('artist'),
+            'lines': lines,
+            'lyrics': None if lines else pick.get('lyrics'),
+            'synced': bool(lines),
+            'loose': False,
+            'picked': True,
+            **_lyrics_source('lrclib', pick.get('track'), pick.get('artist'), pick.get('lrclib_id')),
+        }
+
+    async def api_lyrics_candidates(self, request):
+        """Songs on lrclib that could be the one playing, with a few lines of
+        each, for Hoffle's "Wrong lyrics?" picker. lrclib is free; Musixmatch
+        is never asked here."""
+        if not self._authorized_admin(request):
+            return web.json_response({'error': 'admin password required'}, status=403)
+        cog = self.cog
+        if not cog:
+            return web.json_response({'error': 'The music bot is starting.'}, status=503)
+        title = (request.query.get('title') or '').strip()[:200]
+        artist = (request.query.get('artist') or '').strip()[:120] or None
+        text = (request.query.get('q') or '').strip()[:200]
+        if not text and title:
+            track, who = cog._musixmatch_terms(title, artist)
+            text = f'{who} {track}'.strip() if who else track
+        if not text:
+            return web.json_response({'query': '', 'candidates': []})
+        try:
+            duration = int(float(request.query.get('duration') or 0)) or None
+        except ValueError:
+            duration = None
+        data = await cog._lrclib_search(text)
+        if data is None:
+            return web.json_response({'error': 'lrclib could not be reached. Try again in a moment.'}, status=502)
+
+        def off_length(item):
+            try:
+                return bool(duration) and abs(float(item.get('duration') or 0) - duration) > 15
+            except (TypeError, ValueError):
+                return True
+
+        # lrclib's own order is its relevance; synced ones and ones about as
+        # long as the playing song come first.
+        ranked = sorted(data, key=lambda item: (not item.get('syncedLyrics'), off_length(item)))
+        candidates, seen = [], set()
+        for item in ranked:
+            if not isinstance(item, dict) or not item.get('id'):
+                continue
+            words = [text for _, text in cog._parse_synced_lyrics(item.get('syncedLyrics') or '')]
+            if not words:
+                words = [line.strip() for line in (item.get('plainLyrics') or '').splitlines()]
+            words = [line for line in words if line and line != '♪']
+            if not words:
+                continue
+            key = ((item.get('artistName') or '').casefold(), (item.get('trackName') or '').casefold(),
+                   words[0].casefold(), bool(item.get('syncedLyrics')))
+            if key in seen:      # the same lyrics uploaded again
+                continue
+            seen.add(key)
+            try:
+                length = int(float(item['duration'])) if item.get('duration') else None
+            except (TypeError, ValueError):
+                length = None
+            candidates.append({
+                'id': int(item['id']),
+                'track': item.get('trackName') or '',
+                'artist': cog._format_artist_display(item.get('artistName') or ''),
+                'album': item.get('albumName') or None,
+                'duration': length,
+                'synced': bool(item.get('syncedLyrics')),
+                'snippet': words[:3],
+                'url': f"https://lrclib.net/tracks/{int(item['id'])}",
+            })
+            if len(candidates) >= 5:
+                break
+        return web.json_response({'query': text, 'candidates': candidates})
+
+    async def api_lyrics_pick(self, request):
+        """Save (or with no lrclib_id, forget) the lyrics someone picked by hand
+        for a song in one Hoffle server."""
+        if not self._authorized_admin(request):
+            return web.json_response({'error': 'admin password required'}, status=403)
+        cog = self.cog
+        if not cog:
+            return web.json_response({'error': 'The music bot is starting.'}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        title = str(body.get('title') or '').strip()[:200]
+        artist = str(body.get('artist') or '').strip()[:120] or None
+        if not title:
+            return web.json_response({'error': 'Which song?'}, status=400)
+        path = self._lyrics_pick_path(cog, body.get('scope'), title, artist)
+        if not body.get('lrclib_id'):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            return web.json_response({'cleared': True})
+        try:
+            lrclib_id = int(body['lrclib_id'])
+        except (TypeError, ValueError):
+            return web.json_response({'error': 'Pick lyrics from the list.'}, status=400)
+        item = await cog._lrclib_get(lrclib_id)
+        if not item:
+            return web.json_response({'error': 'lrclib does not have those lyrics any more.'}, status=404)
+        lines = [list(line) for line in cog._parse_synced_lyrics(item.get('syncedLyrics') or '')]
+        plain = (item.get('plainLyrics') or re.sub(
+            r'^\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]\s*', '', item.get('syncedLyrics') or '', flags=re.MULTILINE)).strip()
+        if not lines and not plain:
+            return web.json_response({'error': 'Those lyrics are empty.'}, status=404)
+        pick = {
+            'track': item.get('trackName') or title,
+            'artist': cog._format_artist_display(item.get('artistName') or ''),
+            'lines': lines,
+            'lyrics': '' if lines else plain,
+            'lrclib_id': lrclib_id,
+            'picked_by': str(body.get('by') or '')[:80],
+            'picked_at': time.time(),
+        }
+        await asyncio.to_thread(save_json, path, pick, logger)
+        return web.json_response(self._picked_json(pick))
 
     async def api_huddle_search(self, request):
         """Several YouTube matches for Hoffle's music player search.
@@ -2786,6 +2944,8 @@ async def start_web_server(bot):
     asyncio.ensure_future(_warm_top_songs())
     app.router.add_get('/api/autocomplete', ui.api_autocomplete)
     app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
+    app.router.add_get('/api/lyrics/candidates', ui.api_lyrics_candidates)
+    app.router.add_post('/api/lyrics/pick', ui.api_lyrics_pick)
     app.router.add_get('/api/admin/musixmatch', ui.api_musixmatch_usage)
     app.router.add_get('/api/stems/status', ui.api_stems_status)
     app.router.add_get('/api/library/songs', ui.api_library_songs)

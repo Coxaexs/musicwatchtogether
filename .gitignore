@@ -21,6 +21,7 @@ venv/
 musics/
 lyrics/
 musixmatch/
+lyrics_picks/
 watch_cache/
 stems_cache/
 dj_settings.json
