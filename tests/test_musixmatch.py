@@ -232,10 +232,48 @@ class EndpointGateTests(unittest.IsolatedAsyncioTestCase):
         mxm.lookup.assert_not_awaited()
         self.assertNotIn("source", data)
 
+    async def test_the_music_player_reads_musixmatch_answers_without_asking(self):
+        ui, mxm = self.make_ui()
+        data = await self.ask(ui, "q=manifest+-+Zehir&musixmatch=cached")
+        mxm.cached.assert_called_once()
+        mxm.lookup.assert_not_awaited()
+        self.assertFalse(data["musixmatch_checked"])
+        mxm.cached.return_value = ({"track": "Zehir", "artist": "manifest", "lines": [[3.0, "z"]],
+                                    "lyrics": "", "source": "musixmatch"}, True)
+        data = await self.ask(ui, "q=manifest+-+Zehir&musixmatch=cached")
+        self.assertEqual(data["lines"], [[3.0, "z"]])
+        mxm.lookup.assert_not_awaited()
+
     def test_the_discord_lyrics_path_has_no_musixmatch_left(self):
         self.assertFalse(hasattr(MusicCog, "_fetch_musixmatch_lyrics"))
         import inspect
         self.assertNotIn("musixmatch", inspect.getsource(MusicCog._fetch_synced_lyrics).lower())
+
+
+
+class PlayerSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_lists_several_results_and_remembers_them(self):
+        import webui
+        ui = webui.WebUI(SimpleNamespace(get_cog=lambda name: None))
+        flat = {"entries": [
+            {"id": "abcdefghijk", "url": "https://www.youtube.com/watch?v=abcdefghijk",
+             "title": "Zehir", "channel": "manifest", "duration": 201.0},
+            None,
+            {"id": "lmnopqrstuv", "title": "Zehir (live)", "uploader": "fan", "duration": None},
+        ]}
+        fake = mock.Mock()
+        fake.extract_info.return_value = flat
+        with mock.patch.object(webui, "ytdl_playlist", fake):
+            first = json.loads((await ui.api_huddle_search(make_mocked_request("GET", "/api/huddle/search?q=zehir"))).text)
+            again = json.loads((await ui.api_huddle_search(make_mocked_request("GET", "/api/huddle/search?q=ZEHIR"))).text)
+        self.assertEqual(fake.extract_info.call_count, 1)
+        self.assertEqual(first, again)
+        self.assertEqual(first["results"][0], {
+            "title": "Zehir", "artist": "manifest", "duration": 201,
+            "thumbnail": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg",
+            "url": "https://www.youtube.com/watch?v=abcdefghijk"})
+        self.assertEqual(first["results"][1]["url"], "https://www.youtube.com/watch?v=lmnopqrstuv")
+        self.assertIsNone(first["results"][1]["duration"])
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@ import songlib
 import stations
 import stem_mixes
 import stems
-from music import Song, get_autocomplete_suggestions, state_store
+from music import Song, get_autocomplete_suggestions, state_store, ytdl_playlist
 from musixmatch import MusixmatchLyrics
 from security import SlidingWindowLimiter, client_identity
 from storage import save_bytes_atomic, save_json
@@ -675,6 +675,7 @@ class WebUI:
         self.lyrics_cache = {}
         self.playlist_lock = None
         self._musixmatch = None
+        self._search_cache = {}
 
     def _playlist_lock(self):
         if self.playlist_lock is None:
@@ -2153,14 +2154,17 @@ class WebUI:
             return web.json_response({'track': None, 'lines': [], 'lyrics': None})
 
         # Musixmatch spends requests from a small monthly plan, so only Hoffle's
-        # /lyricsnow for the song that is playing asks for it (musixmatch=1),
-        # and only Hoffle's master-password session may: dashboard invite
-        # links reach this endpoint too.
-        mxm = self.musixmatch() if (request.query.get('musixmatch') == '1'
+        # /lyricsnow for the song that is playing asks it (musixmatch=1), and
+        # only Hoffle's master-password session may: dashboard invite links
+        # reach this endpoint too. musixmatch=cached (Hoffle's music player)
+        # reads what Musixmatch already answered and never sends a request.
+        mode = request.query.get('musixmatch')
+        mxm = self.musixmatch() if (mode in ('1', 'cached')
                                     and self._authorized_admin(request)) else None
         terms = cog._musixmatch_terms(query, artist) if mxm else None
+        found, checked = None, False
         if mxm:
-            found, _known = mxm.cached(*terms, duration)
+            found, checked = mxm.cached(*terms, duration)
             if found and found['lines']:
                 return web.json_response(self._musixmatch_json(cog, terms, found))
 
@@ -2176,17 +2180,19 @@ class WebUI:
                 'loose': bool(synced.get('loose')),
             })
 
-        found = None
-        if mxm:
+        if mxm and mode == '1':
             found = await mxm.lookup(*terms, duration)
+            checked = True
             if found and found['lines']:
                 return web.json_response(self._musixmatch_json(cog, terms, found))
 
         plain = await cog._fetch_lyrics(query, artist, duration)
         if not plain and found and found.get('lyrics'):
-            return web.json_response(self._musixmatch_json(cog, terms, found))
+            return web.json_response(dict(self._musixmatch_json(cog, terms, found),
+                                          musixmatch_checked=checked))
         if not plain:
-            return web.json_response({'track': None, 'lines': [], 'lyrics': None})
+            return web.json_response({'track': None, 'lines': [], 'lyrics': None,
+                                      'musixmatch_checked': checked})
         return web.json_response({
             'track': plain.get('track'),
             'artist': plain.get('artist'),
@@ -2194,7 +2200,55 @@ class WebUI:
             'lyrics': plain.get('lyrics'),
             'synced': False,
             'loose': bool(plain.get('loose')),
+            'musixmatch_checked': checked,
         })
+
+    async def api_huddle_search(self, request):
+        """Several YouTube matches for Hoffle's music player search.
+
+        Titles only (a flat search, about a second): Hoffle plays the one that
+        is picked through /api/huddle/resolve, exactly like /play. Answers are
+        kept ten minutes, so going back to a search costs nothing.
+        """
+        query = re.sub(r'\s+', ' ', request.query.get('q') or '').strip()[:200]
+        if not query:
+            return web.json_response({'results': []})
+        key = query.casefold()
+        cached = self._search_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 600:
+            return web.json_response({'results': cached[1]})
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(
+                None, lambda: ytdl_playlist.extract_info(f'ytsearch10:{query}', download=False))
+        except Exception as error:
+            logger.warning('Hoffle player search failed for %r: %s', query, error)
+            return web.json_response(
+                {'error': 'Search failed. YouTube may be busy, try again in a moment.'}, status=502)
+        results = []
+        for entry in (data or {}).get('entries') or []:
+            if not entry:
+                continue
+            url = entry.get('webpage_url') or entry.get('url') or ''
+            if not str(url).startswith('http') and entry.get('id'):
+                url = f"https://www.youtube.com/watch?v={entry['id']}"
+            if not str(url).startswith('http'):
+                continue
+            try:
+                duration = int(float(entry.get('duration'))) if entry.get('duration') else None
+            except (TypeError, ValueError):
+                duration = None
+            results.append({
+                'title': entry.get('title') or 'Unknown',
+                'artist': entry.get('channel') or entry.get('uploader') or '',
+                'duration': duration,
+                'thumbnail': _thumbnail_from_url(url),
+                'url': url,
+            })
+        if len(self._search_cache) > 200:
+            self._search_cache.clear()
+        self._search_cache[key] = (time.monotonic(), results)
+        return web.json_response({'results': results})
 
     def musixmatch(self):
         if self._musixmatch is None:
@@ -2665,6 +2719,7 @@ async def start_web_server(bot):
     app.router.add_post('/api/guilds/{guild_id}/stems', ui.api_split_stems)
     app.router.add_post('/api/guilds/{guild_id}/play', ui.api_play)
     app.router.add_post('/api/huddle/resolve', ui.api_huddle_resolve)
+    app.router.add_get('/api/huddle/search', ui.api_huddle_search)
     app.router.add_get('/api/guilds/{guild_id}/lyrics', ui.api_lyrics)
     app.router.add_get('/api/guilds/{guild_id}/playlists', ui.api_playlists)
     app.router.add_post('/api/guilds/{guild_id}/playlists', ui.api_playlist_action)
