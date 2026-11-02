@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Reels Together</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/watch/static/together.css">
+<link rel="stylesheet" href="/watch/static/reels.css">
+</head>
+<body>
+<div class="rapp" id="rapp">
+  <div class="backdrop" id="backdrop"></div>
+  <div class="frame" id="frame">
+    <div class="track" id="track"></div>
+    <div class="reactions" id="reactions"></div>
+    <div class="hearts" id="hearts"></div>
+    <div class="topbar">
+      <span id="people"></span>
+      <span class="spacer"></span>
+      <button class="pill" id="autoBtn" type="button"></button>
+    </div>
+    <div class="info" id="info">
+      <div class="creator" id="creator"></div>
+      <div class="title" id="title"></div>
+      <div class="why" id="why"></div>
+      <div class="likers" id="likers"></div>
+    </div>
+    <div class="progress"><i id="progress"></i></div>
+    <div class="cover hidden" id="loading">
+      <div class="spinner"></div>
+      <p id="loadingText">Finding reels for you…</p>
+    </div>
+    <div class="cover tap hidden" id="tapCover">
+      <button class="bigplay" type="button" aria-label="Start watching" id="tapBtn"></button>
+      <h2>Tap to join in</h2>
+      <p>Your browser wants a tap before it plays sound.</p>
+    </div>
+    <div class="cover seed hidden" id="seed">
+      <div class="seed-icon" id="seedIcon"></div>
+      <h2>What should the feed show?</h2>
+      <p>Pick a few. It learns from what everyone here likes, skips and watches to the end.</p>
+      <div class="chips" id="seedChips"></div>
+      <form class="seed-form" id="seedForm" autocomplete="off">
+        <input class="input" id="seedText" maxlength="120" placeholder="Or type your own: skateboarding, chess…">
+      </form>
+      <button class="btn primary" id="seedGo" type="button" disabled>Start the feed</button>
+    </div>
+  </div>
+  <div class="rail" id="rail">
+    <button class="rbtn" id="likeBtn" type="button" aria-label="Like"></button><span class="rcount" id="likeCount">0</span>
+    <button class="rbtn" id="lessBtn" type="button" aria-label="Not for me" title="Not for me"></button><span class="rcount">Less</span>
+    <button class="rbtn" id="reactBtn" type="button" aria-label="React" title="React"></button><span class="rcount">React</span>
+    <button class="rbtn" id="addBtn" type="button" aria-label="Add a reel" title="Add a reel"></button><span class="rcount">Add</span>
+    <button class="rbtn" id="tuneBtn" type="button" aria-label="Tune the feed" title="Tune the feed"></button><span class="rcount">Feed</span>
+    <span class="nav">
+      <button class="rbtn small" id="upBtn" type="button" aria-label="Previous reel" title="Previous (↑)"></button>
+      <button class="rbtn small" id="downBtn" type="button" aria-label="Next reel" title="Next (↓)"></button>
+    </span>
+  </div>
+  <div class="react-pop hidden" id="reactPop"></div>
+</div>
+<script src="/watch/static/together.js"></script>
+<script src="/watch/static/reels.js"></script>
+</body>
+</html>

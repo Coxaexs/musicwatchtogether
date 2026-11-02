@@ -1027,6 +1027,38 @@ class WebUI:
         token = generate_token(guild_id, None)
         return web.json_response({'guild_id': guild_id, 'token': token})
 
+    async def api_admin_watch_ticket(self, request):
+        """Hoffle letting one of its members into a Watch/Reels Together room.
+
+        Hoffle has already checked the member may be in that voice room; the
+        ticket is one-time and lasts two minutes (watchtogether.issue_ticket).
+        """
+        if not getattr(config, 'WATCHTOGETHER_ENABLED', True):
+            return web.json_response({'error': 'Watch Together is turned off on the bot'}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        import watchtogether
+        try:
+            return web.json_response(watchtogether.issue_ticket(body if isinstance(body, dict) else {}))
+        except ValueError as exc:
+            return web.json_response({'error': str(exc)}, status=400)
+
+    async def api_admin_watch_command(self, request):
+        """Hoffle's /watch <link> and /reels <topics> acting on a room."""
+        if not getattr(config, 'WATCHTOGETHER_ENABLED', True):
+            return web.json_response({'error': 'Watch Together is turned off on the bot'}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        import watchtogether
+        try:
+            return web.json_response(await watchtogether.command(body if isinstance(body, dict) else {}))
+        except (ValueError, RuntimeError) as exc:
+            return web.json_response({'error': str(exc)}, status=400)
+
     # ------------------------------------------------------------ playlist mix
 
     def _mix_target(self, request):
@@ -2549,6 +2581,8 @@ async def start_web_server(bot):
     app.router.add_get('/api/metrics', ui.api_metrics)
     app.router.add_get('/api/admin/state', ui.api_admin_state)
     app.router.add_post('/api/admin/huddle-link', ui.api_admin_huddle_link)
+    app.router.add_post('/api/admin/watch-ticket', ui.api_admin_watch_ticket)
+    app.router.add_post('/api/admin/watch-command', ui.api_admin_watch_command)
     app.router.add_post('/api/admin/update', ui.api_admin_update)
     app.router.add_delete('/api/admin/rooms/{room_id}', ui.api_admin_delete_room)
     app.router.add_get('/api/guilds', ui.api_guilds)
@@ -2610,9 +2644,9 @@ ADMIN_HTML = r"""<!DOCTYPE html>
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 550px at 10% -10%,#382b6844,transparent),var(--bg);color:var(--text);font:14px system-ui,sans-serif}.wrap{max-width:1180px;margin:auto;padding:24px}.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.top h1{margin-right:auto}.pill,.nav a{border:1px solid var(--line);background:#111622;color:var(--text);border-radius:999px;padding:9px 13px;text-decoration:none}.pill.ok{color:var(--ok)}.nav{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 22px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px}.card{background:#151925e8;border:1px solid var(--line);border-radius:17px;padding:16px;box-shadow:0 12px 40px #0004}.card h2,.card h3{margin:0 0 10px}.muted{color:var(--muted)}.row{display:flex;align-items:center;justify-content:space-between;gap:14px;border-top:1px solid #ffffff0d;padding:9px 0}.row:first-of-type{border-top:0}input,select,button{background:#0f1420;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:8px}input[type=range]{width:120px}button{cursor:pointer;background:var(--accent);border:0;font-weight:700}.danger-row{margin-top:6px;padding-bottom:0}.danger{background:#2a1219;color:#ffb5c0;border:1px solid #ff647c66}.danger:hover{background:#421622}.login{position:fixed;inset:0;background:#070910ee;display:grid;place-items:center;z-index:5}.login.hidden{display:none}.login .card{width:min(360px,calc(100% - 32px))}.login input{width:100%;margin:12px 0}.empty{padding:20px;color:var(--muted);text-align:center}
 </style></head><body><div class="wrap">
 <div class="top"><h1>🛠️ MusicWatch Admin</h1><span id="health" class="pill">Connecting…</span></div>
-<div class="nav"><a id="dashboardLink">🎵 MusicBot dashboard</a><a href="/watch/">🎬 WatchTogether</a><a href="/watch/reels">📱 ReelsTogether</a></div>
+<div class="nav"><a id="dashboardLink">🎵 MusicBot dashboard</a></div>
 <div id="summary" class="grid"></div><h2>MusicBot servers</h2><div id="music" class="grid"></div>
-<h2>WatchTogether &amp; ReelsTogether rooms</h2><div id="rooms" class="grid"></div></div>
+<h2>Watch Together &amp; Reels Together rooms (Hoffle voice rooms)</h2><div id="rooms" class="grid"></div></div>
 <div id="login" class="login"><div class="card"><h2>Admin password</h2><div class="muted">Use the MusicBot admin password to manage every surface.</div><input id="password" type="password" placeholder="Password" onkeydown="if(event.key==='Enter')signIn()"><button style="width:100%" onclick="signIn()">Open admin</button><div id="error" class="muted" style="margin-top:10px"></div></div></div>
 <script>
 const basePath=location.pathname.replace(/admin\/?$/,'');
@@ -2623,12 +2657,12 @@ async function request(path,opts={}){const r=await fetch(basePath+path,{credenti
 async function signIn(){const password=document.getElementById('password').value;const r=await fetch(basePath+'api/session',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});if(!r.ok){document.getElementById('error').textContent='Wrong password';return}document.getElementById('login').classList.add('hidden');load()}
 function checked(v){return v?'checked':''}
 function musicCard(g){return `<div class="card"><h3>${esc(g.name)}</h3><div class="muted">${g.connected?'🔊 '+esc(g.channel||'Connected'):'Disconnected'} · ${g.current?esc(g.current):'Nothing playing'} · ${g.queue} queued</div><div class="row"><span>Volume <b>${g.volume}%</b></span><input type="range" min="0" max="100" value="${g.volume}" onchange="updateMusic('${g.id}',{volume:+this.value})"></div><div class="row"><span>Smart autoplay</span><input type="checkbox" ${checked(g.autoplay)} onchange="updateMusic('${g.id}',{autoplay:this.checked})"></div><div class="row"><span>Avoid artist streaks</span><input type="checkbox" ${checked(g.artist_diversity)} onchange="updateMusic('${g.id}',{artist_diversity:this.checked})"></div><div class="row"><span>Vibe matching</span><input type="checkbox" ${checked(g.vibe_match)} onchange="updateMusic('${g.id}',{vibe_match:this.checked})"></div><div class="row"><span>AutoMix</span><input type="checkbox" ${checked(g.automix)} onchange="updateMusic('${g.id}',{automix:this.checked})"></div><div class="row"><span>AutoMix blend</span><select onchange="updateMusic('${g.id}',{automix_blend_seconds:+this.value})">${[4,6,8,10,12,15].map(n=>`<option ${n===g.automix_blend_seconds?'selected':''}>${n}</option>`).join('')}</select></div></div>`}
-function roomCard(r){const s=r.settings||{};return `<div class="card"><h3>${r.mode==='reels'?'📱':'🎬'} ${esc(r.name)}</h3><div class="muted">${esc(r.id)} · ${r.active?r.participants+' online · '+r.queued+' queued':'saved settings'}</div><div class="row"><span>Controls</span><select onchange="updateRoom('${esc(r.id)}',{control_policy:this.value})">${['host','moderators','everyone'].map(v=>`<option ${v===s.control_policy?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Skipping</span><select onchange="updateRoom('${esc(r.id)}',{skip_policy:this.value})">${['moderators','vote','everyone'].map(v=>`<option ${v===s.skip_policy?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Vote threshold</span><select onchange="updateRoom('${esc(r.id)}',{vote_threshold:+this.value})">${[.25,.5,.67,1].map(v=>`<option value="${v}" ${v===s.vote_threshold?'selected':''}>${Math.round(v*100)}%</option>`).join('')}</select></div><div class="row"><span>Quality</span><select onchange="updateRoom('${esc(r.id)}',{quality:+this.value})">${[360,480,720,1080].map(v=>`<option ${v===s.quality?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Adblock</span><input type="checkbox" ${checked(s.adblock)} onchange="updateRoom('${esc(r.id)}',{adblock:this.checked})"></div><div class="row"><span>SponsorBlock</span><input type="checkbox" ${checked(s.sponsorblock)} onchange="updateRoom('${esc(r.id)}',{sponsorblock:this.checked})"></div><div class="row danger-row"><span>${r.active?'Closes the active room and revokes its link':'Removes saved room data and revokes its link'}</span><button class="danger" onclick="deleteRoom('${esc(r.id)}')">Delete room</button></div></div>`}
+function roomCard(r){const s=r.settings||{};return `<div class="card"><h3>${r.mode==='reels'?'📱':'🎬'} ${esc(r.name)}</h3><div class="muted">${esc(r.id)} · ${r.active?r.participants+' online · '+r.queued+' queued':'saved settings'}</div><div class="row"><span>Controls</span><select onchange="updateRoom('${esc(r.id)}',{control_policy:this.value})">${['everyone','managers'].map(v=>`<option ${v===s.control_policy?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Skipping</span><select onchange="updateRoom('${esc(r.id)}',{skip_policy:this.value})">${['everyone','vote','managers'].map(v=>`<option ${v===s.skip_policy?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Vote threshold</span><select onchange="updateRoom('${esc(r.id)}',{vote_threshold:+this.value})">${[.25,.5,.67,1].map(v=>`<option value="${v}" ${v===s.vote_threshold?'selected':''}>${Math.round(v*100)}%</option>`).join('')}</select></div><div class="row"><span>Quality</span><select onchange="updateRoom('${esc(r.id)}',{quality:+this.value})">${[360,480,720,1080].map(v=>`<option ${v===s.quality?'selected':''}>${v}</option>`).join('')}</select></div><div class="row"><span>Adblock</span><input type="checkbox" ${checked(s.adblock)} onchange="updateRoom('${esc(r.id)}',{adblock:this.checked})"></div><div class="row"><span>SponsorBlock</span><input type="checkbox" ${checked(s.sponsorblock)} onchange="updateRoom('${esc(r.id)}',{sponsorblock:this.checked})"></div><div class="row danger-row"><span>${r.active?'Closes the active room and forgets its settings':'Forgets its settings, playlists and Reels feed'}</span><button class="danger" onclick="deleteRoom('${esc(r.id)}')">Delete room</button></div></div>`}
 function render(d){latestRooms=d.rooms;document.getElementById('health').textContent=d.ready?'● Bot healthy':'● Bot not ready';document.getElementById('health').classList.toggle('ok',d.ready);document.getElementById('summary').innerHTML=`<div class="card"><h3>Runtime</h3><div class="row"><span>Active rooms</span><b>${d.runtime.rooms}</b></div><div class="row"><span>Participants</span><b>${d.runtime.participants}</b></div><div class="row"><span>Background tasks</span><b>${d.runtime.background_tasks}</b></div></div>`;document.getElementById('music').innerHTML=d.music.length?d.music.map(musicCard).join(''):'<div class="card empty">No Discord servers</div>';document.getElementById('rooms').innerHTML=d.rooms.length?d.rooms.map(roomCard).join(''):'<div class="card empty">No WatchTogether or ReelsTogether rooms have been created yet.</div>'}
 async function load(){try{render(await request('api/admin/state'));document.getElementById('login').classList.add('hidden')}catch(e){if(e.message==='auth')document.getElementById('login').classList.remove('hidden')}}
 async function updateMusic(id,changes){render(await request('api/admin/update',{method:'POST',body:JSON.stringify({target:'music',guild_id:id,...changes})}))}
 async function updateRoom(id,changes){render(await request('api/admin/update',{method:'POST',body:JSON.stringify({target:'room',room_id:id,...changes})}))}
-async function deleteRoom(id){const room=latestRooms.find(r=>r.id===id);if(!room)return;const warning=room.active?' This room is active; everyone inside will be disconnected.':'';if(!confirm(`Delete “${room.name}”?${warning}\n\nIts saved settings, playlists, Reels profile, and every existing room link will be permanently removed.`))return;try{render(await request(`api/admin/rooms/${encodeURIComponent(id)}`,{method:'DELETE'}))}catch(e){alert(e.message)}}
+async function deleteRoom(id){const room=latestRooms.find(r=>r.id===id);if(!room)return;const warning=room.active?' This room is active; everyone inside will be disconnected.':'';if(!confirm(`Delete “${room.name}”?${warning}\n\nIts saved settings, playlists, moderators and Reels feed will be permanently removed.`))return;try{render(await request(`api/admin/rooms/${encodeURIComponent(id)}`,{method:'DELETE'}))}catch(e){alert(e.message)}}
 load();setInterval(load,10000);
 </script></body></html>"""
 

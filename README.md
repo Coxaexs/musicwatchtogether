@@ -7,28 +7,34 @@ A Discord music bot (`music.py`) with a browser-based control dashboard and a
 
 - 🎵 **Music** — YouTube / Spotify / local library playback, queue, lyrics,
   24/7 mode, web dashboard (`webui.py`). `/settings` exposes every safe
-  per-server playback option plus this channel's WatchTogether preferences;
-  the dashboard mirrors the playback controls.
-- 🎬 **Watch Together** (`watchtogether.py`) — synced video rooms with chat.
-  Add anything yt-dlp resolves (YouTube, Shorts, Reels, TikTok, Twitter…).
-  Long videos stream while they download (progressive HLS). Per-room settings
-  for quality, SponsorBlock, and adblock. Rooms have host, moderator, and viewer
-  roles; moderators manage playback and destructive queue actions, while the
-  host can assign roles.
-- 📚 **Collaborative room playlists** — participants can save the current
-  queue as a persistent shared playlist and load it together later. Moderators
-  can remove obsolete room playlists.
+  per-server playback option; the dashboard mirrors the playback controls.
 - 🎧 **Spotify playlist import** — paste a Spotify playlist or album link in
   the dashboard library to create a personal playlist with up to 200 tracks,
   Spotify artwork, durations, and automatic duplicate-name handling.
-- 📱 **ReelsTogether** — a synced, swipeable short-form feed with backward
-  navigation through recent reels and a per-room taste algorithm. Watch and
-  Reels rooms share a hard 10-video download cache.
+
+### Watch Together and Reels Together (Hoffle only)
+
+These are activities of a [Hoffle](https://hoffle.online) voice room, not
+Discord commands. Hoffle checks who someone is and that they may be in the
+room, then asks the dashboard for a one-time ticket
+(`POST /api/admin/watch-ticket`, master session); the page trades it for a
+session. There is one room per voice room and mode, and nothing under
+`/watch/` works without a ticket from Hoffle.
+
+- 🎬 **Watch Together** (`watchtogether.py`, `webstatic/watch.*`) — one synced
+  player for the whole voice room. Search YouTube right in the panel or paste
+  anything yt-dlp resolves; long videos stream while they download (HLS).
+  Reactions, saved room playlists, vote-to-skip, and per-room quality,
+  SponsorBlock and adblock. The host (whoever started it) and Hoffle's
+  moderators can lock controls and make others moderators of the room.
+- 📱 **Reels Together** (`reels_brain.py`, `webstatic/reels.*`) — a synced,
+  swipeable Shorts feed. It pulls real Shorts from hashtag and creator feeds,
+  learns each person's taste from likes, "show less", full watches and fast
+  skips (your taste follows you between rooms), and takes turns choosing for
+  everyone in the room. Auto-scroll, swipe back, "more from this creator".
 - 🌐 **Shared co-browser** (`cobrowser.py`) — when yt-dlp can't grab something,
   the room opens a real Firefox on the server, streamed to everyone (MPEG-TS
   over websocket) with one person driving. AdGuard adblock built in.
-- Rooms work with **or without** Discord — `deeppixel.online/watch` creates a
-  shareable room directly.
 
 ## Quick Start with Docker (GHCR)
 

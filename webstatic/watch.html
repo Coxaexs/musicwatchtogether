@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Watch Together</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/watch/static/together.css">
+<link rel="stylesheet" href="/watch/static/watch.css">
+</head>
+<body>
+<div class="app" id="app">
+  <section class="main">
+    <div class="stage" id="stage">
+      <video id="v" playsinline preload="auto"></video>
+      <div id="embedBox" class="embedbox hidden"></div>
+      <div id="bwrap" class="bwrap hidden">
+        <canvas id="bcanvas" tabindex="0"></canvas>
+        <div id="bcursor" class="bcursor"></div>
+      </div>
+      <div class="reactions" id="reactions"></div>
+      <div class="stage-msg hidden" id="stageMsg"></div>
+      <div class="welcome hidden" id="welcome">
+        <div class="welcome-icon" id="welcomeIcon"></div>
+        <h2>What are we watching?</h2>
+        <p>Search YouTube or paste a link. Everyone in the voice room sees the same thing at the same moment.</p>
+        <form class="welcome-search" id="welcomeForm" autocomplete="off">
+          <input class="input" id="welcomeInput" maxlength="300" placeholder="Search or paste a link…" aria-label="Search or paste a link">
+          <button class="btn primary" type="submit">Search</button>
+        </form>
+      </div>
+      <div class="controls" id="controls">
+        <div class="seek" id="seek" role="slider" aria-label="Seek" tabindex="0">
+          <div class="seek-track"><div class="seek-buf" id="seekBuf"></div><div class="seek-fill" id="seekFill"></div></div>
+          <div class="seek-tip hidden" id="seekTip"></div>
+        </div>
+        <div class="controls-row">
+          <button class="cbtn" id="playBtn" type="button" aria-label="Play"></button>
+          <button class="cbtn" id="skipBtn" type="button" aria-label="Skip"></button>
+          <div class="vol">
+            <button class="cbtn" id="muteBtn" type="button" aria-label="Mute"></button>
+            <input type="range" id="volume" min="0" max="1" step="0.02" aria-label="Volume">
+          </div>
+          <span class="time" id="time">0:00 / 0:00</span>
+          <span class="spacer"></span>
+          <span class="sync" id="sync" title="Everyone is at the same moment"><i></i><b>In sync</b></span>
+          <button class="cbtn" id="reactBtn" type="button" aria-label="React"></button>
+          <button class="cbtn" id="fsBtn" type="button" aria-label="Full screen"></button>
+        </div>
+      </div>
+      <div class="react-pop hidden" id="reactPop"></div>
+    </div>
+    <div class="nowbar" id="nowbar">
+      <div class="now-text">
+        <div class="now-title ellipsis" id="nowTitle">Nothing playing</div>
+        <div class="now-meta" id="nowMeta"></div>
+      </div>
+      <div class="now-actions" id="nowActions"></div>
+    </div>
+    <div class="bbar card hidden" id="bbar"></div>
+  </section>
+  <aside class="side">
+    <nav class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="queue" class="on"><span>Up next</span><b id="queueCount"></b></button>
+      <button type="button" role="tab" data-tab="search"><span>Search</span></button>
+      <button type="button" role="tab" data-tab="room"><span>Room</span><b id="peopleCount"></b></button>
+    </nav>
+    <div class="tab-body" id="tab-queue"></div>
+    <div class="tab-body hidden" id="tab-search">
+      <form class="search-bar" id="searchForm" autocomplete="off">
+        <input class="input" id="searchInput" maxlength="300" placeholder="Search YouTube or paste a link" aria-label="Search">
+      </form>
+      <div id="results"></div>
+    </div>
+    <div class="tab-body hidden" id="tab-room"></div>
+  </aside>
+</div>
+<script src="/watch/static/together.js"></script>
+<script src="/watch/static/watch.js"></script>
+</body>
+</html>

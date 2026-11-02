@@ -3,6 +3,7 @@ import json
 import unittest
 from unittest import mock
 
+import reels_brain as brain
 import runtime
 import watchtogether
 import webui
@@ -16,96 +17,71 @@ class FakeSocket:
         self.messages.append(json.loads(value))
 
 
-class RoomRoleTests(unittest.TestCase):
-    def test_first_member_hosts_and_moderator_is_promoted_on_disconnect(self):
-        room = watchtogether.Room("w-role-unit", "Roles")
-        host_socket = FakeSocket()
-        moderator_socket = FakeSocket()
-        viewer_socket = FakeSocket()
-
-        host = room.join(host_socket, "private-host", "Host")
-        moderator = room.join(moderator_socket, "private-moderator", "Moderator")
-        viewer = room.join(viewer_socket, "private-viewer", "Viewer")
-        moderator["role"] = "moderator"
-        room.roles[moderator["session"]] = "moderator"
-
-        self.assertEqual(host["role"], "host")
-        self.assertEqual(viewer["role"], "viewer")
-        self.assertNotIn("private-host", watchtogether._room_state(room)["participants"][0]["id"])
-
-        room.sockets.pop(host_socket)
-        promoted, old_role = room.ensure_active_host()
-        self.assertEqual(old_role, "moderator")
-        self.assertIs(promoted, moderator)
-        self.assertEqual(moderator["role"], "host")
-        self.assertEqual(room.roles["private-host"], "moderator")
+def info(uid, name, host=False, moderator=False):
+    return {"user": {"id": uid, "name": name}, "host": host, "moderator": moderator}
 
 
-class PlaylistTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncTearDown(self):
-        watchtogether.room_playlists.pop("w-playlist-unit", None)
+class QuietDocs(unittest.IsolatedAsyncioTestCase):
+    """Keep the tests' rooms and tastes out of the bot's real state."""
 
-    async def test_participant_can_save_reusable_room_queue(self):
-        room = watchtogether.Room("w-playlist-unit", "Playlists")
-        socket = FakeSocket()
-        member = room.join(socket, "private-member", "Alex")
+    def setUp(self):
+        self.touch = mock.patch.object(watchtogether._Doc, "touch")
+        self.touch.start()
+        self.saved = {doc.key: json.loads(json.dumps(doc.data)) for doc in self.docs()}
+
+    def tearDown(self):
+        for doc in self.docs():
+            doc.data.clear()
+            doc.data.update(self.saved[doc.key])
+        self.touch.stop()
+
+    @staticmethod
+    def docs():
+        return (watchtogether.sessions, watchtogether.settings_doc, watchtogether.playlists_doc,
+                watchtogether.mods_doc, watchtogether.people_doc, watchtogether.feeds_doc)
+
+
+class RoomRoleTests(QuietDocs):
+    def test_roles_come_from_hoffle_and_room_moderators(self):
+        room = watchtogether.Room("wh_role-unit", "Roles")
+        host = room.join(FakeSocket(), info("h", "Host", host=True))
+        mod = room.join(FakeSocket(), info("m", "Mod", moderator=True))
+        member = room.join(FakeSocket(), info("x", "Member"))
+        self.assertEqual([host["role"], mod["role"], member["role"]], ["host", "moderator", "member"])
+        watchtogether.mods_doc.data["wh_role-unit"] = ["x"]
+        again = room.join(FakeSocket(), info("x", "Member"))
+        self.assertEqual(again["role"], "moderator")
+        state = watchtogether._room_state(room)
+        self.assertEqual([m["id"] for m in state["members"]], ["h", "m", "x"])  # one entry per person
+
+
+class PlaylistTests(QuietDocs):
+    async def test_save_load_delete_follow_owner(self):
+        room = watchtogether.Room("wh_playlist-unit", "Playlists")
+        owner = room.join(FakeSocket(), info("o", "Owner"))
+        other = room.join(FakeSocket(), info("p", "Other"))
         room.queue = [
             {"url": "https://example.com/one", "title": "One", "duration": 12},
             {"url": "not-a-url", "title": "Ignored"},
         ]
+        await watchtogether._save_room_playlist(room, " Road Trip ", owner)
+        playlist = watchtogether.playlists_doc.data["wh_playlist-unit"]["Road Trip"]
+        self.assertEqual([i["url"] for i in playlist["items"]], ["https://example.com/one"])
+        self.assertEqual(playlist["owner_id"], "o")
+        await watchtogether._delete_room_playlist(room, "Road Trip", other)
+        self.assertIn("Road Trip", watchtogether.playlists_doc.data["wh_playlist-unit"])
+        added = []
 
-        with mock.patch.object(watchtogether, "_save_json") as save, \
-                mock.patch.object(watchtogether.state_store, "save"):
-            await watchtogether._save_room_playlist(room, " Road Trip ", member)
-
-        saved = watchtogether.room_playlists[room.id]["Road Trip"]
-        self.assertEqual([item["url"] for item in saved["items"]], ["https://example.com/one"])
-        self.assertEqual(saved["updated_by"], "Alex")
-        save.assert_called_once()
-
-    async def test_loading_playlist_adds_each_url_in_order(self):
-        room = watchtogether.Room("w-playlist-unit", "Playlists")
-        member = room.join(FakeSocket(), "private-member", "Alex")
-        watchtogether.room_playlists[room.id] = {
-            "Mix": {"items": [{"url": "https://example.com/1"},
-                                {"url": "https://example.com/2"}]}
-        }
-
-        with mock.patch.object(watchtogether, "_notice", new=mock.AsyncMock()), \
-                mock.patch.object(watchtogether, "_add_query", new=mock.AsyncMock()) as add:
-            await watchtogether._load_room_playlist(room, "Mix", member)
-
-        self.assertEqual(
-            [call.args[1] for call in add.await_args_list],
-            ["https://example.com/1", "https://example.com/2"],
-        )
-
-    async def test_owner_can_grant_playlist_editor_access(self):
-        room = watchtogether.Room("w-playlist-unit", "Playlists")
-        owner_socket, editor_socket = FakeSocket(), FakeSocket()
-        owner = room.join(owner_socket, "private-owner", "Owner")
-        editor = room.join(editor_socket, "private-editor", "Editor")
-        watchtogether.room_playlists[room.id] = {
-            "Mix": {
-                "items": [{"url": "https://example.com/one"}],
-                "owner_key": watchtogether._member_owner_key(owner),
-                "owner_name": owner["name"],
-            }
-        }
-
-        with mock.patch.object(watchtogether, "_save_room_playlists"):
-            await watchtogether._playlist_manage(
-                room, owner,
-                {"action": "editor_add", "name": "Mix", "id": editor["id"]},
-                owner_socket,
-            )
-
-        playlist = watchtogether.room_playlists[room.id]["Mix"]
-        self.assertIn(watchtogether._member_owner_key(editor), playlist["editor_keys"])
-        self.assertTrue(watchtogether._can_edit_room_playlist(playlist, editor))
+        async def add(_room, url, by, play_next=False):
+            added.append((url, by["id"]))
+        with mock.patch.object(watchtogether, "_add_query", side_effect=add):
+            await watchtogether._load_room_playlist(room, "Road Trip", other)
+        self.assertEqual(added, [("https://example.com/one", "p")])
+        await watchtogether._delete_room_playlist(room, "Road Trip", owner)
+        self.assertNotIn("wh_playlist-unit", watchtogether.playlists_doc.data)
 
 
-class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+class RuntimeTests(QuietDocs):
     async def test_registry_cancels_owned_tasks(self):
         registry = runtime.TaskRegistry("test")
         started = asyncio.Event()
@@ -127,97 +103,142 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         response = await webui.WebUI(bot).health(None)
         payload = json.loads(response.text)
         self.assertEqual(payload["status"], "ok")
-        self.assertTrue(payload["ready"])
         self.assertIn("rooms", payload["watch"])
         self.assertIn("musicwatch_process_uptime_seconds", watchtogether.metrics_text())
 
-    async def test_dashboard_shell_is_not_cached(self):
-        response = await webui.WebUI(mock.Mock()).index(None)
-        self.assertEqual(response.headers["Cache-Control"], "no-store")
-
-    async def test_admin_shell_and_room_snapshot(self):
+    async def test_admin_snapshot_and_delete(self):
         response = await webui.WebUI(mock.Mock()).admin_index(None)
-        self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertIn("MusicWatch Admin", response.text)
-
-        room = watchtogether.Room("w-admin-unit", "Admin Room")
-        watchtogether.rooms[room.id] = room
-        try:
-            snapshot = watchtogether.admin_snapshot()
-            item = next(value for value in snapshot if value["id"] == room.id)
-            self.assertEqual(item["mode"], "watch")
-            self.assertTrue(item["active"])
-            self.assertIn("control_policy", item["settings"])
-        finally:
-            watchtogether.rooms.pop(room.id, None)
-
-    async def test_admin_delete_room_revokes_links_and_persisted_state(self):
-        room_id = "w-admin-delete-unit"
-        room = watchtogether.Room(room_id, "Delete Me")
+        self.assertNotIn('href="/watch/"', response.text)
+        room_id = "wh_admin-unit"
+        room = watchtogether.Room(room_id, "Admin Room")
         socket = mock.AsyncMock()
-        room.sockets[socket] = {'session': 'member'}
+        room.sockets[socket] = dict(info("a", "A")["user"], role="member", order=1)
         watchtogether.rooms[room_id] = room
-        watchtogether.room_settings[room_id] = {'quality': 360}
-        watchtogether.room_playlists[room_id] = {'Mix': []}
-        watchtogether.profiles[room_id] = {'seen': ['video']}
-        token = "admin-delete-token"
-        watchtogether.tokens[token] = {'room': room_id, 'name': 'Delete Me'}
+        watchtogether.settings_doc.data[room_id] = {"quality": 360}
+        watchtogether.playlists_doc.data[room_id] = {"Mix": {}}
+        watchtogether.sessions.data["admin-sid"] = {"room": room_id, "user": {"id": "a"}, "created": 0}
         try:
-            with mock.patch.object(watchtogether, '_save_tokens'), \
-                    mock.patch.object(watchtogether, '_save_room_settings'), \
-                    mock.patch.object(watchtogether, '_save_room_playlists'), \
-                    mock.patch.object(watchtogether, '_save_profiles'):
-                await watchtogether.admin_delete_room(room_id)
+            item = next(v for v in watchtogether.admin_snapshot() if v["id"] == room_id)
+            self.assertTrue(item["active"])
+            await watchtogether.admin_delete_room(room_id)
             self.assertNotIn(room_id, watchtogether.rooms)
-            self.assertNotIn(room_id, watchtogether.room_settings)
-            self.assertNotIn(room_id, watchtogether.room_playlists)
-            self.assertNotIn(room_id, watchtogether.profiles)
-            self.assertNotIn(token, watchtogether.tokens)
-            socket.close.assert_awaited_once_with(
-                code=4004, message=b'room deleted by administrator')
+            self.assertNotIn(room_id, watchtogether.settings_doc.data)
+            self.assertNotIn(room_id, watchtogether.playlists_doc.data)
+            self.assertNotIn("admin-sid", watchtogether.sessions.data)
+            socket.close.assert_awaited_once_with(code=4004, message=b'room deleted by administrator')
         finally:
             watchtogether.rooms.pop(room_id, None)
-            watchtogether.room_settings.pop(room_id, None)
-            watchtogether.room_playlists.pop(room_id, None)
-            watchtogether.profiles.pop(room_id, None)
-            watchtogether.tokens.pop(token, None)
 
 
-class ReelsFeedTests(unittest.IsolatedAsyncioTestCase):
-    async def test_topup_prefetches_four_and_penalizes_repeat_creators(self):
-        room = watchtogether.Room("r-feed-unit", "Feed")
-        entries = [
-            {"id": f"video-{index}", "title": f"Cats clip {index}",
-             "url": f"https://example.com/{index}", "uploader": f"Creator {index}"}
-            for index in range(8)
-        ]
+class WatchQueueTests(QuietDocs):
+    async def test_added_video_carries_on_after_the_queue_ran_out(self):
+        room = watchtogether.Room("wh_end-unit", "End")
+        room.join(FakeSocket(), info("a", "A"))
+        last = watchtogether._new_item("https://example.com/a", "A", status="ready", file="a.mp4", duration=30)
+        room.queue = [last]
+        room.index = 0
+        room.set_position(30, playing=False)
+        new = watchtogether._new_item("https://example.com/b", "B", status="ready", file="b.mp4")
+        room.queue.append(new)
+        await watchtogether._after_ready(room, new)
+        self.assertIs(room.current(), new)
+        self.assertTrue(room.playing)
+        self.assertLess(room.get_position(), 1)
 
-        def extract(url):
-            index = int(url.rsplit('/', 1)[-1])
-            return dict(entries[index], duration=20, width=720, height=1280,
-                        webpage_url=url, thumbnail=None, tags=["cats"])
+    async def test_room_waiting_on_a_download_starts_it_from_the_top(self):
+        room = watchtogether.Room("wh_wait-unit", "Wait")
+        room.join(FakeSocket(), info("a", "A"))
+        first = watchtogether._new_item("https://example.com/a", "A", status="ready", file="a.mp4")
+        slow = watchtogether._new_item("https://example.com/b", "B", status="downloading")
+        room.queue = [first, slow]
+        watchtogether._move_to(room, 1)
+        room.position = 25   # the download took a while
+        slow["status"], slow["file"] = "ready", "b.mp4"
+        await watchtogether._after_ready(room, slow)
+        self.assertLess(room.get_position(), 1)
 
+
+class ReelsFeedTests(QuietDocs):
+    async def test_topup_fills_ahead_from_the_chosen_source(self):
+        room = watchtogether.Room("rh_feed-unit", "Feed")
+        room.join(FakeSocket(), info("ann", "Ann"))
+        room.join(FakeSocket(), info("bob", "Bob"))
+        watchtogether.people_doc.data["ann"] = {"tags": {"cats": 5.0, "kitten": 2.0}, "creators": {}}
+        entries = [{"id": f"vid{i:08d}x", "title": f"Cat {i} #cats", "view_count": 1000 * i} for i in range(20)]
         spawned = []
 
-        def discard_download(coroutine, _name):
-            spawned.append(coroutine)
+        def discard(coroutine, name):
+            spawned.append(name)
             coroutine.close()
 
-        with mock.patch.object(watchtogether, "_blocking_search", return_value=entries), \
-                mock.patch.object(watchtogether, "_blocking_extract", side_effect=extract), \
-                mock.patch.object(watchtogether, "_spawn", side_effect=discard_download), \
-                mock.patch.object(room, "save_profile"):
+        urls = []
+
+        async def source(url):
+            urls.append(url)
+            return entries
+
+        with mock.patch.object(watchtogether, "_source_entries", side_effect=source), \
+                mock.patch.object(watchtogether, "_spawn", side_effect=discard), \
+                mock.patch.object(brain, "EXPLORE_RATE", 0.0):
             await watchtogether._reels_topup_inner(room)
+        self.assertEqual(len(room.queue), watchtogether.REELS_READY_AHEAD)
+        self.assertEqual(len(spawned), watchtogether.REELS_READY_AHEAD)
+        self.assertTrue(all(u.startswith("https://www.youtube.com/hashtag/") for u in urls))
+        self.assertTrue(all(it["why"]["label"].startswith("#") for it in room.queue))
+        self.assertEqual(room.queue[0]["why"]["for"], "Ann")
+        for item in room.queue:
+            self.assertIn(item["vid"], room.feed["seen"])
+            self.assertTrue(item["url"].startswith("https://www.youtube.com/shorts/"))
 
-        self.assertEqual(watchtogether.REELS_READY_AHEAD, 4)
-        self.assertEqual(watchtogether.REELS_CACHE_LIMIT, 30)
-        self.assertEqual(len(room.queue), 4)
-        self.assertEqual(len(spawned), 4)
+    async def test_nothing_to_go_on_waits_for_the_seed_screen(self):
+        room = watchtogether.Room("rh_empty-unit", "Empty")
+        room.join(FakeSocket(), info("new", "New"))
+        with mock.patch.object(watchtogether, "_source_entries") as source:
+            await watchtogether._reels_topup_inner(room)
+        source.assert_not_called()
+        self.assertTrue(watchtogether._room_state(room)["feed"]["need_seed"])
 
-        repeated = {"title": "Cats forever", "uploader": room.recent_uploaders[0]}
-        fresh = {"title": "Cats forever", "uploader": "New creator"}
-        self.assertLess(watchtogether._entry_score(room, repeated),
-                        watchtogether._entry_score(room, fresh))
+    async def test_full_watch_teaches_everyone_present(self):
+        room = watchtogether.Room("rh_learn-unit", "Learn")
+        room.join(FakeSocket(), info("ann", "Ann"))
+        room.join(FakeSocket(), info("bob", "Bob"))
+        item = watchtogether._new_item("u", "t", status="ready", file="f.mp4", duration=10,
+                                       arm="tag:cats", channel_id="UC9")
+        item["tags_w"] = {"cats": 1.0}
+        room.queue = [item]
+        watchtogether._move_to(room, 0)
+        room.position = 10
+        watchtogether._conclude_reel(room, "ended")
+        self.assertGreater(watchtogether.people_doc.data["ann"]["tags"]["cats"], 0)
+        self.assertGreater(watchtogether.people_doc.data["bob"]["tags"]["cats"], 0)
+        self.assertEqual(room.feed["arms"]["tag:cats"][0], 1.0)
+        watchtogether._conclude_reel(room, "ended")   # once per visit
+        self.assertEqual(room.feed["arms"]["tag:cats"][0], 1.0)
+
+
+class CommandTests(QuietDocs):
+    async def test_watch_add_and_reels_seed(self):
+        spawned = []
+
+        def discard(coroutine, name):
+            spawned.append(name)
+            coroutine.close()
+
+        user = {"id": "cmd-user", "name": "Cee"}
+        with mock.patch.object(watchtogether, "_spawn", side_effect=discard):
+            result = await watchtogether.command({"mode": "watch", "channel_id": "cmd-room", "action": "add",
+                                                  "q": "https://example.com/v", "user": user})
+            self.assertTrue(result["ok"])
+            self.assertTrue(any(name.startswith("add:wh_cmd-room") for name in spawned))
+            result = await watchtogether.command({"mode": "reels", "channel_id": "cmd-room", "action": "seed",
+                                                  "q": "cats, street food", "user": user})
+        self.assertEqual(result["topics"], ["cats", "streetfood"])
+        self.assertGreater(watchtogether.people_doc.data["cmd-user"]["tags"]["cats"], 0)
+        status = await watchtogether.command({"mode": "watch", "channel_id": "cmd-room", "action": "status"})
+        self.assertFalse(status["active"])
+        watchtogether.rooms.pop("wh_cmd-room", None)
+        watchtogether.rooms.pop("rh_cmd-room", None)
 
 
 if __name__ == "__main__":

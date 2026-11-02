@@ -6255,8 +6255,7 @@ class MusicCog(commands.Cog):
         if vc and vc.is_connected() and not vc.is_playing() and not vc.is_paused() and not player.queue:
             await player.play_next()
 
-    def _settings_embed(self, player: MusicPlayer, notices: Optional[list[str]] = None,
-                        watch_settings: Optional[dict] = None):
+    def _settings_embed(self, player: MusicPlayer, notices: Optional[list[str]] = None):
         """Complete status card shared by /settings and tests."""
         loop_mode = "Song" if player.loop else ("Queue" if player.loop_queue else "Off")
         filter_labels = {
@@ -6313,14 +6312,6 @@ class MusicCog(commands.Cog):
                   "\nAdmin controls: `/247start` and `/247stop`",
             inline=True,
         )
-        if watch_settings:
-            embed.add_field(
-                name="🎬 WatchTogether • this channel",
-                value=(f"Quality: **{watch_settings['quality']}p**\n"
-                       f"Ad blocking: **{'On' if watch_settings['adblock'] else 'Off'}**\n"
-                       f"SponsorBlock: **{'On' if watch_settings['sponsorblock'] else 'Off'}**"),
-                inline=False,
-            )
         embed.set_footer(text="Run /settings again with any options you want to change.")
         return embed
 
@@ -6338,9 +6329,6 @@ class MusicCog(commands.Cog):
         karaoke="Remove vocals and show live lyrics for every song",
         sleep_timer_minutes="Stop and leave after this many minutes; 0 cancels",
         idle_disconnect_minutes="Leave when idle after this many minutes; 0 means never",
-        watch_quality="WatchTogether download quality for this channel",
-        watch_adblock="Block ads in this channel's shared browser",
-        watch_sponsorblock="Remove sponsored segments from WatchTogether videos",
     )
     @app_commands.choices(
         loop_mode=[
@@ -6355,12 +6343,6 @@ class MusicCog(commands.Cog):
             app_commands.Choice(name="8D", value="8d"),
             app_commands.Choice(name="Karaoke (filter only)", value="karaoke"),
             app_commands.Choice(name="Off", value="off"),
-        ],
-        watch_quality=[
-            app_commands.Choice(name="360p", value=360),
-            app_commands.Choice(name="480p", value=480),
-            app_commands.Choice(name="720p", value=720),
-            app_commands.Choice(name="1080p", value=1080),
         ],
     )
     async def settings(
@@ -6380,9 +6362,6 @@ class MusicCog(commands.Cog):
         karaoke: Optional[bool] = None,
         sleep_timer_minutes: Optional[app_commands.Range[int, 0, 480]] = None,
         idle_disconnect_minutes: Optional[app_commands.Range[int, 0, 60]] = None,
-        watch_quality: Optional[int] = None,
-        watch_adblock: Optional[bool] = None,
-        watch_sponsorblock: Optional[bool] = None,
     ):
         await interaction.response.defer(ephemeral=True)
         player = self.get_player(interaction.guild)
@@ -6390,9 +6369,6 @@ class MusicCog(commands.Cog):
         notices = []
         durable_changed = False
         rebuild_audio = False
-        import watchtogether
-        watch_room_id = 'w' + str(interaction.channel.id)
-        watch_cfg = watchtogether.get_settings(watch_room_id)
 
         if volume is not None:
             player.volume = volume / 100
@@ -6515,16 +6491,6 @@ class MusicCog(commands.Cog):
                 )
                 notices.append(f"Sleep timer set to {sleep_timer_minutes} min")
 
-        if any(value is not None for value in
-               (watch_quality, watch_adblock, watch_sponsorblock)):
-            watch_cfg = watchtogether.update_settings(
-                watch_room_id,
-                quality=watch_quality,
-                adblock=watch_adblock,
-                sponsorblock=watch_sponsorblock,
-            )
-            notices.append("WatchTogether settings updated for this channel")
-
         if durable_changed:
             self.save_player_settings(player)
 
@@ -6536,7 +6502,7 @@ class MusicCog(commands.Cog):
                                "Audio changes apply from the next song")
 
         await interaction.followup.send(
-            embed=self._settings_embed(player, notices, watch_cfg), ephemeral=True
+            embed=self._settings_embed(player, notices), ephemeral=True
         )
 
         if karaoke is True and vc and (vc.is_playing() or vc.is_paused()) and player.current:
@@ -8026,47 +7992,6 @@ class MusicCog(commands.Cog):
             f"*This link is unique to you and authorizes access to control the music player in this server.*",
             ephemeral=True
         )
-
-    @app_commands.command(name="watch", description="Start a Watch Together room for this channel (synced videos + chat)")
-    async def watch_cmd(self, interaction: discord.Interaction):
-        if not getattr(config, 'WATCHTOGETHER_ENABLED', True):
-            await interaction.response.send_message("🎬 Watch Together is disabled in the bot configuration.", ephemeral=True)
-            return
-        import watchtogether
-        url = watchtogether.get_room_link(interaction.channel.id, f"#{interaction.channel.name}", 'watch')
-        embed = discord.Embed(
-            title="🎬 Watch Together",
-            description=(
-                f"**[Click here to join the room]({url})**\n\n"
-                "▶️ Play/pause/seek is synced for everyone\n"
-                "➕ Add anything yt-dlp understands: YouTube, Shorts, Reels, TikTok, Twitter…\n"
-                "💬 Built-in chat\n\n"
-                "*Everyone in this channel can use the same link.*"
-            ),
-            color=0x7c6cf0,
-        )
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="reels", description="ReelsTogether: swipe through short videos in sync with friends")
-    async def reels_cmd(self, interaction: discord.Interaction):
-        if not getattr(config, 'WATCHTOGETHER_ENABLED', True):
-            await interaction.response.send_message("📱 ReelsTogether is disabled in the bot configuration.", ephemeral=True)
-            return
-        import watchtogether
-        url = watchtogether.get_room_link(interaction.channel.id, f"#{interaction.channel.name}", 'reels')
-        embed = discord.Embed(
-            title="📱 ReelsTogether",
-            description=(
-                f"**[Click here to start swiping]({url})**\n\n"
-                "⬆️ Swipe up and everyone moves to the next reel\n"
-                "⬇️ Swipe down to return to a recent reel\n"
-                "❤️ Double-tap to like — the feed learns what you're into\n"
-                "➕ Paste your own Reels / Shorts / TikToks into the feed\n\n"
-                "*Works best on your phone. Everyone in this channel shares the feed.*"
-            ),
-            color=0xe0559a,
-        )
-        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="loop", description="Toggle loop mode")
     @app_commands.describe(mode="Loop mode: song, queue, or off")

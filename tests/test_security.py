@@ -117,7 +117,7 @@ class AuthorizationTests(unittest.TestCase):
         self.assertNotIn(token, webui.temp_tokens)
 
     def test_media_is_bound_to_room_queue(self):
-        room = watchtogether.Room("w1", "Room")
+        room = watchtogether.Room("wh_1", "Room")
         room.queue.append({"file": "video.mp4"})
         room.queue.append({"file": "hls/abc/index.m3u8"})
         self.assertTrue(watchtogether._room_owns_file(room, "video.mp4"))
@@ -128,39 +128,34 @@ class AuthorizationTests(unittest.TestCase):
             watchtogether._room_owns_file(room, "hls/abc/../../other.mp4")
         )
 
-    def test_invitation_links_keep_credentials_out_of_query_string(self):
-        room_id = "w987654321"
-        try:
-            with mock.patch.object(watchtogether, "_save_tokens"):
-                link = watchtogether.get_room_link(987654321, "Test", "watch")
-            self.assertIn(f"?room={room_id}#token=", link)
-            self.assertNotIn("&token=", link)
-        finally:
-            for token, info in list(watchtogether.tokens.items()):
-                if info.get("room") == room_id:
-                    watchtogether.tokens.pop(token, None)
+    def test_only_hoffle_room_ids_are_valid(self):
+        self.assertEqual(watchtogether._room_id("watch", "kitchen-table"), "wh_kitchen-table")
+        self.assertEqual(watchtogether._room_id("reels", "abc"), "rh_abc")
+        for bad in ("", "../x", "a b", "x" * 81):
+            with self.assertRaises(ValueError):
+                watchtogether._room_id("watch", bad)
 
 
 class SessionExchangeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_watch_link_exchanges_for_httponly_room_cookie(self):
-        token = "watch-session-test"
-        room_id = "w-session-test"
-        watchtogether.tokens[token] = {
-            "room": room_id, "name": "Test", "created_at": watchtogether.time.time()
-        }
-        try:
-            response = await watchtogether.api_session(
-                JsonRequest({"room": room_id, "token": token})
-            )
-            self.assertEqual(response.status, 200)
-            name = watchtogether._room_cookie_name(room_id)
-            member_name = watchtogether._room_member_cookie_name(room_id)
-            self.assertIn(name, response.cookies)
-            self.assertTrue(response.cookies[name]["httponly"])
-            self.assertIn(member_name, response.cookies)
-            self.assertTrue(response.cookies[member_name]["httponly"])
-        finally:
-            watchtogether.tokens.pop(token, None)
+    async def test_ticket_is_one_time_and_bound_to_its_room(self):
+        with mock.patch.object(watchtogether.sessions, "touch"):
+            issued = watchtogether.issue_ticket({
+                "mode": "watch", "channel_id": "sess-room", "room_name": "Room",
+                "user": {"id": "u1", "name": "Ada"},
+            })
+            other = await watchtogether.api_session(
+                JsonRequest({"room": "wh_other-room", "ticket": issued["ticket"]}))
+            self.assertEqual(other.status, 401)
+            issued = watchtogether.issue_ticket({
+                "mode": "watch", "channel_id": "sess-room", "user": {"id": "u1", "name": "Ada"},
+            })
+            first = await watchtogether.api_session(
+                JsonRequest({"room": issued["room"], "ticket": issued["ticket"]}))
+            again = await watchtogether.api_session(
+                JsonRequest({"room": issued["room"], "ticket": issued["ticket"]}))
+        self.assertEqual(first.status, 200)
+        self.assertEqual(again.status, 401)
+        self.assertNotIn("Set-Cookie", first.headers)
 
     async def test_dashboard_password_exchanges_for_opaque_cookie(self):
         ui = webui.WebUI(None)
