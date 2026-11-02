@@ -24,6 +24,8 @@ import shutil
 import struct
 import time
 
+from urllib.parse import quote
+
 import aiohttp
 from aiohttp import web
 
@@ -604,6 +606,28 @@ def station_entries(station, stemmed, taken=(), count=16, rng=None, heard=()):
     rng.shuffle(without)
     stale.sort(key=lambda x: x[:2])
     return (with_stems + without + [song for *_k, song in stale])[:count]
+
+
+def _lyrics_source(source, track, artist, lrclib_id=None):
+    """Where lyrics came from and a page about them there, for Hoffle's
+    "Lyrics from …" line: lrclib's own track page when its id is known (else
+    an lrclib search), or the song's Musixmatch page."""
+    if source == 'musixmatch':
+        def slug(text):
+            text = re.sub(r"[^\w\s'-]+", ' ', str(text or ''))
+            return quote(re.sub(r'\s+', '-', text.strip()))
+        url = (f'https://www.musixmatch.com/lyrics/{slug(artist)}/{slug(track)}'
+               if slug(artist) and slug(track) else 'https://www.musixmatch.com/')
+        return {'source': 'musixmatch', 'source_url': url}
+    try:
+        lrclib_id = int(lrclib_id) if lrclib_id else None
+    except (TypeError, ValueError):
+        lrclib_id = None
+    if lrclib_id:
+        return {'source': 'lrclib', 'source_url': f'https://lrclib.net/tracks/{lrclib_id}'}
+    words = ' '.join(str(part) for part in (artist, track) if part).strip()
+    return {'source': 'lrclib',
+            'source_url': f'https://lrclib.net/search/{quote(words)}' if words else 'https://lrclib.net/'}
 
 
 def _thumbnail_from_url(url, thumbnail=None):
@@ -2179,6 +2203,7 @@ class WebUI:
                     'lines': saved.get('lines') or [],
                     'synced': True,
                     'loose': bool(saved.get('loose')),
+                    **_lyrics_source('lrclib', saved.get('track'), saved.get('artist'), saved.get('lrclib_id')),
                 })
             if found and found.get('lyrics'):
                 return web.json_response(dict(self._musixmatch_json(cog, terms, found),
@@ -2196,6 +2221,7 @@ class WebUI:
                 'lines': synced.get('lines') or [],
                 'synced': True,
                 'loose': bool(synced.get('loose')),
+                **_lyrics_source('lrclib', synced.get('track'), synced.get('artist'), synced.get('lrclib_id')),
             })
 
         if mxm and mode == '1':
@@ -2219,6 +2245,7 @@ class WebUI:
             'synced': False,
             'loose': bool(plain.get('loose')),
             'musixmatch_checked': checked,
+            **_lyrics_source('lrclib', plain.get('track'), plain.get('artist'), plain.get('lrclib_id')),
         })
 
     async def api_huddle_search(self, request):
@@ -2290,7 +2317,7 @@ class WebUI:
             'lines': found.get('lines') or [],
             'synced': bool(found.get('lines')),
             'loose': loose,
-            'source': 'musixmatch',
+            **_lyrics_source('musixmatch', matched_track or track, matched_artist or artist),
         }
         if found.get('lines'):
             if found.get('version_length'):

@@ -5299,6 +5299,8 @@ class MusicCog(commands.Cog):
                 'artist': self._format_artist_display(item.get('artistName') or 'Unknown'),
                 'lyrics': lyrics,
             }
+            if item.get('id'):
+                result['lrclib_id'] = item['id']
             if loose:
                 result['loose'] = True
             return result
@@ -5484,6 +5486,8 @@ class MusicCog(commands.Cog):
                 'artist': self._format_artist_display(item.get('artistName') or 'Unknown'),
                 'lines': parsed_lines,
             }
+            if item.get('id'):
+                result['lrclib_id'] = item['id']
             if loose:
                 result['loose'] = True
             break

@@ -217,6 +217,7 @@ class EndpointGateTests(unittest.IsolatedAsyncioTestCase):
         data = await self.ask(ui, "q=manifest+-+Zehir&duration=180&musixmatch=1")
         mxm.lookup.assert_awaited_once_with("Zehir", "manifest", 180)
         self.assertEqual(data["source"], "musixmatch")
+        self.assertEqual(data["source_url"], "https://www.musixmatch.com/lyrics/manifest/Zehir")
         self.assertEqual(data["lines"], [[1.0, "x"]])
 
     async def test_without_the_flag_or_from_an_invite_link_it_is_never_asked(self):
@@ -230,7 +231,8 @@ class EndpointGateTests(unittest.IsolatedAsyncioTestCase):
         ui, mxm = self.make_ui(synced={"track": "Zehir", "artist": "manifest", "lines": [[2.0, "y"]]})
         data = await self.ask(ui, "q=manifest+-+Zehir&musixmatch=1")
         mxm.lookup.assert_not_awaited()
-        self.assertNotIn("source", data)
+        self.assertEqual(data["source"], "lrclib")
+        self.assertEqual(data["source_url"], "https://lrclib.net/search/manifest%20Zehir")
 
     async def test_the_music_player_reads_musixmatch_answers_without_asking(self):
         ui, mxm = self.make_ui()
@@ -263,6 +265,17 @@ class EndpointGateTests(unittest.IsolatedAsyncioTestCase):
         import inspect
         self.assertNotIn("musixmatch", inspect.getsource(MusicCog._fetch_synced_lyrics).lower())
 
+
+
+class LyricsSourceLinkTests(unittest.TestCase):
+    def test_links_point_at_the_lyrics_page(self):
+        import webui
+        self.assertEqual(webui._lyrics_source("lrclib", "Hello", "Adele", 3396226),
+                         {"source": "lrclib", "source_url": "https://lrclib.net/tracks/3396226"})
+        self.assertEqual(webui._lyrics_source("musixmatch", "Mayın Tarlası", "Şebnem Ferah")["source_url"],
+                         "https://www.musixmatch.com/lyrics/%C5%9Eebnem-Ferah/May%C4%B1n-Tarlas%C4%B1")
+        self.assertEqual(webui._lyrics_source("musixmatch", "Zehir", "manifest feat. Pango")["source_url"],
+                         "https://www.musixmatch.com/lyrics/manifest-feat-Pango/Zehir")
 
 
 class PlayerSearchTests(unittest.IsolatedAsyncioTestCase):
