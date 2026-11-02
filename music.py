@@ -5355,6 +5355,16 @@ class MusicCog(commands.Cog):
         self._lyrics_file_cache[cache_path] = (mtime, data)
         return data
 
+    def _cached_synced_lyrics(self, query: str, artist: Optional[str] = None) -> Optional[dict]:
+        """Synced lyrics already saved for this song (by /lyricsnow, the 🎤
+        button, a prefetch), without asking lrclib anything."""
+        track_query, artist = self._lyrics_search_context(query, artist)
+        try:
+            data = self._read_cached_lyrics(self._get_lyrics_cache_path(track_query, artist))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) and data.get('lines') else None
+
     def _clean_lyrics_query_hard(self, query: str) -> str:
         """Last-resort title cleanup: drop every bracketed tag and feat. credit."""
         text = re.sub(r'\s*[\[(][^\])]*[\])]', '', query or '')

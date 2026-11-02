@@ -2168,6 +2168,24 @@ class WebUI:
             if found and found['lines']:
                 return web.json_response(self._musixmatch_json(cog, terms, found))
 
+        if request.query.get('cached_only') == '1':
+            # Hoffle's music player on a new song: only lyrics already saved,
+            # nothing is looked up until someone presses "Search for lyrics".
+            saved = cog._cached_synced_lyrics(query, artist)
+            if saved:
+                return web.json_response({
+                    'track': saved.get('track'),
+                    'artist': saved.get('artist'),
+                    'lines': saved.get('lines') or [],
+                    'synced': True,
+                    'loose': bool(saved.get('loose')),
+                })
+            if found and found.get('lyrics'):
+                return web.json_response(dict(self._musixmatch_json(cog, terms, found),
+                                              musixmatch_checked=checked))
+            return web.json_response({'track': None, 'lines': [], 'lyrics': None,
+                                      'musixmatch_checked': checked})
+
         # Only Huddle's /lyrics and /lyricsnow call this, so a person is asking:
         # look again even if the play-time prefetch missed a few minutes ago.
         synced = await cog._fetch_synced_lyrics(query, artist, duration, fresh=True)

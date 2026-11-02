@@ -244,6 +244,20 @@ class EndpointGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["lines"], [[3.0, "z"]])
         mxm.lookup.assert_not_awaited()
 
+    async def test_cached_only_never_looks_anything_up(self):
+        ui, mxm = self.make_ui()
+        cog = ui.cog
+        cog._cached_synced_lyrics = mock.Mock(return_value=None)
+        data = await self.ask(ui, "q=manifest+-+Zehir&musixmatch=cached&cached_only=1")
+        self.assertEqual(data["lines"], [])
+        cog._fetch_synced_lyrics.assert_not_awaited()
+        cog._fetch_lyrics.assert_not_awaited()
+        mxm.lookup.assert_not_awaited()
+        cog._cached_synced_lyrics.return_value = {"track": "Zehir", "artist": "manifest", "lines": [[4.0, "saved"]]}
+        data = await self.ask(ui, "q=manifest+-+Zehir&musixmatch=cached&cached_only=1")
+        self.assertEqual((data["lines"], data["synced"]), ([[4.0, "saved"]], True))
+        cog._fetch_synced_lyrics.assert_not_awaited()
+
     def test_the_discord_lyrics_path_has_no_musixmatch_left(self):
         self.assertFalse(hasattr(MusicCog, "_fetch_musixmatch_lyrics"))
         import inspect
