@@ -96,6 +96,72 @@ class LyricsPickTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(os.path.abspath(path).startswith(os.path.abspath(self.dir.name) + os.sep))
 
 
+class MusixmatchInThePickerTests(unittest.IsolatedAsyncioTestCase):
+    """When lrclib's versions are all wrong, the picker can ask Musixmatch."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        for name, value in (("LYRICS_PICKS_DIR", self.dir.name),):
+            patcher = mock.patch.object(webui, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        admin = mock.patch.object(webui.WebUI, "_authorized_admin", return_value=True)
+        admin.start()
+        self.addCleanup(admin.stop)
+        self.cog = MusicCog.__new__(MusicCog)
+        self.cog._lrclib_search = mock.AsyncMock(return_value=LRCLIB[3:4])
+        self.ui = webui.WebUI(SimpleNamespace(get_cog=lambda name: self.cog))
+        self.answer = {"track": "Kanıyorduk", "artist": "Redd", "lines": [[19.9, "Resmini buldum"], [25.0, "♪"], [30.0, "ikinci"]],
+                       "lyrics": "", "length": 266.0, "source": "musixmatch"}
+        self.mxm = mock.Mock(api_key="key")
+        self.mxm.cached.return_value = (None, False)
+        self.mxm.lookup = mock.AsyncMock(return_value=self.answer)
+        self.mxm.left.return_value = 296
+        self.ui._musixmatch = self.mxm
+
+    async def post(self, handler, body):
+        request = make_mocked_request("POST", "/x")
+        request.json = mock.AsyncMock(return_value=body)
+        return json.loads((await handler(request)).text)
+
+    async def test_the_list_says_what_would_be_asked_without_asking(self):
+        data = json.loads((await self.ui.api_lyrics_candidates(make_mocked_request(
+            "GET", "/x?title=paga+play+-+Redd+-+Kan%C4%B1yorduk&duration=266"))).text)
+        self.assertEqual(data["musixmatch"], {"track": "Kanıyorduk", "artist": "Redd", "answered": False,
+                                              "candidate": None, "left": 296})
+        self.mxm.lookup.assert_not_awaited()
+
+    async def test_asking_shows_its_answer_and_using_it_saves_the_pick(self):
+        data = await self.post(self.ui.api_lyrics_ask_musixmatch,
+                               {"title": "paga play - Redd - Kanıyorduk", "duration": 266})
+        self.mxm.lookup.assert_awaited_once_with("Kanıyorduk", "Redd", 266)
+        offer = data["musixmatch"]
+        self.assertEqual(offer["candidate"]["snippet"], ["Resmini buldum", "ikinci"])
+        self.assertEqual(offer["candidate"]["url"], "https://www.musixmatch.com/lyrics/Redd/Kan%C4%B1yorduk")
+
+        self.mxm.cached.return_value = (self.answer, True)
+        picked = await self.post(self.ui.api_lyrics_pick, {
+            "title": "paga play - Redd - Kanıyorduk", "scope": "s1", "duration": 266,
+            "musixmatch": {"track": "Kanıyorduk", "artist": "Redd"}})
+        self.assertEqual((picked["source"], picked["picked"], picked["lines"][0]), ("musixmatch", True, [19.9, "Resmini buldum"]))
+        self.cog._fetch_synced_lyrics = mock.AsyncMock()
+        later = json.loads((await self.ui.api_lyrics_search(make_mocked_request(
+            "GET", "/x?q=paga+play+-+Redd+-+Kan%C4%B1yorduk&pick_scope=s1"))).text)
+        self.assertEqual(later["source"], "musixmatch")
+        self.cog._fetch_synced_lyrics.assert_not_awaited()
+
+    async def test_typed_artist_and_song_are_what_gets_asked(self):
+        await self.post(self.ui.api_lyrics_ask_musixmatch,
+                        {"title": "something else", "duration": 200, "q": "Redd - Kanıyorduk"})
+        self.mxm.lookup.assert_awaited_once_with("Kanıyorduk", "Redd", 200)
+
+    async def test_a_musixmatch_pick_needs_its_answer_first(self):
+        data = await self.post(self.ui.api_lyrics_pick, {
+            "title": "x", "scope": "s1", "musixmatch": {"track": "Kanıyorduk", "artist": "Redd"}})
+        self.assertEqual(data, {"error": "Ask Musixmatch first."})
+
+
 class ChannelPrefixTests(unittest.TestCase):
     def setUp(self):
         self.cog = MusicCog.__new__(MusicCog)

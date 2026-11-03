@@ -2281,6 +2281,7 @@ class WebUI:
     @staticmethod
     def _picked_json(pick):
         lines = pick.get('lines') or []
+        source = 'musixmatch' if pick.get('source') == 'musixmatch' else 'lrclib'
         return {
             'track': pick.get('track'),
             'artist': pick.get('artist'),
@@ -2289,8 +2290,35 @@ class WebUI:
             'synced': bool(lines),
             'loose': False,
             'picked': True,
-            **_lyrics_source('lrclib', pick.get('track'), pick.get('artist'), pick.get('lrclib_id')),
+            **_lyrics_source(source, pick.get('track'), pick.get('artist'), pick.get('lrclib_id')),
         }
+
+    @staticmethod
+    def _picker_terms(cog, title, artist, text):
+        """What to ask Musixmatch from the picker: "Artist - Song" typed in its
+        search box, else the playing song's own title."""
+        if text and re.search(r'\s[-–—]\s', text):
+            return cog._musixmatch_terms(text, None)
+        return cog._musixmatch_terms(title, artist)
+
+    def _musixmatch_offer(self, cog, terms, duration, found, answered):
+        """The picker's Musixmatch box: what would be asked, and its answer if it has one."""
+        mxm = self.musixmatch()
+        candidate = None
+        if found:
+            words = [text for _, text in found.get('lines') or [] if text and text != '♪'] or [
+                line.strip() for line in (found.get('lyrics') or '').splitlines() if line.strip()]
+            candidate = {
+                'track': found.get('track') or terms[0],
+                'artist': found.get('artist') or terms[1] or '',
+                'duration': int(found['length']) if found.get('length') else None,
+                'synced': bool(found.get('lines')),
+                'snippet': words[:3],
+                'url': _lyrics_source('musixmatch', found.get('track') or terms[0],
+                                      found.get('artist') or terms[1])['source_url'],
+            }
+        return {'track': terms[0], 'artist': terms[1], 'answered': bool(answered),
+                'candidate': candidate, 'left': mxm.left() if mxm.api_key else 0}
 
     async def api_lyrics_candidates(self, request):
         """Songs on lrclib that could be the one playing, with a few lines of
@@ -2357,7 +2385,38 @@ class WebUI:
             })
             if len(candidates) >= 5:
                 break
-        return web.json_response({'query': text, 'candidates': candidates})
+        terms = self._picker_terms(cog, title, artist, request.query.get('q'))
+        found, answered = self.musixmatch().cached(*terms, duration) if terms[0] else (None, True)
+        return web.json_response({
+            'query': text,
+            'candidates': candidates,
+            'musixmatch': self._musixmatch_offer(cog, terms, duration, found, answered) if terms[0] else None,
+        })
+
+    async def api_lyrics_ask_musixmatch(self, request):
+        """The picker's "Ask Musixmatch": someone asking on purpose, so it may
+        spend one request (never twice for a song: every answer is kept)."""
+        if not self._authorized_admin(request):
+            return web.json_response({'error': 'admin password required'}, status=403)
+        cog = self.cog
+        if not cog:
+            return web.json_response({'error': 'The music bot is starting.'}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        title = str(body.get('title') or '').strip()[:200]
+        artist = str(body.get('artist') or '').strip()[:120] or None
+        try:
+            duration = int(float(body.get('duration') or 0)) or None
+        except (TypeError, ValueError):
+            duration = None
+        terms = self._picker_terms(cog, title, artist, str(body.get('q') or '').strip()[:200])
+        if not terms[0]:
+            return web.json_response({'error': 'Which song?'}, status=400)
+        found = await self.musixmatch().lookup(*terms, duration)
+        _found, answered = self.musixmatch().cached(*terms, duration)
+        return web.json_response({'musixmatch': self._musixmatch_offer(cog, terms, duration, found, answered)})
 
     async def api_lyrics_pick(self, request):
         """Save (or with no lrclib_id, forget) the lyrics someone picked by hand
@@ -2376,6 +2435,27 @@ class WebUI:
         if not title:
             return web.json_response({'error': 'Which song?'}, status=400)
         path = self._lyrics_pick_path(cog, body.get('scope'), title, artist)
+        chosen = body.get('musixmatch')
+        if isinstance(chosen, dict) and chosen.get('track'):
+            try:
+                duration = int(float(body.get('duration') or 0)) or None
+            except (TypeError, ValueError):
+                duration = None
+            found, _known = self.musixmatch().cached(
+                str(chosen['track'])[:200], str(chosen.get('artist') or '')[:120] or None, duration)
+            if not found:
+                return web.json_response({'error': 'Ask Musixmatch first.'}, status=409)
+            pick = {
+                'track': found.get('track') or chosen['track'],
+                'artist': found.get('artist') or chosen.get('artist') or '',
+                'lines': found.get('lines') or [],
+                'lyrics': '' if found.get('lines') else found.get('lyrics') or '',
+                'source': 'musixmatch',
+                'picked_by': str(body.get('by') or '')[:80],
+                'picked_at': time.time(),
+            }
+            await asyncio.to_thread(save_json, path, pick, logger)
+            return web.json_response(self._picked_json(pick))
         if not body.get('lrclib_id'):
             try:
                 os.remove(path)
@@ -2946,6 +3026,7 @@ async def start_web_server(bot):
     app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
     app.router.add_get('/api/lyrics/candidates', ui.api_lyrics_candidates)
     app.router.add_post('/api/lyrics/pick', ui.api_lyrics_pick)
+    app.router.add_post('/api/lyrics/ask-musixmatch', ui.api_lyrics_ask_musixmatch)
     app.router.add_get('/api/admin/musixmatch', ui.api_musixmatch_usage)
     app.router.add_get('/api/stems/status', ui.api_stems_status)
     app.router.add_get('/api/library/songs', ui.api_library_songs)
