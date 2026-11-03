@@ -3352,6 +3352,33 @@ class FakeInteraction:
         self.followup = FakeFollowup(ctx)
 
 
+#: Emoji and other pictographs in upload titles ("Imagine🎶", flags).
+TITLE_PICTOGRAPHS = re.compile('[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200d]+')
+#: Quality and performance tails that are no part of a song's name.
+TITLE_TAILS = re.compile(
+    r'(?:\s+(?:full\s+)?(?:hq|hd|4k|1080p|720p|stereo)\b'
+    r'|\s+(?:\d{4}\s+)?canl[ıi]\s+performans\b'
+    r'|\s+live\s+(?:at|on|from)\b.*)+$', re.IGNORECASE)
+#: A whole title part that is only a version ("Song - Cover", "Song - Live").
+LYRICS_VERSION_ONLY = re.compile(
+    r'(?:\w+\s+)?(?:cover|live|remix|acoustic|akustik|instrumental|karaoke)', re.IGNORECASE)
+
+
+def tidy_song_title(title):
+    """An upload's title down to its "Artist - Song": what follows a "|" only
+    describes it (a show, a country, a year: "Slimane - Mon Amour | Eurovision
+    2024", "hayat | canlı akustik"), and emoji, a leading @, quotes and quality
+    or live-performance tails go too."""
+    text = TITLE_PICTOGRAPHS.sub(' ', str(title or ''))
+    segments = [part.strip() for part in re.split(r'\s+\|\s+', text) if part.strip()]
+    if segments:
+        text = segments[0]
+    text = re.sub(r'(^|\s)@(?=\w)', r'\1', text)
+    text = re.sub(r'[“”"]', '', text)
+    text = TITLE_TAILS.sub('', text.strip())
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 #: A last title part that names a version, not a song ("Artist - Song - Live").
 LYRICS_VERSION_WORDS = re.compile(
     r'\b(?:remix|mix|edit|version|cover|acoustic|akustik|remaster(?:ed)?|live|canl[ıi]|instrumental|karaoke|slowed|sped up)\b',
@@ -5230,8 +5257,8 @@ class MusicCog(commands.Cog):
         tag, "feat." credits and upload-channel suffixes go, and an
         "Artist - Song" title wins over an unrelated upload channel.
         """
-        title = re.sub(r'\.(?:mp3|m4a|flac|ogg|opus|wav|webm|aac)$', '',
-                       (query or '').strip(), flags=re.IGNORECASE)
+        title = tidy_song_title(re.sub(r'\.(?:mp3|m4a|flac|ogg|opus|wav|webm|aac)$', '',
+                                       (query or '').strip(), flags=re.IGNORECASE))
         track, artist = self._lyrics_search_context(title, artist)
         # The known artist opened the title ("Duman - Song - Album"): what is left starts with the song.
         named_first = bool(artist) and track != self._clean_lyrics_query(title)
@@ -5240,8 +5267,8 @@ class MusicCog(commands.Cog):
         parts = [part.strip() for part in re.split(r'\s+[-–—|]\s+', track) if part.strip()]
         if len(parts) >= 2:
             parts = [feat.sub('', part).strip() or part for part in parts]
-            if named_first:
-                track = parts[0]
+            if named_first or (len(parts) == 2 and LYRICS_VERSION_ONLY.fullmatch(parts[1])):
+                track = parts[0]                # "Duman - Song - Album", "Song - Cover"
             elif artist and self._lyrics_artist_matches(artist, parts[-1]) \
                     and not self._lyrics_artist_matches(artist, parts[0]):
                 track = parts[0]                # "Song — Artist" (Spotify)
@@ -5255,6 +5282,8 @@ class MusicCog(commands.Cog):
         for name in self._dedupe_artist_names(artist or ''):
             name = re.sub(r'\s*-\s*topic$', '', name, flags=re.IGNORECASE)
             name = re.sub(r'(?<=[a-z0-9])vevo$', '', name, flags=re.IGNORECASE).strip()
+            name = re.sub(r'\s*[-–—]?\s*official(?:\s+(?:channel|music|artist))?$', '', name,
+                          flags=re.IGNORECASE).strip()
             if name:
                 names.append(name)
         return track, ', '.join(self._dedupe_artist_names(names)[:3]) or None
@@ -5382,7 +5411,7 @@ class MusicCog(commands.Cog):
 
     def _clean_lyrics_query_hard(self, query: str) -> str:
         """Last-resort title cleanup: drop every bracketed tag and feat. credit."""
-        text = re.sub(r'\s*[\[(][^\])]*[\])]', '', query or '')
+        text = re.sub(r'\s*[\[(][^\])]*[\])]', '', tidy_song_title(query))
         text = re.sub(r'\s+(?:ft\.?|feat\.?|featuring)\s+.*$', '', text, flags=re.IGNORECASE)
         text = re.sub(r'\s*[-|]\s*(?:official|lyrics?|video|audio|live|hd|4k|topic)\b.*$', '',
                       text, flags=re.IGNORECASE)
@@ -5408,6 +5437,8 @@ class MusicCog(commands.Cog):
         if len(parts) == 2 and parts[0].strip() and parts[1].strip():
             left, right = parts[0].strip(), parts[1].strip()
             rungs.append((f'{left} {right}', right, left, False))
+            # "Song - Artist", the other way round: counts only if lrclib's artist is that half.
+            rungs.append((f'{right} {left}', left, right, False))
             # "Channel - Artist - Song" (an uploader's name in front)
             inner = [part.strip() for part in re.split(r'\s+[-–—|]\s+', right, maxsplit=1)]
             if len(inner) == 2 and all(inner) and not LYRICS_VERSION_WORDS.search(inner[1]):

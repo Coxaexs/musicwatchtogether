@@ -109,6 +109,31 @@ class ChannelPrefixTests(unittest.TestCase):
         # a version word last: the artist came first, the song is the middle part
         self.assertEqual(terms("Redd - Kanıyorduk - Remix", None), ("Kanıyorduk", "Redd"))
 
+    def test_titles_hoffle_rooms_played(self):
+        terms = self.cog._musixmatch_terms
+        cases = [
+            (("Slimane - Mon Amour (LIVE) | France 🇫🇷 | Grand Final | Eurovision 2024", "Eurovision Song Contest"),
+             ("Mon Amour", "Slimane")),
+            (("hayat | canlı akustik @ Sirkeci Garı - mor ve ötesi", "mor ve ötesi - official channel"),
+             ("hayat", "mor ve ötesi")),
+            (("John Lennon - Imagine (Lyrics)🎶", "Vhic Playlist"), ("Imagine", "John Lennon")),
+            (("@TheMarias - No One Noticed (Lyrics)", "Dan Music"), ("No One Noticed", "TheMarias")),
+            (("Sakin - Laleler Beyaz [Official Video Klip] HQ", "osde86"), ("Laleler Beyaz", "Sakin")),
+            (("Model ve Fatma Turgut - Levlâ Vazgeçti (Bitmedi Hikayemiz) 2026 Canlı performans", "Buğra Konserde"),
+             ("Levlâ Vazgeçti", "Model ve Fatma Turgut")),
+            (("Mor Ve Ötesi - Uyan | Remastered (1080p) Stereo", "Klip Arşivi"), ("Uyan", "Mor Ve Ötesi")),
+            (("Just the Two of Us - Cover", "Lucy Ellis"), ("Just the Two of Us", "Lucy Ellis")),
+            (("Martin Solveig - Intoxicated - Radio Edit (Lyrics)", "Careless"), ("Intoxicated", "Martin Solveig")),
+            (("Redd - Kanıyorduk", "paga play"), ("Kanıyorduk", "Redd")),
+        ]
+        for (title, artist), expected in cases:
+            with self.subTest(title=title):
+                self.assertEqual(terms(title, artist), expected)
+
+    def test_lrclib_also_tries_song_then_artist(self):
+        rungs = self.cog._lyrics_search_rungs("Senden Önce Senden Sonra - Teoman (Official Video)", "MuzikPlay")
+        self.assertIn(("Teoman Senden Önce Senden Sonra", "Senden Önce Senden Sonra", "Teoman", False), rungs)
+
     def test_lrclib_also_tries_the_artist_after_the_channel(self):
         rungs = self.cog._lyrics_search_rungs("paga play - Redd - Kanıyorduk", None)
         self.assertIn(("Redd - Kanıyorduk", "Kanıyorduk", "Redd", False), rungs)
