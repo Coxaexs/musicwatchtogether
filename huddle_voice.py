@@ -12,7 +12,6 @@ from fractions import Fraction
 import json
 import logging
 import os
-import re
 import socket
 import sys
 import time
@@ -235,11 +234,12 @@ class RoomAudioTrack(MediaStreamTrack):
 
     @staticmethod
     async def _spawn(url: str, position_seconds: float, filters: list):
+        # ffmpeg refuses to open a file with these: they are http options.
+        network = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
         command = [
             "ffmpeg", "-nostdin", "-loglevel", "error",
             "-ss", f"{max(0.0, position_seconds):.3f}",
-            "-reconnect", "1", "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "2",
+            *(network if url.startswith("http") else []),
             "-i", url, "-vn", "-af", ",".join(filters),
             "-acodec", "pcm_s16le", "-f", "s16le",
             "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), "pipe:1",
@@ -986,8 +986,8 @@ AUTOPLAY_WAITS = (15, 30)
 #: Picks a room could not play, so the next try asks for something else.
 AUTOPLAY_SKIP_KEEP = 50
 
-#: The YouTube id in a library filename: "Title - [id].mp3", or the older "ytdl_id.mp3".
-LIBRARY_VIDEO_ID = re.compile(r"\[([0-9A-Za-z_-]{11})\]\.\w+$|^ytdl_([0-9A-Za-z_-]{11})\.")
+#: Forget which file each track uses past this many, so it cannot grow forever.
+TRACK_FILES_KEEP = 5000
 
 
 def hoffle_query(song) -> str:
@@ -995,14 +995,14 @@ def hoffle_query(song) -> str:
     file on this disk, so a library song goes by its YouTube id, or else its name."""
     if song.source_type != "local":
         return song.url
-    match = LIBRARY_VIDEO_ID.search(os.path.basename(song.url or ""))
-    if match:
-        return f"https://www.youtube.com/watch?v={match.group(1) or match.group(2)}"
+    video_id = huddle.library_video_id(song.url)
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
     return f"{song.artist or ''} {song.title}".strip()
 
 
 class HuddleVoiceManager:
-    def __init__(self, cog=None, song_class=None):
+    def __init__(self, cog=None, song_class=None, download_of=None):
         self.headers = {
             "Authorization": f"Bearer {config.HUDDLE_BOT_TOKEN}",
             "Accept": "application/json",
@@ -1010,6 +1010,11 @@ class HuddleVoiceManager:
         self.publishers = {}
         self.cog = cog
         self.song_class = song_class
+        #: link -> the file we already have for it, or None
+        self.download_of = download_of
+        #: track id -> the file it plays from, or None. Decided once per track,
+        #: so a download finishing halfway through a song cannot restart it.
+        self.track_files = {}
         self.autoplay_tasks = {}
         #: channel id -> {"track", "tries", "at"}: the song a room is failing to follow
         self.autoplay_retries = {}
@@ -1144,6 +1149,7 @@ class HuddleVoiceManager:
         for server in data.get("servers") or []:
             for room in server.get("voiceChannels") or []:
                 player = room.get("player") or {}
+                await self._use_downloads(player)
                 players[room["id"]] = player
                 if player.get("track"):
                     self._resolve_upcoming(room["id"], player)
@@ -1170,6 +1176,38 @@ class HuddleVoiceManager:
                 publisher = RoomPublisher(channel_id, self.headers)
                 self.publishers[channel_id] = publisher
             await publisher.update(player)
+
+    async def _use_downloads(self, player: dict):
+        """Point a room's songs at the files we already have, so they play from disk.
+
+        Done here, as the room's state arrives, so everything after it (the player,
+        AutoMix, karaoke, the DJ booth) sees one source for a song. A placeholder is
+        left alone: Hoffle has to resolve it first, and that finds the download too.
+        """
+        tracks = [track for track in [player.get("track"), *(player.get("queue") or [])] if track]
+        unseen = [track for track in tracks if track.get("audioUrl") and track.get("id") not in self.track_files]
+        if unseen:
+            if len(self.track_files) > TRACK_FILES_KEEP:
+                self.track_files.clear()
+            self.track_files.update(await asyncio.to_thread(self._find_downloads, unseen))
+        for track in tracks:
+            audio = str(track.get("audioUrl") or "")
+            path = self.track_files.get(track.get("id"))
+            if audio and path:
+                track["hubAudioUrl"] = audio
+                track["audioUrl"] = path
+            elif audio.startswith(huddle.LIBRARY_AUDIO):
+                track["audioUrl"] = ""  # the file has gone: _resolve_upcoming asks Hoffle again
+
+    def _find_downloads(self, tracks: list) -> dict:
+        found = {}
+        for track in tracks:
+            try:
+                found[track.get("id")] = self.download_of(track.get("pageUrl")) if self.download_of else None
+            except Exception as error:
+                logger.warning("Could not look for a download of %r: %s", track.get("title"), error)
+                found[track.get("id")] = None
+        return found
 
     async def _observe_room(self, channel_id: str, player: dict):
         track = player.get("track") or {}

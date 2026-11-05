@@ -1891,7 +1891,7 @@ class HuddleCrate:
             return
         await huddle._request("POST", "/api/bot/player", {
             "channelId": self.channel_id,
-            "action": {"name": "playnext", "track": {**track, "playNext": False}}})
+            "action": {"name": "playnext", "track": {**huddle.as_hub_knows_it(track), "playNext": False}}})
 
     async def add(self, query, requester=None):
         import huddle

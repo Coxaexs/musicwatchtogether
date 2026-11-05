@@ -1950,6 +1950,9 @@ class WebUI:
                 song = await self.bot.loop.run_in_executor(
                     None, self.cog._local_song_for_query, query, requester)
                 if not song:
+                    song = await self.bot.loop.run_in_executor(
+                        None, self.cog._download_for_link, query, requester)
+                if not song:
                     song = await self.cog.process_youtube(query, requester)
                 if song:
                     songs = [song]
@@ -1977,24 +1980,38 @@ class WebUI:
             except (TypeError, ValueError):
                 return None
 
-        return web.json_response({
-            'tracks': [{
+        def download_id(song):
+            if song.source_type == 'local':
+                return huddle.library_video_id(song.url)
+            return self.cog.downloaded_video_id(song.url)
+
+        def described(song, video_id):
+            # A song on our disk goes by its YouTube link: Hoffle never sees the
+            # path, and `library` tells it no stream is needed.
+            link = f'https://www.youtube.com/watch?v={video_id}' if video_id else song.url
+            cover = f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg' if video_id else None
+            return {
                 'title': song.title,
                 'artist': getattr(song, 'artist', None),
                 'duration': duration_seconds(song.duration),
-                'thumbnail': song.thumbnail,
-                'page_url': song.url,
+                'thumbnail': song.thumbnail or cover,
+                'page_url': link,
                 'source_type': song.source_type,
-                'key': song_key(song.url),
+                'key': song_key(link),
+                'library': video_id,
                 # Lazy Spotify entries use this form; yt-dlp needs the search
                 # text rather than the pseudo URL.
                 'resolve_query': (
-                    song.url.replace('spotify:search:', '', 1)
-                    if str(song.url).startswith('spotify:search:')
-                    else song.url
+                    link.replace('spotify:search:', '', 1)
+                    if str(link).startswith('spotify:search:')
+                    else link
                 ),
-            } for song in songs[:50]],
-        })
+            }
+
+        songs = songs[:50]
+        # Off the loop: a miss can rescan the library on disk.
+        ids = await self.bot.loop.run_in_executor(None, lambda: [download_id(song) for song in songs])
+        return web.json_response({'tracks': [described(song, video_id) for song, video_id in zip(songs, ids)]})
 
     async def api_lyrics(self, request):
         if huddle.is_huddle_id(request.match_info.get('guild_id', '')):

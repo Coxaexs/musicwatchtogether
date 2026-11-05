@@ -1091,6 +1091,12 @@ def extract_youtube_video_id(url: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def download_of(url: str) -> Optional[str]:
+    """The file we already have for a YouTube link, if any."""
+    video_id = extract_youtube_video_id(url or '')
+    return find_cached_song(video_id) if video_id else None
+
+
 def normalize_youtube_url(url: str) -> str:
     """Strip playlist/share junk (list=, si=, index=...) down to a canonical watch URL."""
     video_id = extract_youtube_video_id(url)
@@ -3508,17 +3514,34 @@ class MusicCog(commands.Cog):
             stem = re.sub(r'\s*-?\s*\[[0-9A-Za-z_-]{11}\]$', '', stem).strip()
             title, artist = parse_local_song_name(path)
             if text == stem.lower() or text == title.lower():
-                duration_seconds = _probe_duration_seconds(path)
-                logger.info(f"📁 Playing from library: {title}")
-                return Song(
-                    title=title,
-                    url=path,
-                    duration=self.format_duration(duration_seconds) if duration_seconds else 'Unknown',
-                    requester=requester,
-                    source_type='local',
-                    artist=artist
-                )
+                return self._library_song(path, requester)
         return None
+
+    def _download_for_link(self, query: str, requester) -> Optional[Song]:
+        """A YouTube link to a song already on disk, without asking YouTube.
+
+        Blocking (library index + ffprobe): call from an executor.
+        """
+        path = download_of(query)
+        return self._library_song(path, requester) if path else None
+
+    def _library_song(self, path: str, requester) -> Song:
+        title, artist = parse_local_song_name(path)
+        duration_seconds = _probe_duration_seconds(path)
+        logger.info(f"📁 Playing from library: {title}")
+        return Song(
+            title=title,
+            url=path,
+            duration=self.format_duration(duration_seconds) if duration_seconds else 'Unknown',
+            requester=requester,
+            source_type='local',
+            artist=artist
+        )
+
+    @staticmethod
+    def downloaded_video_id(url: str) -> Optional[str]:
+        """The id of a YouTube link we have the file for."""
+        return extract_youtube_video_id(url or '') if download_of(url) else None
 
     @staticmethod
     def _artist_key(value: Optional[str]) -> str:
@@ -8713,7 +8736,7 @@ async def main():
         if getattr(config, 'HUDDLE_ENABLED', True) and config.HUDDLE_BASE_URL:
             try:
                 import huddle_voice
-                huddle_voice_manager = huddle_voice.HuddleVoiceManager(cog, Song)
+                huddle_voice_manager = huddle_voice.HuddleVoiceManager(cog, Song, download_of)
                 await huddle_voice_manager.start()
             except Exception as e:
                 logger.error(f"Huddle WebRTC voice failed to start: {e}")

@@ -15,6 +15,7 @@ import logging
 import json
 import os
 import hashlib
+import re
 import time
 from collections import Counter, deque
 from datetime import datetime
@@ -117,6 +118,26 @@ def update_settings(channel_or_guild_id, **patch):
 
 def enabled():
     return bool(config.HUDDLE_BASE_URL and config.HUDDLE_BOT_TOKEN)
+
+
+#: Hoffle's audioUrl for a song we play from our own download. huddle_voice swaps
+#: it for the file, so no YouTube stream is needed.
+LIBRARY_AUDIO = 'library:'
+#: The YouTube id in a library filename: "Title - [id].mp3", or the older "ytdl_id.mp3".
+LIBRARY_VIDEO_ID = re.compile(r'\[([0-9A-Za-z_-]{11})\]\.\w+$|^ytdl_([0-9A-Za-z_-]{11})\.')
+
+
+def library_video_id(path):
+    match = LIBRARY_VIDEO_ID.search(os.path.basename(path or ''))
+    return (match.group(1) or match.group(2)) if match else None
+
+
+def as_hub_knows_it(track):
+    """A room's track without our local file in it, to send back to Hoffle."""
+    known = dict(track)
+    if 'hubAudioUrl' in known:
+        known['audioUrl'] = known.pop('hubAudioUrl')
+    return known
 
 
 def is_huddle_id(guild_id):
