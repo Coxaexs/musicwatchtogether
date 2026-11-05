@@ -6,11 +6,13 @@ and publishes the resulting audio as a genuine WebRTC bot participant.
 """
 
 import asyncio
+from collections import deque
 import gc
 from fractions import Fraction
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import time
@@ -976,6 +978,29 @@ def keep_audio_loop_responsive():
     logger.info("Audio loop: 0.5 ms thread switching, %d startup objects frozen out of GC", gc.get_freeze_count())
 
 
+#: Autoplay picks a song in the last 75 s of the one playing. Each try costs a
+#: YouTube lookup, so a room gets this many per song, this far apart, and then
+#: waits for the next song.
+AUTOPLAY_TRIES = 3
+AUTOPLAY_WAITS = (15, 30)
+#: Picks a room could not play, so the next try asks for something else.
+AUTOPLAY_SKIP_KEEP = 50
+
+#: The YouTube id in a library filename: "Title - [id].mp3", or the older "ytdl_id.mp3".
+LIBRARY_VIDEO_ID = re.compile(r"\[([0-9A-Za-z_-]{11})\]\.\w+$|^ytdl_([0-9A-Za-z_-]{11})\.")
+
+
+def hoffle_query(song) -> str:
+    """What to ask Hoffle for: it streams through yt-dlp, which cannot open a
+    file on this disk, so a library song goes by its YouTube id, or else its name."""
+    if song.source_type != "local":
+        return song.url
+    match = LIBRARY_VIDEO_ID.search(os.path.basename(song.url or ""))
+    if match:
+        return f"https://www.youtube.com/watch?v={match.group(1) or match.group(2)}"
+    return f"{song.artist or ''} {song.title}".strip()
+
+
 class HuddleVoiceManager:
     def __init__(self, cog=None, song_class=None):
         self.headers = {
@@ -986,6 +1011,10 @@ class HuddleVoiceManager:
         self.cog = cog
         self.song_class = song_class
         self.autoplay_tasks = {}
+        #: channel id -> {"track", "tries", "at"}: the song a room is failing to follow
+        self.autoplay_retries = {}
+        #: channel id -> the Songs it could not play
+        self.autoplay_skipped = {}
         self.resolve_tasks = {}
         self.recorded_tracks = {}
         #: channel id -> the room's raw hub player, refreshed every poll
@@ -1016,6 +1045,7 @@ class HuddleVoiceManager:
         for task in self.autoplay_tasks.values():
             task.cancel()
         self.autoplay_tasks.clear()
+        self.autoplay_retries.clear()
 
     async def _run(self):
         timeout = aiohttp.ClientTimeout(total=10)
@@ -1169,22 +1199,43 @@ class HuddleVoiceManager:
         existing = self.autoplay_tasks.get(channel_id)
         if existing and not existing.done():
             return
+        retry = self.autoplay_retries.get(channel_id)
+        if retry and retry["track"] == track_id and (
+            retry["tries"] >= AUTOPLAY_TRIES or time.monotonic() < retry["at"]
+        ):
+            return
         self.autoplay_tasks[channel_id] = asyncio.create_task(
-            self._queue_radio(channel_id, player) if radio else self._queue_autoplay(channel_id, track)
+            self._fill_queue(channel_id, player, track, bool(radio))
         )
 
-    async def _queue_radio(self, channel_id: str, player: dict):
+    async def _fill_queue(self, channel_id: str, player: dict, track: dict, radio: bool):
+        """One try at the next song. A failed one is counted against the song playing."""
+        if radio:
+            queued = await self._queue_radio(channel_id, player)
+        else:
+            queued = await self._queue_autoplay(channel_id, track)
+        if queued:
+            self.autoplay_retries.pop(channel_id, None)
+            return
+        track_id = track.get("id")
+        retry = self.autoplay_retries.get(channel_id)
+        tries = retry["tries"] + 1 if retry and retry["track"] == track_id else 1
+        wait = AUTOPLAY_WAITS[min(tries, len(AUTOPLAY_WAITS)) - 1]
+        self.autoplay_retries[channel_id] = {"track": track_id, "tries": tries, "at": time.monotonic() + wait}
+
+    async def _queue_radio(self, channel_id: str, player: dict) -> bool:
         """The room's mood radio (huddle.radio_next) wins over Smart Autoplay: one more song from its station."""
         try:
-            await huddle.radio_next(huddle.PREFIX + channel_id, player)
+            return bool(await huddle.radio_next(huddle.PREFIX + channel_id, player))
         except asyncio.CancelledError:
             raise
         except Exception as error:
             logger.warning("Huddle radio failed for %s: %s", channel_id, error)
+            return False
 
-    async def _queue_autoplay(self, channel_id: str, track: dict):
+    async def _queue_autoplay(self, channel_id: str, track: dict) -> bool:
         if not self.cog or not self.song_class:
-            return
+            return False
         try:
             guild = SimpleNamespace(
                 id=huddle.PREFIX + channel_id,
@@ -1215,19 +1266,27 @@ class HuddleVoiceManager:
             player.autoplay = True
             player.artist_diversity = bool(settings.get("artist_diversity"))
             player.vibe_match = bool(settings.get("vibe_match"))
-            recommendation = await self.cog.pick_autoplay_recommendation(player)
-            if recommendation:
+            skipped = self.autoplay_skipped.setdefault(channel_id, deque(maxlen=AUTOPLAY_SKIP_KEEP))
+            recommendation = await self.cog.pick_autoplay_recommendation(player, skip=skipped)
+            if not recommendation:
+                return False
+            try:
                 await huddle.play(
                     huddle.PREFIX + channel_id,
-                    recommendation.url,
+                    hoffle_query(recommendation),
                     requested_by="Smart Autoplay",
                 )
-                logger.info(
-                    "Queued Huddle autoplay for %s: %s",
-                    channel_id,
-                    recommendation.title,
-                )
+            except Exception:
+                skipped.append(recommendation)
+                raise
+            logger.info(
+                "Queued Huddle autoplay for %s: %s",
+                channel_id,
+                recommendation.title,
+            )
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as error:
             logger.warning("Huddle autoplay failed for %s: %s", channel_id, error)
+            return False

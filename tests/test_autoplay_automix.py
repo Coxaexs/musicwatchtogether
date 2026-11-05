@@ -147,6 +147,29 @@ class AutoplayScoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(song.autoplay_score)
         self.assertIn('related artist', song.autoplay_reason)
 
+    async def test_skip_keeps_a_song_out_of_the_pick(self):
+        cog = object.__new__(music.MusicCog)
+        cog.bot = SimpleNamespace(loop=asyncio.get_running_loop())
+        cog._audio_features = {}
+        cog._transition_feedback = {}
+        seed = music.Song('Seed', 'seed-url', '3:00', None, 'youtube', artist='Seed Artist')
+        guild = SimpleNamespace(id=9, me=SimpleNamespace(), voice_client=None)
+        player = SimpleNamespace(
+            current=seed, history=deque([seed]), guild=guild,
+            vibe_match=False, artist_diversity=False,
+            _resolve_local_file=lambda _song: None,
+        )
+        files = ['/lib/Seed Artist/Broken - [aaaaaaaaaaa].mp3', '/lib/Seed Artist/Fine - [bbbbbbbbbbb].mp3']
+        broken = music.Song('Broken', files[0], '3:00', None, 'local', artist='Seed Artist')
+        with mock.patch.object(cog, '_autoplay_station', new=mock.AsyncMock(return_value=[])), \
+                mock.patch.object(cog, '_dislike_index', return_value=(set(), set(), {})), \
+                mock.patch.object(cog, '_favorite_index', return_value=(set(), set(), set())), \
+                mock.patch.object(cog, 'get_local_features', return_value=None), \
+                mock.patch('music._probe_duration_seconds', return_value=None), \
+                mock.patch('music.list_library_files', return_value=files):
+            picks = {(await cog.pick_autoplay_recommendation(player, skip=[broken])).url for _ in range(12)}
+        self.assertEqual(picks, {files[1]})
+
     async def test_early_skip_learns_transition_not_song_dislike(self):
         cog = object.__new__(music.MusicCog)
         cog.bot = SimpleNamespace(loop=asyncio.get_running_loop())

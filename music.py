@@ -3841,8 +3841,10 @@ class MusicCog(commands.Cog):
             recent.insert(0, vid)
         return None
 
-    async def pick_autoplay_recommendation(self, player: MusicPlayer) -> Optional[Song]:
-        """Rank local and catalogue candidates in one explainable pool."""
+    async def pick_autoplay_recommendation(self, player: MusicPlayer, skip=()) -> Optional[Song]:
+        """Rank local and catalogue candidates in one explainable pool.
+
+        `skip` is more songs not to offer, alongside what just played."""
         if getattr(player, 'radio', None):
             song = await self._radio_song(player)
             if song:
@@ -3854,9 +3856,10 @@ class MusicCog(commands.Cog):
         station = await self._autoplay_station(artist)
         seed_key = self._artist_key(artist)
         related_keys = {self._artist_key(item.get('artist')) for item in station}
-        recent_urls = {song.url for song in player.history}
+        avoid = [*player.history, *skip]
+        recent_urls = {song.url for song in avoid}
         recent_titles = {self._feedback_title_key(song.title, self._song_artist(song))
-                         for song in player.history}
+                         for song in avoid}
         listener_ids = self._listener_user_ids(player)
         guild_id = player.guild.id
         hard_dis_urls, hard_dis_titles, listener_dis_artists = self._dislike_index(
@@ -4022,7 +4025,7 @@ class MusicCog(commands.Cog):
             else:
                 song = await self._resolve_autoplay_match(candidate, player.guild.me)
                 if (not song or not song.url
-                        or self._autoplay_song_is_recent(song, player.history)):
+                        or self._autoplay_song_is_recent(song, avoid)):
                     continue
             song.autoplay_score = round(candidate['score'], 1)
             song.autoplay_reason = '; '.join(candidate['components'][:8])
@@ -4036,7 +4039,7 @@ class MusicCog(commands.Cog):
         # candidate stop the radio. These remain anchored to the seed artist.
         for suffix in ('official audio', 'deep cut official audio', 'radio mix'):
             song = await self.process_youtube(f"{artist} {suffix}", player.guild.me)
-            if song and not self._autoplay_song_is_recent(song, player.history):
+            if song and not self._autoplay_song_is_recent(song, avoid):
                 song.artist = song.artist or artist
                 song.autoplay = True
                 song.autoplay_reason = 'artist fallback after candidate resolution failures'
@@ -4046,7 +4049,7 @@ class MusicCog(commands.Cog):
         if genre:
             song = await self.process_youtube(
                 f"{genre} music discovery official audio", player.guild.me)
-            if song and not self._autoplay_song_is_recent(song, player.history):
+            if song and not self._autoplay_song_is_recent(song, avoid):
                 song.autoplay = True
                 song.autoplay_reason = f'{genre} session fallback after related tracks failed'
                 song.autoplay_traits = ('artist:change', f'genre:{genre}')
