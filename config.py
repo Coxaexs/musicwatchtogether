@@ -126,6 +126,8 @@ DJ_ROLE_NAME = os.getenv("DJ_ROLE_NAME", "DJ")
 # dashboard also lists Huddle voice rooms and can drive their playback.
 HUDDLE_BASE_URL = os.getenv("HUDDLE_BASE_URL", "")
 HUDDLE_BOT_TOKEN = os.getenv("HUDDLE_BOT_TOKEN", "")
+# The key Hoffle uses to call this bot, instead of the dashboard password.
+HOFFLE_BOT_KEY = os.getenv("HOFFLE_BOT_KEY", "").strip()
 
 def _bool_env(name, default=True, aliases=(), disable_aliases=()):
     # Check negative flags first (e.g. DISABLE_DJ=1)

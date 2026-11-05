@@ -14,6 +14,7 @@ import asyncio
 import concurrent.futures
 from types import SimpleNamespace
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -702,6 +703,18 @@ def _image_dimensions(image, extension):
     return None
 
 
+#: What Hoffle may call with its bot key (HOFFLE_BOT_KEY). Everything else on
+#: the dashboard stays behind the dashboard password.
+HOFFLE_BOT_PATHS = re.compile(
+    r'^/api/(?:'
+    r'admin/(?:huddle-link|watch-ticket|watch-command|musixmatch)'
+    r'|huddle/(?:resolve|search)'
+    r'|lyrics/(?:search|candidates|pick|ask-musixmatch)'
+    r'|library/(?:songs|delete)'
+    r'|guilds(?:/[^/]+(?:/(?:action|play|lyrics|playlists|dj))?)?'
+    r')$')
+
+
 class WebUI:
     def __init__(self, bot):
         self.bot = bot
@@ -747,7 +760,17 @@ class WebUI:
             secure=request.secure or forwarded_proto == 'https',
             samesite='Strict', path='/')
 
+    def _hoffle_bot(self, request):
+        """Hoffle calling with its bot key, on a route that key may use."""
+        key = config.HOFFLE_BOT_KEY
+        if not key or not HOFFLE_BOT_PATHS.match(request.path):
+            return False
+        sent = request.headers.get('Authorization', '')
+        return hmac.compare_digest(sent.encode(), f'Bearer {key}'.encode())
+
     def _authorized(self, request):
+        if self._hoffle_bot(request):
+            return True
         supplied = self._supplied_token(request)
         
         # Passwords are exchanged at /api/session; API calls only accept an
@@ -765,7 +788,9 @@ class WebUI:
         return False
 
     def _authorized_admin(self, request):
-        """Only a master-password session may use the cross-product admin API."""
+        """Only a master-password session or Hoffle's bot key may use the cross-product admin API."""
+        if self._hoffle_bot(request):
+            return True
         info = _valid_token_info(self._supplied_token(request))
         return bool(info and info.get('kind') == 'session'
                     and info.get('guild_id') is None)
