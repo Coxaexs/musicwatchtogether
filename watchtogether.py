@@ -134,7 +134,11 @@ def _global_download_limiter():
 def _dl_opts(cache_dir, vertical=False, quality=720, sponsorblock=False):
     height = 1280 if vertical else quality
     opts = {
-        'format': (f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]'
+        # H.264 first: "ext=mp4" alone also matches YouTube's AV1 and VP9, which
+        # plenty of browsers and Windows machines show as a blank picture.
+        'format': (f'bestvideo[height<={height}][vcodec^=avc1]+bestaudio[ext=m4a]'
+                   f'/best[height<={height}][vcodec^=avc1]'
+                   f'/bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]'
                    f'/best[height<={height}][ext=mp4]/best[height<={height}]/best'),
         'outtmpl': os.path.join(cache_dir, '%(id)s.%(ext)s'),
         'merge_output_format': 'mp4',
