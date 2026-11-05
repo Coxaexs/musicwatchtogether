@@ -7,7 +7,8 @@
   let clock = null;         // {index, playing, position, now}: where the room is
   let mediaBase = '';
   let reactions = [];
-  let loadedSrc = '', hls = null, blocked = false, seekingUntil = 0, lastHardSeek = 0;
+  let loadedSrc = '', hls = null, blocked = false, seekingUntil = 0;
+  let nextHardSeek = 0, seekWait = 5000, inStepSince = 0, brokenSrc = '';
   let dragging = -1, searchState = { q: '', items: null, busy: false, error: '' };
   let bPlayer = null;
 
@@ -63,7 +64,9 @@
           const verb = d.action === 'play' ? 'pressed play' : d.action === 'pause' ? 'paused' : 'jumped to ' + T.fmt(d.position);
           T.toast(`${d.by.name} ${verb}`, { by: d.by, ms: 1600 });
         }
-        reconcile(true);
+        // Only someone's action may force a seek: the steady sync must not, or
+        // it drags a viewer who is still loading away from what has loaded.
+        reconcile(Boolean(d.action));
       } else if (d.t === 'progress') {
         const item = st && st.queue.find((it) => it.uid === d.uid);
         if (item) { item.progress = d.pct; renderProgress(item); }
@@ -89,6 +92,8 @@
     const src = srcFor(item);
     if (src === loadedSrc) return;
     loadedSrc = src;
+    nextHardSeek = 0;
+    seekWait = 5000;
     if (hls) { try { hls.destroy(); } catch (_e) { /* gone */ } hls = null; }
     const startAt = expected();
     const seekOnce = () => {
@@ -134,8 +139,11 @@
   }
 
   /** Bring the local player to where the room is. Small drift is eased out
-   *  with the playback rate; big drift is a seek. */
-  function reconcile(fromSync) {
+   *  with the playback rate; big drift is a seek. A seek throws away what has
+   *  loaded, so a player still loading is left to finish, and a seek that does
+   *  not stick waits longer before the next: seeking a slow viewer over and
+   *  over is how they end up with no picture at all. */
+  function reconcile(forced) {
     const item = current();
     if (!st || !item || item.status !== 'ready' || !item.file || (st.browser && st.browser.active)) return;
     if (!loadedSrc) return;
@@ -147,20 +155,28 @@
     const duration = item.duration || (isFinite(v.duration) ? v.duration : 0);
     if (duration && want >= duration - 0.25) return;   // the end: 'ended' moves the room on
     const drift = v.currentTime - want;
+    const size = Math.abs(drift);
     const now = Date.now();
+    const loading = clock.playing && (v.readyState < 3 || v.seeking);
     let sync = 'on';
-    if (Math.abs(drift) > (clock.playing ? 1.5 : 0.35)) {
-      if (now - lastHardSeek > 1500 || fromSync) {
-        v.currentTime = Math.max(0, want);
-        lastHardSeek = now;
-      }
+    if (size > (clock.playing ? 3 : 0.35) && (forced || (!loading && now >= nextHardSeek))) {
+      v.currentTime = Math.max(0, want);
+      nextHardSeek = now + seekWait;
+      seekWait = forced ? 5000 : Math.min(seekWait * 2, 60000);
       v.playbackRate = 1;
       sync = 'catch';
-    } else if (clock.playing && Math.abs(drift) > 0.2) {
-      v.playbackRate = drift > 0 ? 0.94 : 1.06;
+    } else if (loading) {
+      v.playbackRate = 1;
       sync = 'catch';
+    } else if (clock.playing && size > 0.2) {
+      const push = size > 1 ? 0.1 : 0.06;
+      v.playbackRate = drift > 0 ? 1 - push : 1 + push;
+      sync = 'catch';
+      inStepSince = 0;
     } else {
       v.playbackRate = 1;
+      inStepSince = inStepSince || now;
+      if (now - inStepSince > 15000) seekWait = 5000;
     }
     const el = $('#sync');
     el.className = 'sync' + (sync === 'catch' ? ' catch' : '') + (T.connected ? '' : ' off');
@@ -170,6 +186,9 @@
 
   v.addEventListener('ended', () => {
     if (st) T.send({ t: 'ended', index: st.index });
+  });
+  v.addEventListener('error', () => {
+    if (loadedSrc && !hls) { brokenSrc = loadedSrc; renderStage(); }
   });
   v.addEventListener('progress', paintControls);
   v.addEventListener('playing', () => { if (blocked) { blocked = false; renderStage(); } });
@@ -390,6 +409,9 @@
     } else if (item.status === 'error') {
       show(T.icon('alert'), h('h3', null, 'This one can’t play'), h('p', null, item.error || 'The site refused.'),
         h('button.btn.primary', { type: 'button', onclick: () => T.send({ t: 'skip' }) }, T.icon('skip', 'fill'), 'Skip it'));
+    } else if (brokenSrc && brokenSrc === loadedSrc) {
+      show(T.icon('alert'), h('h3', null, 'This video won’t play here'),
+        h('p', null, 'This browser could not play it. Try the Hoffle app or another browser.'));
     } else if (blocked) {
       show(h('button.big-play', { type: 'button', 'aria-label': 'Join playback', onclick: togglePlay }, T.icon('play')),
         h('h3', null, 'Click to join in'), h('p', null, 'Your browser wants a click before it plays sound.'));
