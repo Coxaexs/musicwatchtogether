@@ -150,7 +150,7 @@ def _bool_env(name, default=True, aliases=(), disable_aliases=()):
 DJ_ENABLED = _bool_env("DJ_ENABLED", True, aliases=["ENABLE_DJ"], disable_aliases=["DISABLE_DJ"])
 WATCHTOGETHER_ENABLED = _bool_env("WATCHTOGETHER_ENABLED", True, aliases=["ENABLE_WATCHTOGETHER", "ENABLE_WATCH_TOGETHER"], disable_aliases=["DISABLE_WATCHTOGETHER", "DISABLE_WATCH_TOGETHER"])
 STEMS_ENABLED = _bool_env("STEMS_ENABLED", True, aliases=["ENABLE_STEMS", "DJ_STEMS"], disable_aliases=["DISABLE_STEMS"])
-COBROWSER_ENABLED = _bool_env("COBROWSER_ENABLED", True, aliases=["ENABLE_COBROWSER", "ENABLE_CO_BROWSER"], disable_aliases=["DISABLE_COBROWSER", "DISABLE_CO_BROWSER"])
+COBROWSER_ENABLED = _bool_env("COBROWSER_ENABLED", False, aliases=["ENABLE_COBROWSER", "ENABLE_CO_BROWSER"], disable_aliases=["DISABLE_COBROWSER", "DISABLE_CO_BROWSER"])
 HUDDLE_ENABLED = _bool_env("HUDDLE_ENABLED", True, aliases=["ENABLE_HUDDLE"], disable_aliases=["DISABLE_HUDDLE"])
 AUTOPLAY_ENABLED = _bool_env("AUTOPLAY_ENABLED", True, aliases=["ENABLE_AUTOPLAY"], disable_aliases=["DISABLE_AUTOPLAY"])
 LYRICS_ENABLED = _bool_env("LYRICS_ENABLED", True, aliases=["ENABLE_LYRICS"], disable_aliases=["DISABLE_LYRICS"])
