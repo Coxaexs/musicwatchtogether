@@ -128,6 +128,32 @@ def _save_playlist_mix(guild_id, owner, name, record):
     state_store.save('playlist_mixes', mixes)
 
 
+def _playlist_creators(guild_id):
+    """Who made each of a Hoffle room's playlists: {name: Hoffle account id}."""
+    return state_store.load('playlist_creators', {}).get(str(guild_id), {})
+
+
+def _save_playlist_creator(guild_id, name, creator):
+    """Remembers who made a playlist, or forgets it with creator=None."""
+    creators = state_store.load('playlist_creators', {})
+    room = creators.setdefault(str(guild_id), {})
+    if creator:
+        room[name] = creator
+    else:
+        room.pop(name, None)
+    state_store.save('playlist_creators', creators)
+
+
+def _may_change_playlist(creators, owner, name, actor):
+    """A Hoffle room's playlist changes only for an admin or whoever made it.
+
+    Lists older than these records and the ones shown in every room have no
+    creator, so they are admin-only. `actor` is (Hoffle account id, admin?).
+    """
+    person, admin = actor
+    return admin or bool(person and owner != 'global' and creators.get(name) == person)
+
+
 def playlist_mix_specs(guild_id, owner, name, entries):
     """Per-entry transition specs for queueing, or None when not mixed."""
     record = _playlist_mix(guild_id, owner, name)
@@ -490,14 +516,15 @@ async def _warm_top_songs():
         await asyncio.sleep(TOP_REFRESH_SECONDS)
 
 
-def generate_token(guild_id, user_id=None):
+def generate_token(guild_id, user_id=None, hoffle_user=None, hoffle_admin=False):
     token = secrets.token_urlsafe(16)
     # Clean up expired tokens (older than 24 hours)
     now = time.time()
     for k, v in list(temp_tokens.items()):
         if now - v.get('created_at', 0) >= WEB_TOKEN_TTL:
             temp_tokens.pop(k, None)
-    temp_tokens[token] = {'guild_id': guild_id, 'user_id': user_id, 'created_at': now}
+    temp_tokens[token] = {'guild_id': guild_id, 'user_id': user_id, 'created_at': now,
+                          'hoffle_user': hoffle_user, 'hoffle_admin': hoffle_admin}
     _save_tokens()
     return token
 
@@ -810,6 +837,20 @@ class WebUI:
         """Discord user carried by the validated invitation session."""
         token_info = _valid_token_info(self._supplied_token(request))
         return token_info.get('user_id') if token_info else None
+
+    def _playlist_actor(self, request, fields):
+        """(Hoffle account, admin?) behind a change to a Hoffle room's playlists.
+
+        Hoffle names who it acts for in `fields` (the body or the query); a /web
+        link carries the person it was made for, and cannot claim anyone else.
+        The dashboard password on its own may change anything.
+        """
+        if self._authorized_admin(request):
+            by = str(fields.get('by') or '').strip()
+            return (by, fields.get('admin') in (True, '1')) if by else (None, True)
+        info = _valid_token_info(self._supplied_token(request)) or {}
+        return info.get('hoffle_user'), bool(info.get('hoffle_admin'))
+
     def _acting_member(self, request, guild):
         user_id = self._get_acting_user_id(request)
         member = guild.get_member(user_id) if user_id else None
@@ -1085,7 +1126,9 @@ class WebUI:
         if not channel_id or len(channel_id) > 100:
             return web.json_response({'error': 'channel_id required'}, status=400)
         guild_id = huddle.PREFIX + channel_id
-        token = generate_token(guild_id, None)
+        # Who it is for, so the link can only do to playlists what they may.
+        token = generate_token(guild_id, None, hoffle_user=str(body.get('by') or '').strip() or None,
+                               hoffle_admin=body.get('admin') is True)
         return web.json_response({'guild_id': guild_id, 'token': token})
 
     async def api_admin_watch_ticket(self, request):
@@ -2060,7 +2103,7 @@ class WebUI:
         suggestions = await asyncio.get_event_loop().run_in_executor(None, get_autocomplete_suggestions, query)
         return web.json_response(suggestions)
 
-    def _playlist_json(self, guild_id, user_id):
+    def _playlist_json(self, guild_id, user_id, actor=(None, False)):
         """The acting user's playlists (own + guild-shared, own shadows shared)."""
         cog = self.cog
         all_lists = cog._read_playlists()
@@ -2070,6 +2113,8 @@ class WebUI:
         own = guild_data.get('users', {}).get(str(user_id), {}) if user_id else {}
         shared = guild_data.get('shared', {})
         everywhere = all_lists.get(cog.GLOBAL_GUILD, {}).get('shared', {})
+        hoffle_room = huddle.is_huddle_id(str(guild_id))
+        creators = _playlist_creators(guild_id) if hoffle_room else {}
 
         def track_json(entry):
             return {
@@ -2091,6 +2136,7 @@ class WebUI:
                 'custom_cover': bool(custom),
                 'shared': is_shared,
                 'everywhere': owner_key == 'global',
+                'can_edit': not hoffle_room or _may_change_playlist(creators, owner_key, name, actor),
                 'tracks': [track_json(entry) for entry in entries[:200]],
             }
 
@@ -2631,7 +2677,8 @@ class WebUI:
         requested = request.match_info.get('guild_id', '')
         if huddle.is_huddle_id(requested):
             user_id = self._get_acting_user_id(request)
-            return web.json_response({'playlists': self._playlist_json(requested, user_id)})
+            actor = self._playlist_actor(request, request.query)
+            return web.json_response({'playlists': self._playlist_json(requested, user_id, actor)})
         guild, _player = self._get_guild_and_player(request)
         user_id = self._get_acting_user_id(request)
         return web.json_response({'playlists': self._playlist_json(guild.id, user_id)})
@@ -2706,6 +2753,10 @@ class WebUI:
         found_lists = (cog._bucket_for(data.setdefault(cog._guild_for(guild.id, found_owner), {}), found_owner)
                        if found_owner else None)
         imported_name = None
+        actor = self._playlist_actor(request, body) if is_huddle else (None, False)
+        if (is_huddle and found_owner and action in ('add_song', 'remove_song', 'delete')
+                and not _may_change_playlist(_playlist_creators(guild.id), found_owner, name, actor)):
+            return web.json_response({'error': f'Only an admin or whoever made {name} can change it.'}, status=403)
 
         # The day's stem mixes play and queue like any playlist, and are never edited.
         if name.startswith(stem_mixes.PREFIX):
@@ -2720,7 +2771,7 @@ class WebUI:
             found_lists = {name: stem_mix_entries(mix)}
         # "Stemmed songs" builds itself: it can be played and queued, not edited.
         if name == STEMS_PLAYLIST:
-            if action == 'add_song':
+            if action == 'add_song' and not body.get('by'):
                 if not stems.enabled():
                     return web.json_response({'error': 'Stem separation is off on this server.'}, status=409)
                 songs = await self._search_songs(body, guild)
@@ -2744,7 +2795,7 @@ class WebUI:
                 return web.json_response({
                     'message': message,
                     'imported_name': None,
-                    'playlists': self._playlist_json(guild.id, user_id),
+                    'playlists': self._playlist_json(guild.id, user_id, actor),
                     'state': (await huddle.room_state(requested) if is_huddle
                               else self._guild_state(guild, player)),
                 })
@@ -2791,6 +2842,8 @@ class WebUI:
                 'thumbnail': song.thumbnail,
             } for song in songs]
             cog._write_playlists(data)
+            if is_huddle and actor[0]:
+                await asyncio.to_thread(_save_playlist_creator, guild.id, imported_name, actor[0])
             if payload.get('cover'):
                 meta_data = cog._read_playlist_meta()
                 guild_meta = cog._bucket_for(
@@ -2809,7 +2862,10 @@ class WebUI:
             if found_owner:
                 return web.json_response({'error': f'A playlist named {name} already exists.'}, status=409)
             own_lists[name] = []
-            cog._write_playlists(data)
+            # Off the event loop: these saves fsync, and rooms stutter if it waits.
+            await asyncio.to_thread(cog._write_playlists, data)
+            if is_huddle and actor[0]:
+                await asyncio.to_thread(_save_playlist_creator, guild.id, name, actor[0])
             message = f'Created {name}.'
         elif action == 'save':
             songs = ([player.current] if player.current else []) + list(player.queue)
@@ -2836,6 +2892,8 @@ class WebUI:
                 return web.json_response({'error': f'{name} is protected and cannot be deleted.'}, status=403)
             del found_lists[name]
             cog._write_playlists(data)
+            if is_huddle:
+                await asyncio.to_thread(_save_playlist_creator, guild.id, name, None)
             meta_data = cog._read_playlist_meta()
             guild_meta = cog._bucket_for(meta_data.setdefault(cog._guild_for(guild.id, found_owner), {}), found_owner)
             cover_url = guild_meta.pop(name, None)
@@ -2853,6 +2911,8 @@ class WebUI:
             songs = await self._search_songs(body, guild)
             if isinstance(songs, web.Response):
                 return songs
+            if len(songs) == 1 and any(entry.get('url') == songs[0].url for entry in entries):
+                return web.json_response({'error': f'{songs[0].title} is already in {name}.'}, status=409)
             room = max(0, 200 - len(entries))
             songs = songs[:room]
             if not songs:
@@ -2864,7 +2924,7 @@ class WebUI:
                 'source_type': song.source_type,
                 'thumbnail': _thumbnail_from_url(song.url, song.thumbnail),
             } for song in songs)
-            cog._write_playlists(data)
+            await asyncio.to_thread(cog._write_playlists, data)
             message = f'Added {len(songs)} song' + ('' if len(songs) == 1 else 's') + f' to {name}.'
         elif action == 'remove_song':
             entries = found_lists.get(name) if found_lists is not None else None
@@ -2950,7 +3010,7 @@ class WebUI:
         return web.json_response({
             'message': message,
             'imported_name': imported_name,
-            'playlists': self._playlist_json(guild.id, user_id),
+            'playlists': self._playlist_json(guild.id, user_id, actor),
             'state': (await huddle.room_state(requested) if is_huddle
                       else self._guild_state(guild, player)),
         })
