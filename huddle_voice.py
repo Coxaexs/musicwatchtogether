@@ -536,9 +536,10 @@ class RoomPublisher:
             self._maybe_plan(player, settings)
             return
         # The hub catching up with a transition we already played: the new
-        # song is running from the mix, so don't restart it.
+        # song is running from the mix, so don't restart it. A state_key
+        # cleared on purpose is the opposite: it asks for a restart.
         previous_id = self.state_key[0] if self.state_key else None
-        if (track_id and track_id != previous_id
+        if (track_id and previous_id and track_id != previous_id
                 and track_id == self.source.track_id
                 and not player.get("paused")):
             self.state_key = key
