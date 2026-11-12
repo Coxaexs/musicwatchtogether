@@ -1287,7 +1287,7 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
                          hook=tease_hook, script=script)
         if lift > 0.15 or vibe == "hype":
             consider("loop_roll", start, 0, 0, 0.5 + 1.5 * max(0.0, lift), "loop roll into the new song's big moment")
-    opening = cold_open(inn)
+    opening = cold_open(inn) if getattr(inn, "top", True) else None
     if opening:
         # From the top: the new song's opening in the clear, its beat landing on the old song's phrase.
         for start in range(max(earliest, first_big + 2), count + 1):

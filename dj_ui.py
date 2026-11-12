@@ -515,6 +515,7 @@ function build(){
     <div class="seg modeseg vibeseg realonly" id="vibeSeg" title="How much Real DJ plays the decks: loops, effects, sampler, drops"><button data-v="chill">CHILL</button><button data-v="club">CLUB</button><button data-v="hype">HYPE</button></div>
     <div class="seg modeseg realonly" id="threeSeg" title="3 songs: Real DJ also lays a third song's vocal over the playing beat for a phrase, then plays that song next"><button data-v="2">2 SONGS</button><button data-v="3">3 SONGS</button></div>
     <div class="seg modeseg aiseg realonly" id="aiSeg" title="Beta, on by default: Real DJ uses the offline AI analysis: songs that sound alike follow each other, and it leaves, enters, loops and plays effects where an AI that listened to each song says it fits. Off = the DJ as before."><button data-v="0">AI OFF</button><button data-v="1">✨ AI · BETA</button></div>
+    <div class="seg modeseg" id="topSeg" title="New: a song that opens on a line everyone knows is played from that line, in a one-bar gap, instead of being blended over or skipped into. Classic: the booth mixes as it did before."><button data-v="0">CLASSIC MIXES</button><button data-v="1">NEW MIXES</button></div>
     <div class="realinfo" id="realInfo"></div>
     <div class="smoothonly"><div class="label">Transition</div><div class="chips" id="styleChips"></div></div>
     <div class="row between med smoothonly"><span class="label">Length</span><select id="autoBeats" style="padding:4px 6px"><option value="">Style default</option><option value="4">1 bar</option><option value="8">2 bars</option><option value="16">4 bars</option><option value="32">8 bars</option><option value="64">16 bars</option></select></div>
@@ -628,6 +629,7 @@ function wire(){
     api({op:'auto',mode,on:true}).then(r=>r&&toast(msg))};
   const VIBE_MSG={chill:'Chill: long smooth blends, few tricks.',club:'Club: loops, effects and drops most phrases.',hype:'Hype: tricks all the time, drops, sampler.'};
   $$('#vibeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',vibe:b.dataset.v}).then(r=>r&&toast(VIBE_MSG[b.dataset.v])));
+  $$('#topSeg button').forEach(b=>b.onclick=()=>api({op:'auto',top:b.dataset.v==='1'}).then(r=>r&&toast(b.dataset.v==='1'?'New mixes: songs with an opening line are played from the top.':'Classic mixes: the booth mixes as it did before.')));
   $$('#aiSeg button').forEach(b=>b.onclick=()=>api({op:'auto',ai:b.dataset.v==='1'}).then(r=>r&&toast(b.dataset.v==='1'?'AI (beta): songs that sound alike, and exits, entries and effects an AI picked for each song.':'AI off: the DJ as before.')));
   $('#pauseSet').onclick=()=>api({op:S&&S.paused?'resume':'pause'});
   $$('#threeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',three:b.dataset.v==='3'}).then(r=>r&&toast(b.dataset.v==='3'?'3 songs: a third song sings over the beat for a phrase, then plays next.':'2 songs: back to back.')));
@@ -858,6 +860,7 @@ function renderAuto(){
   $$('#vibeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.vibe||'club')));
   $$('#threeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.three?'3':'2')));
   $$('#aiSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.ai?'1':'0')));
+  $$('#topSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.top?'1':'0')));
   {const pb=$('#pauseSet');const t=S.paused?'▶ RESUME SET':'⏸ PAUSE SET';if(pb.textContent!==t)pb.textContent=t;pb.classList.toggle('on',!!S.paused)}
 
   const ri=$('#realInfo');

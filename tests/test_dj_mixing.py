@@ -174,6 +174,17 @@ class FromTheTopTests(unittest.TestCase):
         self.assertEqual(dj.choose_style(out, inn), "top")
         self.assertNotEqual(dj.choose_style(inn, out), "top")
 
+    def test_classic_mixes_as_before(self):
+        _engine, out, inn = self.decks()
+        out.playing = True
+        session = dj.DJSession.__new__(dj.DJSession)
+        session.engine, session.real = _engine, None
+        session.set_top(False)
+        self.assertNotEqual(dj.choose_style(out, inn), "top")
+        self.assertNotEqual(realdj.plan_transition(out, inn, 8, [], random.Random(3), "club").style, "top")
+        session.set_top(True)
+        self.assertEqual(dj.choose_style(out, inn), "top")
+
     def test_the_old_song_cuts_and_the_new_beat_lands_on_the_bar(self):
         engine, out, inn = self.decks()
         out.seek(out.time_of_beat(62))
