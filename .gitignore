@@ -26,6 +26,7 @@ watch_cache/
 stems_cache/
 dj_settings.json
 dj_sessions.json
+dj_mixes.json
 data/
 .restart
 reels_cache/

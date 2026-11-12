@@ -500,6 +500,87 @@ def pick_next(items, out_deck, minutes, history, rng=random, lift=0.0, station=N
 # Planning a transition
 # --------------------------------------------------------------------------
 
+def cold_open(deck):
+    """A song's opening before its beat comes in, when it is worth hearing on its own.
+
+    Some songs open on a line or a figure everyone knows, a bar or so before the drums ("It's
+    Britney, bitch"). A blend buries it and a cue further in skips it. This finds it from the
+    stems: the first beat from which the drums stay, and what plays before it.
+
+    {"drum_beat": the beat the drums land on, "beats": the opening's length in whole beats,
+    "sung": whether it is a vocal}, or None: no stems or grid, drums from the first beat, an
+    opening over two bars long (an intro to mix into, not a tag), or one too quiet to matter.
+    Cached on the deck.
+    """
+    if not deck.has_stems or not deck.bpm:
+        return None
+    key = (deck.wave_id, deck.bpm, deck.first_beat, id(deck.stems))
+    cached = getattr(deck, "_cold_open", None)
+    if cached and cached[0] == key:
+        return cached[1]
+    result = _cold_open(deck)
+    deck._cold_open = (key, result)
+    return result
+
+
+def _cold_open(deck):
+    beat = deck.beat_seconds
+    total = min(len(deck.audio), deck.stems.shape[1])
+    di, vi = stems.NAMES.index("drums"), stems.NAMES.index("vocals")
+
+    def rms(source, t0, t1):
+        a, b = int(max(0.0, t0) * SR), min(total, int(max(0.0, t1) * SR))
+        if b - a < 96:
+            return 0.0
+        x = source[a:b:24].astype(np.float32)
+        return float(np.sqrt((x * x).mean()))
+
+    # A kick sits a little ahead of the grid's beat more often than behind it.
+    def drums_on(b):
+        return rms(deck.stems[di], deck.time_of_beat(b) - 0.2 * beat, deck.time_of_beat(b) + 0.8 * beat)
+
+    last = int(deck.beat_at(deck.music_end()))
+    if last < 96:
+        return None
+    usual = float(np.median([drums_on(b) for b in range(32, min(last, 160))]))
+    mix_usual = float(np.median([rms(deck.audio, deck.time_of_beat(b), deck.time_of_beat(b + 1))
+                                 for b in range(32, min(last, 160))]))
+    if usual <= 0 or mix_usual <= 0:
+        return None
+    start = max(0.0, float(deck.meta.get("music_start") or 0.0))
+    first = int(math.floor(deck.beat_at(start)))
+    drum_beat = next((b for b in range(first, first + 14)
+                      if all(drums_on(k) >= 0.35 * usual for k in range(b, b + 4))), None)
+    if drum_beat is None:
+        return None
+    lands = deck.time_of_beat(drum_beat) - 0.2 * beat
+    length = (lands - start) / beat
+    if length < 0.75 or length > 8.5:
+        return None
+    heard = rms(deck.audio, start, lands)
+    if heard < 0.12 * mix_usual:
+        return None
+    sung = rms(deck.stems[vi], start, lands) >= 0.45 * heard
+    if not sung and length > 4.5:
+        return None
+    return {"drum_beat": drum_beat, "beats": int(math.ceil(length - 0.1)), "sung": bool(sung)}
+
+
+def top_entry(deck):
+    """(cue in seconds, gap in beats, beats into the gap the song starts) for playing `deck` from the top.
+
+    The gap is a bar, or two for an opening longer than a bar; the song's drums land when it is up. The
+    cue is on the song's grid, a whole number of beats before the drums; an opening shorter than the gap
+    starts that much into it. A song without an opening to hear starts on its cue with a bar's gap."""
+    opening = cold_open(deck)
+    if not opening or not deck.bpm:
+        return deck.cue, 4, 0
+    gap = 4 if opening["beats"] <= 4 else 8
+    cue_beat = opening["drum_beat"] - gap
+    at = max(cue_beat, int(math.ceil(deck.beat_at(0.0) - 1e-6)))
+    return deck.time_of_beat(at), gap, at - cue_beat
+
+
 class Plan:
     def __init__(self, style, beats, start_beat, in_cue, ride=0.0, why=""):
         self.script = None             # keyframes, for a routine
@@ -513,16 +594,19 @@ class Plan:
         self.ride = ride               # outgoing pitch (%) to walk to before mixing
         self.why = why
         self.loops = []                # borrowed parts to play over the mix (_loop_spec)
+        self.saved = None              # a mix from the mix editor (dj.saved_mix), played as drawn
+        self.gap = None                # from the top: beats the old song is cut before the new beat lands
+        self.in_delay = 0              # ... and beats into them the new song starts
 
     def json(self):
-        return {"style": self.style, "beats": self.beats, "start_beat": self.start_beat,
+        return {"style": self.style, "beats": self.beats, "start_beat": self.start_beat, "gap": self.gap,
                 "in_cue": round(self.in_cue, 2), "ride": round(self.ride, 2), "why": self.why,
                 "label": self.label, "move": self.move,
                 "hooks": [{"beat": b, "length": l, "repeats": r, "time": t} for b, l, r, t in self.hooks],
                 "loops": [{"part": x["part"], "title": x.get("title"), "shift": x.get("shift")} for x in self.loops]}
 
 
-DROP_STYLES = ("loop_roll", "echo", "cut")
+DROP_STYLES = ("loop_roll", "echo", "cut", "top")
 
 
 def choose_style(out, inn, so, si, last_styles, rng=random, vibe="club"):
@@ -586,6 +670,14 @@ def choose_style(out, inn, so, si, last_styles, rng=random, vibe="club"):
 
 
 def plan_transition(out, inn, current_beat, last_styles, rng=random, vibe="club"):
+    from dj import CUSTOM, saved_mix
+    saved = saved_mix(out, inn)
+    if saved:
+        # These two songs have a mix someone drew in the mix editor: that one is played.
+        plan = Plan(CUSTOM, saved["mix"]["beats"], saved["start_beat"], saved["cue"],
+                    why="the mix saved for these two songs")
+        plan.label, plan.move, plan.saved = "Your mix", "custom", saved
+        return plan
     if out.has_stems and inn.has_stems:
         plan = plan_with_stems(out, inn, current_beat, last_styles, rng, vibe)
         if plan:
@@ -1037,6 +1129,10 @@ def _fitting_riff(parts, bpm, key, energy, exclude, rng, start, end, gains, leve
 ROUTINE_LABELS = {"trade": "Back and forth", "tease": "Hook tease", "borrow": "Borrowed groove"}
 
 # How much each vibe likes each move (multiplies its score).
+# From the top (cold_open): how much a song's opening is worth against the other moves.
+TOP_SUNG = 3.4
+TOP_PLAYED = 1.5
+
 TASTE = {
     "chill": {"trade": 0.85, "tease": 0.5, "mashup": 1.2, "stem_swap": 1.3, "acapella": 1.0,
               "drum_bridge": 1.0, "guitar_ride": 1.25, "drop": 0.12, "blend": 1.0, "borrow": 0.9},
@@ -1191,6 +1287,16 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
                          hook=tease_hook, script=script)
         if lift > 0.15 or vibe == "hype":
             consider("loop_roll", start, 0, 0, 0.5 + 1.5 * max(0.0, lift), "loop roll into the new song's big moment")
+    opening = cold_open(inn)
+    if opening:
+        # From the top: the new song's opening in the clear, its beat landing on the old song's phrase.
+        for start in range(max(earliest, first_big + 2), count + 1):
+            score = (TOP_SUNG if opening["sung"] else TOP_PLAYED) - 0.12 * abs(start - ideal_end) + rng.random() * 0.2
+            if "top" in last_styles[-2:]:
+                score *= 0.6
+            candidates.append((score, "top", start, 0,
+                               "from the top: the old song cuts with an echo, the new song's opening "
+                               + ("line" if opening["sung"] else "bars") + " in the clear, then its beat", {}))
     for score, move, start, cue, why, extra in sorted(candidates, key=lambda c: -c[0]):
         plan = _make_plan(out, inn, si, gap, score, move, start, cue, why, extra, clash, exclude, energy, rng, vibe)
         if plan is not None:
@@ -1217,6 +1323,10 @@ def _make_plan(out, inn, si, gap, score, move, start, cue, why, extra, clash, ex
                 hooks_to_loop.append((hook["beat"], hook["length"], reps, hook["time"]))
         plan = Plan(ROUTINE, beats, start_beat, inn.time_of_beat(cue * P), why=why)
         plan.script, plan.label, plan.move, plan.hooks = script, ROUTINE_LABELS[move], move, hooks_to_loop
+    elif move == "top":
+        in_cue, gap, delay = top_entry(inn)
+        plan = Plan("top", gap + 4, start_beat - gap, in_cue, why=why)
+        plan.move, plan.gap, plan.in_delay = move, gap, delay
     elif move == "loop_roll":
         cue_beat = si["first_big_beat"]
         plan = Plan("loop_roll", STYLES["loop_roll"][1], start_beat - STYLES["loop_roll"][1],
@@ -1354,7 +1464,9 @@ class RealDJ:
                 self.plan = fresh
                 self.plan_for = plan_key
                 self.ride_from = None
-                other.cue = other.snap(self.plan.in_cue, force=True) if other.bpm else self.plan.in_cue
+                # A drawn mix brings the new song in exactly where it was drawn, on the beat or not.
+                other.cue = (other.snap(self.plan.in_cue, force=True) if other.bpm and not self.plan.saved
+                             else self.plan.in_cue)
                 other.seek(other.cue)
                 ratio = mixer.tempo_ratio(m.live_bpm(), other.bpm) if (m.bpm and other.bpm) else None
                 other.sync = bool(ratio and abs(ratio - 1) <= 0.08 + RIDE_MAX / 100)
@@ -1382,6 +1494,12 @@ class RealDJ:
                 engine.transition.samples = self._transition_samples(plan.style)
                 if plan.script:
                     engine.transition.script = plan.script
+                    engine.transition.label = plan.label
+                if plan.gap:
+                    engine.transition.gap, engine.transition.in_delay = plan.gap, plan.in_delay
+                if plan.saved:
+                    engine.transition.lanes = plan.saved["mix"]["lanes"]
+                    engine.transition.in_delay = plan.saved["mix"].get("in_start") or 0
                     engine.transition.label = plan.label
                 for beat, length, repeats, at in plan.hooks:
                     self._hook_loop(m, beat, length, repeats, at=at)

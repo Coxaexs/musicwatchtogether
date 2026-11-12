@@ -1430,6 +1430,38 @@ class WebUI:
             state['catalog'] = dj.catalog()
         return web.json_response(state)
 
+    async def api_dj_preview(self, request):
+        """The mix editor's PREVIEW: a drawn mix played off air on a copy of the two decks, as an MP3."""
+        key, _player = self._dj_target(request)
+        session = dj.sessions.get(key)
+        if not session:
+            return web.json_response({'error': 'DJ mode is off. Start it first.'}, status=409)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        try:
+            import mixes
+            import subprocess
+            mix = mixes.clean(body.get('mix'))
+            with session.engine.lock:
+                out, inn = session.mix_pair(body)
+            loop = asyncio.get_running_loop()
+            pcm, lead = await loop.run_in_executor(None, dj.preview_mix, out, inn, mix)
+
+            def encode():
+                return subprocess.run(
+                    ['ffmpeg', '-nostdin', '-loglevel', 'error', '-f', 's16le', '-ar', str(dj.SR), '-ac', '2',
+                     '-i', 'pipe:0', '-c:a', 'libmp3lame', '-b:a', '192k', '-f', 'mp3', 'pipe:1'],
+                    input=pcm, capture_output=True, timeout=120).stdout
+            audio = await loop.run_in_executor(None, encode)
+            if not audio:
+                raise RuntimeError('The preview could not be made.')
+        except (ValueError, RuntimeError, TypeError) as error:
+            return web.json_response({'error': str(error)}, status=400)
+        return web.Response(body=audio, content_type='audio/mpeg',
+                            headers={'Cache-Control': 'no-store', 'X-Mix-Lead': f'{lead:.3f}'})
+
     async def _refill_dj_queue(self, session, count=16):
         """Autoplay for a Hoffle room's DJ set (dj.refill): when its queue runs low, a shuffled handful of stemmed
         songs from the library that the set hasn't played and the queue doesn't hold. Real DJ then picks the one
@@ -3115,6 +3147,7 @@ async def start_web_server(bot):
         app.router.add_get('/dj/', ui.dj_page)
         app.router.add_get('/api/guilds/{guild_id}/dj', ui.api_dj_state)
         app.router.add_post('/api/guilds/{guild_id}/dj', ui.api_dj_action)
+        app.router.add_post('/api/guilds/{guild_id}/dj/preview', ui.api_dj_preview)
         import loops_ui
         loops_ui.setup(app)          # the loop crate's page: listen to and rate Real DJ's borrowed loops
         dj.refill = ui._refill_dj_queue

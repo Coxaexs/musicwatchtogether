@@ -246,6 +246,25 @@ body:not(.realmode) .realonly{display:none!important}
 .card .go button.primary{background:linear-gradient(#ffa24a,#ff7a00);color:#1a0d00;border-color:#000}
 .card .go button.primary small{color:#4a2400}
 .card input{width:100%;margin-bottom:10px}
+/* ---------- mix editor ---------- */
+.mxcard{width:min(1100px,100%);max-height:calc(100vh - 32px);overflow:auto;background:linear-gradient(#1b1e23,#121418);border:1px solid #000;border-radius:18px;padding:16px;box-shadow:0 0 0 1px #ffffff12 inset,0 30px 80px #000;display:grid;gap:10px}
+.mxhead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.mxtitle{font-weight:800;font-size:15px;line-height:1.3}.mxtitle i{font-style:normal;color:var(--muted);font-weight:600}
+.mxtitle .a{color:var(--mxout)}.mxtitle .b{color:var(--mxin)}
+.mxcard{--mxout:#ffb020;--mxin:#33d6ff}
+.mxbar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;color:var(--muted);font-size:12px}
+.mxbar select{padding:5px 8px}
+.mxpos{display:inline-flex;align-items:center;gap:6px}.mxpos b{color:var(--text);min-width:38px;text-align:center;font-variant-numeric:tabular-nums}
+.mxlanes{display:flex;flex-wrap:wrap;gap:6px}
+.mxlanes button{padding:6px 10px;border-radius:999px;border:1px solid var(--edge2);font-weight:700;font-size:11px;letter-spacing:.06em;color:var(--muted)}
+.mxlanes button.on{background:var(--panel2);color:var(--text);box-shadow:0 0 0 1px var(--cyan) inset}
+.mxlanes button.has::after{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--orange);margin-left:6px;vertical-align:middle}
+.mxlanes button:disabled{opacity:.35;cursor:not-allowed}
+#mxCanvas{width:100%;height:min(400px,52vh);background:var(--screen);border:1px solid #000;border-radius:10px;touch-action:none;cursor:crosshair;display:block}
+.mxhint{color:var(--dim);font-size:11px}
+.mxfoot{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.mxfoot .btn{padding:10px 14px}
+.pill.mixed.on{border-color:var(--orange);color:var(--orange)}
 .toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(20px);opacity:0;transition:.25s;background:#1d2025;border:1px solid var(--edge2);padding:10px 14px;border-radius:10px;z-index:60;max-width:calc(100% - 32px);box-shadow:0 10px 30px #000a}
 .toast.show{opacity:1;transform:translateX(-50%)}
 
@@ -320,6 +339,19 @@ body:not(.realmode) .realonly{display:none!important}
   <div class="go"><button class="primary" id="pwBtn">Unlock</button></div>
 </div></div>
 <div class="overlay hide" id="picker"><div class="card"><h1>Pick a <b>room</b></h1><div class="list" id="pickList"></div></div></div>
+<div class="overlay hide" id="mixed"><div class="mxcard">
+  <div class="mxhead"><div><div class="label">MIX EDITOR</div><div class="mxtitle" id="mxTitle"></div></div><button class="btn" id="mxClose">CLOSE</button></div>
+  <div class="mxbar">
+    <label>Length <select id="mxBeats"><option value="4">1 bar</option><option value="8">2 bars</option><option value="16">4 bars</option><option value="32">8 bars</option><option value="64">16 bars</option><option value="128">32 bars</option></select></label>
+    <label>Start from <select id="mxPreset"><option value="">a shape…</option><option value="blend">Blend, bass swap halfway</option><option value="fade">Even crossfade</option><option value="top">Cut, new song from the top</option><option value="filter">Filter the old song out</option><option value="vocal">Old vocal over the new beat (stems)</option></select></label>
+    <span class="mxpos">Old song from <button class="btn small" data-mv="out" data-d="-1" title="A bar earlier">◀</button><b id="mxOutAt"></b><button class="btn small" data-mv="out" data-d="1" title="A bar later">▶</button></span>
+    <span class="mxpos">New song from <button class="btn small" data-mv="in" data-d="-1" title="A bar earlier">◀</button><b id="mxInAt"></b><button class="btn small" data-mv="in" data-d="1" title="A bar later">▶</button><button class="btn small" id="mxTop" title="Start the new song at its very beginning">FROM THE TOP</button></span>
+  </div>
+  <div class="mxlanes" id="mxLanes"></div>
+  <canvas id="mxCanvas"></canvas>
+  <div class="mxhint">Top: the old song. Bottom: the new song. Drag a point, click a row to add one, double-click a point to remove it. Nothing is on air until you press MIX NOW.</div>
+  <div class="mxfoot"><button class="btn" id="mxPreview">▶ PREVIEW</button><span class="spacer"></span><button class="btn" id="mxDelete">FORGET SAVED</button><button class="btn" id="mxNow">MIX NOW</button><button class="btn orange" id="mxSave">SAVE FOR THIS PAIR</button></div>
+</div></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -412,6 +444,7 @@ function deckHTML(k){
     <button class="btn small adv" data-flag="quantize">QUANTIZE</button>
     <button class="btn small adv" data-flag="reverse">REV</button>
     <button class="btn small adv" data-flag="vinyl">VINYL</button>
+    <button class="btn small med" data-flag="keylock" title="Key lock: tempo changes keep the song's key">KEY LOCK</button>
   </div>
   <div class="jogwrap"><div class="jog" style="--c:${DECKCOL[k]}"><div class="ring"></div><div class="plate"></div><div class="hub"><img alt=""><b>${k}</b></div></div></div>
   <div class="tempo">
@@ -485,7 +518,8 @@ function build(){
     <div class="realinfo" id="realInfo"></div>
     <div class="smoothonly"><div class="label">Transition</div><div class="chips" id="styleChips"></div></div>
     <div class="row between med smoothonly"><span class="label">Length</span><select id="autoBeats" style="padding:4px 6px"><option value="">Style default</option><option value="4">1 bar</option><option value="8">2 bars</option><option value="16">4 bars</option><option value="32">8 bars</option><option value="64">16 bars</option></select></div>
-    <div class="next" id="nextUp">…</div>`;
+    <div class="next" id="nextUp">…</div>
+    <button class="pill mixed" id="mixEdBtn" title="Draw the mix between the two songs on the decks yourself: where it starts, how long it takes, and a curve for every control. Saved for this pair of songs.">✎ MIX EDITOR</button>`;
   $('#sampler').innerHTML=`<div class="row between"><div class="label">SAMPLER</div>${knob({param:'sampler',label:'VOL',min:0,max:1,def:0.7,kind:'uni',cls:'adv'})}</div><div class="sgrid" id="sgrid"></div>`;
   $('#browser').innerHTML=`<div class="tabs"><button data-tab="queue" class="on">QUEUE</button><button data-tab="search">SEARCH</button><button data-tab="history">HISTORY</button></div>
     <div data-panel="queue"><div class="list" id="queueList"></div></div>
@@ -541,6 +575,8 @@ function wireKnob(el){
 function deckOf(el){return el.closest('[data-deck]')?.dataset.deck}
 function wire(){
   $$('.knob').forEach(k=>{wireKnob(k);setKnob(k,+k.dataset.def)});
+  $('#mixEdBtn').onclick=mxOpen;
+  if(!MX.wired){MX.wired=true;mxWire()}
   $$('.modes button').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));
   for(const k of DECKS){
     const el=$('.deck-'+k);
@@ -731,7 +767,7 @@ function renderDeck(k){
   const play=$('[data-op=play]',el);play.classList.toggle('on',d.playing);play.classList.toggle('ready',d.loaded&&!d.playing);
   $('[data-op=cue]',el).classList.toggle('on',d.loaded&&!d.playing&&Math.abs(d.pos-d.cue)<0.05);
   on('[data-op=sync]',d.sync);on('[data-op=master]',isMaster);
-  for(const f of ['slip','quantize','reverse','vinyl'])on(`[data-flag=${f}]`,d[f]);
+  for(const f of ['slip','quantize','reverse','vinyl','keylock'])on(`[data-flag=${f}]`,d[f]);
   const lp=d.loop;on('[data-op=reloop]',lp&&lp.on);on('[data-op=loop_in]',lp&&lp.in!=null&&!lp.out);on('[data-op=loop_out]',lp&&lp.on);
   $$('[data-range] button',el).forEach(b=>b.classList.toggle('on',+b.dataset.v===d.range));
   const pitch=$('[data-pitch]',el);
@@ -846,6 +882,7 @@ function renderAuto(){
     real?(S.crate.length?`${S.crate.length} songs in the crate. Real DJ picks from all of them.`:'The crate is empty. Queue a playlist and Real DJ picks from it.'):
     (next?`Up next: <b>${esc(next.title||next.query)}</b>`:'The queue is empty. Add songs with <b>/play</b> or the search tab'+(S.kind==='discord'&&a.on?', or Smart Autoplay picks one.':'.'));
   setHTML($('#nextUp'),html);
+  {const mb=$('#mixEdBtn'),saved=!!(S.mix&&S.mix.saved);mb.classList.toggle('on',saved);setText(mb,saved?'✎ MIX EDITOR · SAVED FOR THESE TWO':'✎ MIX EDITOR')}
   const sg=$('#sgrid');
   if(CAT&&!sg.children.length){sg.innerHTML=CAT.samples.map((n,i)=>`<button class="pad" data-sample="${n}" style="--pc:${HOT[(i+4)%8]}">${SAMPLE_NAMES[n]||n}</button>`).join('');
     $$('[data-sample]',sg).forEach(b=>b.addEventListener('pointerdown',e=>{e.preventDefault();b.classList.add('lit');setTimeout(()=>b.classList.remove('lit'),180);api({op:'sample',name:b.dataset.sample})}))}
@@ -860,6 +897,190 @@ function renderBrowser(){
   const hl=$('#histList');const hk=JSON.stringify((S.history||[]).map(h=>h.at));
   if(hl._key!==hk){hl._key=hk;hl.innerHTML=(S.history||[]).map(it=>`<div class="item"><img ${it.thumbnail?`src="${esc(it.thumbnail)}"`:''} alt=""><div class="t"><b>${esc(it.title)}</b><span>${esc(it.artist||'')}</span></div><span class="label">${new Date(it.at*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</span></div>`).join('')||'<div class="empty">Loaded songs show up here.</div>'}
   $('#browser [data-tab=queue]').textContent='QUEUE'+(q.length?' ('+q.length+')':'');
+}
+
+// ---------------------------------------------------------------- mix editor
+// A mix drawn by hand for the two songs on the decks: where it starts on each song, how long
+// it takes, and a curve for every control. Saved per pair of songs (mixes.py on the bot).
+const MXL=[['vol','VOLUME'],['low','BASS EQ'],['mid','MIDS'],['hi','HIGHS'],['filter','FILTER'],['drums','DRUMS',1],['bass','BASS',1],['vocals','VOCALS',1],['other','MUSIC',1]];
+const MX={open:false,ed:null,lane:'vol',out:'A',inn:'B',drag:null,audio:null,url:null,lead:0,busy:false,raf:0};
+const mxRest=l=>l==='filter'?0:1, mxMin=l=>l==='filter'?-1:0;
+const mxPad=8; // beats shown either side of the mix
+function mxShapes(B){const h=B/2;return{
+  blend:{'out.vol':[[0,1],[h,1],[B,0]],'in.vol':[[0,0],[h,1]],'out.low':[[0,1],[h-1,1],[h,0]],'in.low':[[0,0],[h-1,0],[h,1]]},
+  fade:{'out.vol':[[0,1],[B,0]],'in.vol':[[0,0],[B,1]]},
+  top:{'out.vol':[[0,1],[0.5,0]],'in.vol':[[0,1]]},
+  filter:{'out.vol':[[0,1],[B*0.75,1],[B,0]],'out.filter':[[0,0],[B,0.85]],'in.vol':[[0,0],[h,1]],'out.low':[[0,1],[h-1,1],[h,0]],'in.low':[[0,0],[h-1,0],[h,1]]},
+  vocal:{'out.vol':[[0,1],[B*0.85,1],[B,0]],'in.vol':[[0,1]],'out.drums':[[0,1],[Math.min(4,h),0]],'in.drums':[[0,0],[Math.min(4,h),1]],
+    'out.bass':[[0,1],[Math.min(3,h-1),1],[Math.min(4,h),0]],'in.bass':[[0,0],[Math.min(3,h-1),0],[Math.min(4,h),1]],
+    'out.other':[[0,1],[B*0.25,0]],'in.other':[[0,0],[B*0.25,1]],'out.vocals':[[0,1],[B*0.75,1],[B*0.85,0]],'in.vocals':[[0,0],[B*0.85,0],[B*0.95,1]]}}}
+function mxBs(k){const d=S.decks[k];return d.bpm?60/d.bpm:0.5}
+function mxSnapOut(t){const d=S.decks[MX.out],bar=4*mxBs(MX.out);return d.first_beat+Math.round((t-d.first_beat)/bar)*bar}
+function mxOpen(){
+  if(!S||!S.active||!S.mix){toast('A mix needs a song on both decks. Load the next song first.');return}
+  const m=S.mix,o=S.decks[m.out];
+  if(!o.bpm){toast('The song on deck '+m.out+' has no steady beat to count a mix on.');return}
+  MX.out=m.out;MX.inn=m.in;
+  const n=S.decks[m.in],bar=4*mxBs(m.out);
+  let ed=m.saved?JSON.parse(JSON.stringify(m.saved)):{beats:32,out_at:null,in_at:null,in_start:0,lanes:mxShapes(32).blend};
+  if(ed.out_at==null)ed.out_at=m.plan?m.plan.out_at:livePos(o)+2*bar;
+  ed.out_at=Math.max(mxSnapOut(ed.out_at),mxSnapOut(livePos(o)+bar*0.5));
+  if(m.saved&&m.saved.out_at!=null)ed.out_at=m.saved.out_at;
+  if(ed.in_at==null)ed.in_at=m.plan?m.plan.in_at:n.cue;
+  MX.ed=ed;MX.lane='vol';MX.open=true;
+  $('#mixed').classList.remove('hide');
+  mxSync();mxLoop();
+}
+function mxClose(){MX.open=false;mxStop();$('#mixed').classList.add('hide');cancelAnimationFrame(MX.raf)}
+function mxSync(){
+  const ed=MX.ed,o=S.decks[MX.out],n=S.decks[MX.inn],stems=!!(S.mix&&S.mix.stems);
+  setHTML($('#mxTitle'),`<span class="a">${esc(o.title||'Deck '+MX.out)}</span> <i>into</i> <span class="b">${esc(n.title||'Deck '+MX.inn)}</span>`);
+  $('#mxBeats').value=String(ed.beats);
+  setText($('#mxOutAt'),fmt(ed.out_at));setText($('#mxInAt'),fmt(ed.in_at));
+  setHTML($('#mxLanes'),MXL.map(([id,label,st])=>`<button data-lane="${id}" class="${id===MX.lane?'on':''}${ed.lanes['out.'+id]||ed.lanes['in.'+id]?' has':''}" ${st&&!stems?'disabled title="Both songs need stems for this"':''}>${label}</button>`).join(''));
+  $('#mxDelete').classList.toggle('hide',!(S.mix&&S.mix.saved));
+}
+function mxGeom(){
+  const c=$('#mxCanvas'),r=c.getBoundingClientRect(),dpr=Math.min(2,devicePixelRatio||1);
+  const W=Math.max(10,Math.round(r.width*dpr)),H=Math.max(10,Math.round(r.height*dpr));
+  if(c.width!==W||c.height!==H){c.width=W;c.height=H}
+  const B=MX.ed.beats,gap=10*dpr,rowH=(H-3*gap)/2;
+  return{c,W,H,dpr,B,x:b=>(b+mxPad)/(B+2*mxPad)*W,beat:x=>x/W*(B+2*mxPad)-mxPad,
+    rows:{out:{top:gap,h:rowH},in:{top:2*gap+rowH,h:rowH}}};
+}
+function mxY(row,lane,v){const lo=mxMin(lane);return row.top+row.h-(v-lo)/(1-lo)*row.h}
+function mxV(row,lane,y){const lo=mxMin(lane);return Math.max(lo,Math.min(1,lo+(row.top+row.h-y)/row.h*(1-lo)))}
+function mxPoints(side){return MX.ed.lanes[side+'.'+MX.lane]}
+function mxValue(points,b,rest){
+  if(!points||!points.length)return rest;
+  if(b<=points[0][0])return points[0][1];
+  for(let i=1;i<points.length;i++){const p=points[i-1],q=points[i];if(b<=q[0])return q[0]<=p[0]?q[1]:p[1]+(q[1]-p[1])*(b-p[0])/(q[0]-p[0])}
+  return points[points.length-1][1];
+}
+function mxDraw(){
+  const G=mxGeom(),g=G.c.getContext('2d'),ed=MX.ed,B=G.B;
+  g.clearRect(0,0,G.W,G.H);
+  const sides=[['out',MX.out,'#ffb020'],['in',MX.inn,'#33d6ff']];
+  for(const [side,k,color] of sides){
+    const row=G.rows[side],d=S.decks[k],w=waves[k],bs=mxBs(side==='out'?MX.out:MX.inn),mid=row.top+row.h/2;
+    g.fillStyle='#0b0d11';g.fillRect(0,row.top,G.W,row.h);
+    // the song's time at each beat of the mix (both play at the old song's tempo)
+    const timeAt=b=>side==='out'?ed.out_at+b*bs:ed.in_at+(b-(ed.in_start||0))*bs;
+    if(w){
+      const step=Math.max(1,Math.round(G.W/700));
+      for(const [band,scale,col] of [[w.low,0.95,'#1f6bff'],[w.mid,0.8,'#ff9a2e'],[w.high,0.6,'#f4f6ff']]){
+        for(const lit of [true,false]){
+          g.beginPath();
+          for(let x=0;x<G.W;x+=step){
+            const b=G.beat(x),t=timeAt(b),i=Math.floor(t*w.rate);
+            if(i<0||i>=band.length)continue;
+            const audible=side==='out'?b<B:b>=(ed.in_start||0);
+            if(audible!==lit)continue;
+            const v=band[i]/255*row.h/2*scale;if(v>0.3)g.rect(x,mid-v,step,v*2);
+          }
+          g.globalAlpha=lit?0.5:0.13;g.fillStyle=col;g.fill();
+        }
+      }
+      g.globalAlpha=1;
+    }
+    // bars
+    for(let b=-mxPad;b<=B+mxPad;b+=4){
+      const x=Math.round(G.x(b))+0.5;g.strokeStyle=b%16===0?'#ffffff26':'#ffffff10';g.lineWidth=1;
+      g.beginPath();g.moveTo(x,row.top);g.lineTo(x,row.top+row.h);g.stroke();
+    }
+    // outside the mix
+    g.fillStyle='#000a';g.fillRect(0,row.top,G.x(0),row.h);g.fillRect(G.x(B),row.top,G.W-G.x(B),row.h);
+    // the curve
+    const lane=MX.lane,points=mxPoints(side),rest=mxRest(lane);
+    g.strokeStyle=color;g.lineWidth=2*G.dpr;g.setLineDash(points?[]:[6*G.dpr,6*G.dpr]);g.globalAlpha=points?1:0.45;
+    g.beginPath();g.moveTo(G.x(0),mxY(row,lane,mxValue(points,0,rest)));
+    for(const p of points||[])g.lineTo(G.x(p[0]),mxY(row,lane,p[1]));
+    g.lineTo(G.x(B),mxY(row,lane,mxValue(points,B,rest)));g.stroke();g.setLineDash([]);g.globalAlpha=1;
+    for(const p of points||[]){g.beginPath();g.arc(G.x(p[0]),mxY(row,lane,p[1]),5*G.dpr,0,7);g.fillStyle='#0b0d11';g.fill();g.lineWidth=2*G.dpr;g.strokeStyle=color;g.stroke()}
+    g.fillStyle=color;g.font=`${11*G.dpr}px system-ui,sans-serif`;g.textBaseline='top';
+    g.fillText((side==='out'?'OLD  ':'NEW  ')+(d.title||'').slice(0,60),8*G.dpr,row.top+6*G.dpr);
+  }
+  // where the old song is now, and the preview's playhead
+  const o=S.decks[MX.out],now=(livePos(o)-ed.out_at)/mxBs(MX.out);
+  const line=(b,col)=>{if(b<-mxPad||b>B+mxPad)return;const x=G.x(b);g.strokeStyle=col;g.lineWidth=2*G.dpr;g.beginPath();g.moveTo(x,0);g.lineTo(x,G.H);g.stroke()};
+  if(o.playing)line(now,'#ff3d5a');
+  if(MX.audio&&!MX.audio.paused)line((MX.audio.currentTime-MX.lead)/mxBs(MX.out),'#2fe07a');
+}
+function mxLoop(){if(!MX.open)return;MX.raf=requestAnimationFrame(mxLoop);if(S&&S.active&&S.decks[MX.out].loaded&&S.decks[MX.inn].loaded)mxDraw();else mxClose()}
+function mxHit(e){
+  const G=mxGeom(),r=G.c.getBoundingClientRect(),x=(e.clientX-r.left)*G.W/r.width,y=(e.clientY-r.top)*G.H/r.height;
+  const side=y<G.rows.in.top-5*G.dpr?'out':'in',row=G.rows[side];
+  return{G,x,y,side,row,beat:Math.max(0,Math.min(G.B,Math.round(G.beat(x)*2)/2)),value:Math.round(mxV(row,MX.lane,y)*100)/100};
+}
+function mxNear(h){
+  const points=mxPoints(h.side);if(!points)return -1;
+  let best=-1,dist=14*h.G.dpr;
+  points.forEach((p,i)=>{const d=Math.hypot(h.G.x(p[0])-h.x,mxY(h.row,MX.lane,p[1])-h.y);if(d<dist){dist=d;best=i}});
+  return best;
+}
+function mxWire(){
+  const c=$('#mxCanvas');
+  c.addEventListener('pointerdown',e=>{
+    if(!MX.open)return;e.preventDefault();
+    const h=mxHit(e),key=h.side+'.'+MX.lane;let i=mxNear(h);
+    if(i<0){
+      const rest=mxRest(MX.lane),points=MX.ed.lanes[key]||(MX.ed.lanes[key]=[[0,rest],[h.G.B,rest]]);
+      points.push([h.beat,h.value]);points.sort((a,b)=>a[0]-b[0]);
+      i=points.findIndex(p=>p[0]===h.beat&&p[1]===h.value);
+    }
+    MX.drag={key,point:MX.ed.lanes[key][i]};c.setPointerCapture(e.pointerId);mxSync();
+  });
+  c.addEventListener('pointermove',e=>{
+    if(!MX.drag)return;const h=mxHit(e),points=MX.ed.lanes[MX.drag.key],row=h.G.rows[MX.drag.key.split('.')[0]];
+    MX.drag.point[0]=h.beat;MX.drag.point[1]=Math.round(mxV(row,MX.lane,h.y)*100)/100;
+    points.sort((a,b)=>a[0]-b[0]);
+  });
+  const up=()=>{MX.drag=null};
+  c.addEventListener('pointerup',up);c.addEventListener('pointercancel',up);
+  c.addEventListener('dblclick',e=>{
+    const h=mxHit(e),key=h.side+'.'+MX.lane,i=mxNear(h);if(i<0)return;
+    MX.ed.lanes[key].splice(i,1);if(MX.ed.lanes[key].length<2)delete MX.ed.lanes[key];mxSync();
+  });
+  $('#mxLanes').addEventListener('click',e=>{const b=e.target.closest('[data-lane]');if(b&&!b.disabled){MX.lane=b.dataset.lane;mxSync()}});
+  $('#mxBeats').onchange=e=>{
+    const B=+e.target.value,k=B/MX.ed.beats;
+    for(const points of Object.values(MX.ed.lanes))for(const p of points)p[0]=Math.round(p[0]*k*2)/2;
+    MX.ed.beats=B;MX.ed.in_start=Math.min(MX.ed.in_start||0,B-1);mxSync();
+  };
+  $('#mxPreset').onchange=e=>{
+    const shape=mxShapes(MX.ed.beats)[e.target.value];e.target.value='';if(!shape)return;
+    if(Object.keys(shape).some(k=>MXL.find(l=>l[0]===k.split('.')[1])[2])&&!(S.mix&&S.mix.stems)){toast('Both songs need stems for that one.');return}
+    MX.ed.lanes=JSON.parse(JSON.stringify(shape));mxSync();
+  };
+  $$('#mixed [data-mv]').forEach(b=>b.onclick=()=>{
+    const side=b.dataset.mv,d=+b.dataset.d,ed=MX.ed;
+    if(side==='out'){const o=S.decks[MX.out];ed.out_at=Math.max(o.first_beat,Math.min(o.duration-ed.beats*mxBs(MX.out)-1,ed.out_at+d*4*mxBs(MX.out)))}
+    else{const n=S.decks[MX.inn];ed.in_at=Math.max(0,Math.min(n.duration-10,ed.in_at+d*4*mxBs(MX.inn)))}
+    mxSync();
+  });
+  $('#mxTop').onclick=()=>{MX.ed.in_at=0;mxSync()};
+  $('#mxClose').onclick=mxClose;
+  $('#mxPreview').onclick=mxPreview;
+  const body=()=>({mix:MX.ed,out:MX.out,in:MX.inn});
+  $('#mxSave').onclick=async()=>{if(await api({op:'mix_save',...body()}))mxSync()};
+  $('#mxDelete').onclick=async()=>{if(await api({op:'mix_delete',...body()}))mxSync()};
+  $('#mxNow').onclick=async()=>{if(await api({op:'mix_now',...body()}))mxClose()};
+  addEventListener('keydown',e=>{if(MX.open&&e.key==='Escape')mxClose()});
+}
+function mxStop(){if(MX.audio){MX.audio.pause();MX.audio=null}if(MX.url){URL.revokeObjectURL(MX.url);MX.url=null}const b=$('#mxPreview');if(b)b.textContent='▶ PREVIEW'}
+async function mxPreview(){
+  const b=$('#mxPreview');
+  if(MX.audio){mxStop();return}
+  if(MX.busy)return;MX.busy=true;b.textContent='MAKING IT…';
+  try{
+    const r=await fetch(apiUrl+'/preview',{method:'POST',headers:headers(),credentials:'same-origin',body:JSON.stringify({mix:MX.ed,out:MX.out,in:MX.inn})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));toast(d.error||'The preview could not be made.');b.textContent='▶ PREVIEW';return}
+    MX.lead=parseFloat(r.headers.get('X-Mix-Lead')||'0');
+    MX.url=URL.createObjectURL(await r.blob());
+    if(!MX.open){mxStop();return}
+    MX.audio=new Audio(MX.url);MX.audio.onended=mxStop;
+    await MX.audio.play();b.textContent='■ STOP';
+  }catch(_){toast('The preview could not be played.');mxStop()}finally{MX.busy=false}
 }
 
 // ---------------------------------------------------------------- animation
