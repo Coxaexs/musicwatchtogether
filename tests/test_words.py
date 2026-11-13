@@ -62,6 +62,16 @@ class WordsTests(unittest.TestCase):
         self.assertEqual(out[0][0], [10.1, 10.4, "Was", [100, 200, 300]])
         self.assertEqual([w[2] for w in out[2]], ["Asked", "me", "for", "the", "phone"])
 
+    def test_only_a_line_the_aligner_lost_drops_its_words(self):
+        data = timed(words.fingerprint(LINES))
+        for w in data["lines"][1]["words"]:
+            w[4] = 0.002
+        data["lines"][0]["words"][0][4] = 0.0          # one unsure word does not hide a line
+        self.write(data)
+        out = words.for_lines("abc", LINES)
+        self.assertEqual(len(out[0]), 4)
+        self.assertEqual(out[2], [])
+
     def test_other_lyrics_get_no_words(self):
         self.write(timed(words.fingerprint(LINES)))
         self.assertIsNone(words.for_lines("abc", [[10.0, "A different song"]]))

@@ -36,8 +36,10 @@ logger = logging.getLogger("MusicBot.Words")
 #: An aligned song is trusted when this share of its lines start within 1.5 s of where the
 #: lyrics put them (after their overall offset): fewer means another song's or version's words.
 MIN_FIT = 0.5
-#: A word the aligner was unsure of (mean letter probability) is shown without its own timing.
-MIN_SCORE = 0.05
+#: A line whose words the aligner was this unsure of (mean letter probability over the line) keeps its
+#: line timing only. Sung words score low in general (median 0.26 over the first 37 songs) and a low score
+#: is not a wrong time (a line at 0.11 sat within 1.2 s of lrclib), so only near-zero lines are dropped.
+MIN_LINE_SCORE = 0.01
 _cache = {}
 
 
@@ -133,10 +135,11 @@ def for_lines(digest, lines):
             out.append([])
             continue
         t = next(by_line)
-        good = [w for w in t.get("words") or () if w[0] is not None and (len(w) < 5 or w[4] >= MIN_SCORE)]
+        ws = t.get("words") or []
+        scores = [w[4] for w in ws if len(w) > 4]
+        lost = bool(scores) and sum(scores) / len(scores) < MIN_LINE_SCORE
         # A line where the aligner lost its way keeps its line timing only.
-        out.append([[w[0], w[1], w[2], w[3]] for w in t["words"]]
-                   if t.get("words") and len(good) >= 0.6 * len(t["words"]) else [])
+        out.append([] if lost or not ws else [[w[0], w[1], w[2], w[3]] for w in ws])
     return out
 
 
