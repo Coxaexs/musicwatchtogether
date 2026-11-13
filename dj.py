@@ -540,6 +540,7 @@ class Deck:
         self.stretch = keylock.DeckStretch()
         self.ai = True              # set by the session's AI switch (on unless the booth turns it off)
         self.top = True             # set by the session's CLASSIC / NEW switch: may be played from the top
+        self.lyrics = True          # set by the session's FOLLOW LYRICS switch: mixes and loops respect sung lines
 
     def reset_track_state(self):
         self.pos = 0.0              # playhead, in samples (float)
@@ -918,6 +919,9 @@ class Deck:
             "karaoke": self.karaoke,
             "stems": {"status": self.stems_status, "extra": self.extra is not None,
                       "gain": {k: round(v, 3) for k, v in self.stem_gain.items()}},
+            # FOLLOW LYRICS: True / False once Real DJ looked for the song's timed words, None before.
+            "words": (lambda c: None if not c or c[0][0] != self.wave_id else c[1] is not None)(
+                getattr(self, "_lyric_spans", None)),
         }
         if full:
             result["wave"] = self.wave
@@ -2034,6 +2038,7 @@ class DJSession:
         self.three = False               # Real DJ: 3 songs (layer a third song's vocal)
         self.ai = True                   # beta, on by default: Real DJ uses the offline AI analysis (djbrain)
         self.top = True                  # NEW mixes: a song with an opening line is played from the top. Off = CLASSIC
+        self.lyrics = True               # FOLLOW LYRICS: Real DJ cuts and loops on the ends of sung lines (words.py)
         self.paused = False              # the whole set paused (pause / resume)
         self.paused_decks = []           # what was playing when it was paused
         self.saved_at = 0.0              # monotonic time of the last snapshot
@@ -2205,6 +2210,18 @@ class DJSession:
                     self.engine.transition = None
                 else:
                     tr.style, tr.label = "blend", STYLES["blend"][0]
+
+    def set_lyrics(self, on):
+        """FOLLOW LYRICS: Real DJ plans its mixes and hook loops around the songs' sung lines, where Oracle
+        has timed their words (words.py), so the old song is not cut off mid-sentence."""
+        self.lyrics = bool(on)
+        with self.engine.lock:
+            for deck in self.engine.decks.values():
+                deck.lyrics = self.lyrics
+            if self.engine.transition and not self.engine.transition.started:
+                self.engine.transition = None      # planned again
+        if self.real:
+            self.real.plan = self.real.plan_for = None
 
     def set_top(self, on):
         """CLASSIC / NEW: whether Auto DJ and Real DJ may play a song from the top (off: they mix as they did before)."""
@@ -2724,6 +2741,8 @@ class DJSession:
                 self.set_ai(bool(body["ai"]))
             if "top" in body:
                 self.set_top(bool(body["top"]))
+            if "lyrics" in body:
+                self.set_lyrics(bool(body["lyrics"]))
             if "on" in body:
                 self.auto = bool(body["on"])
             if body.get("style") in STYLES:
@@ -3052,8 +3071,8 @@ class DJSession:
             "kind": self.kind,
             "live": self.live,
             "auto": {"on": self.auto, "style": self.auto_style, "beats": self.auto_beats,
-                     "mode": self.mode, "vibe": self.vibe, "three": self.three, "ai": self.ai, "top": self.top, "autoplay": self.autoplay,
-                     "station": self.station, "stations": stations.catalog(),
+                     "mode": self.mode, "vibe": self.vibe, "three": self.three, "ai": self.ai, "top": self.top, "lyrics": self.lyrics,
+                     "autoplay": self.autoplay, "station": self.station, "stations": stations.catalog(),
                      "real": self.real.state() if self.real else None},
             "stems": {"on": self.stems_on, "available": stems.enabled()},
             "paused": self.paused,
@@ -3191,7 +3210,7 @@ class DJSession:
                                "position": round(d.seconds, 2),
                                "playing": bool(playing and name == on_air)}
         snap = {"kind": self.kind, "auto": self.auto, "mode": self.mode, "vibe": self.vibe,
-                "three": self.three, "ai": self.ai, "ai_v": AI_DEFAULT_V, "top": self.top, "stems": self.stems_on, "paused": self.paused,
+                "three": self.three, "ai": self.ai, "ai_v": AI_DEFAULT_V, "top": self.top, "lyrics": self.lyrics, "stems": self.stems_on, "paused": self.paused,
                 "autoplay": self.autoplay, "played": sorted(self.played)[-300:], "station": self.station,
                 "decks": decks, "on_air": on_air if on_air in decks else None, "saved_at": time.time()}
         if self.kind == "huddle":
@@ -3237,6 +3256,7 @@ class DJSession:
         # Sets saved before AI became the default (no ai_v) stored "off" only because it was; they get it on too.
         self.set_ai(bool(snap.get("ai")) if snap.get("ai_v") == AI_DEFAULT_V else True)
         self.set_top(bool(snap.get("top", True)))
+        self.set_lyrics(bool(snap.get("lyrics", True)))
         self.auto = bool(snap.get("auto", True))
         if snap.get("stems") is not None and bool(snap["stems"]) != self.stems_on:
             self.set_stems(bool(snap["stems"]))

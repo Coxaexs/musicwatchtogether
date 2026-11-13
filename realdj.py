@@ -46,6 +46,7 @@ import loops as loop_crate
 import mixer
 import stations
 import stems
+import words
 
 SR = 48_000                   # dj.SR (dj imports this module, so not from there)
 
@@ -800,7 +801,8 @@ def find_hooks(deck, s=None):
     prof = beat_profile(deck)
     if not s or prof is None:
         return []
-    key = (deck.wave_id, deck.bpm, deck.first_beat, id(deck.stems))
+    spans = lyric_spans(deck)
+    key = (deck.wave_id, deck.bpm, deck.first_beat, id(deck.stems), spans is not None)
     cached = getattr(deck, "_hooks", None)
     if cached and cached[0] == key:
         return [dict(h) for h in cached[1]]
@@ -818,6 +820,11 @@ def find_hooks(deck, s=None):
         if phrase is None:
             continue
         weight = 1.0 + (0.6 if phrase["big"] else 0.0) + 0.3 * phrase["energy"] + (0.25 if beat % 4 == 0 else 0.0)
+        if spans:
+            # FOLLOW LYRICS: a line that starts here is a better hook than a word in the middle of one.
+            t = deck.time_of_beat(beat)
+            if any(abs(a - t) <= 0.5 * deck.beat_seconds for a, _ in spans[0]):
+                weight += 0.4
         found.append({"beat": beat, "score": round(level * onset * weight, 4)})
     found.sort(key=lambda h: -h["score"])
     picked = []
@@ -827,11 +834,32 @@ def find_hooks(deck, s=None):
             start, sung = _word(deck, hook["beat"])
             hook["time"] = round(start, 3)
             hook["length"] = 1 if sung < 0.85 * deck.beat_seconds else 2
+            if spans:
+                _fit_hook_to_words(deck, hook, spans)
             picked.append(hook)
         if len(picked) >= 16:
             break
     deck._hooks = (key, picked)
     return [dict(h) for h in picked]
+
+
+def _fit_hook_to_words(deck, hook, spans):
+    """FOLLOW LYRICS: a hook loop starts on the sung word's own start and is 1 or 2 beats long, whichever
+    ends between words (best: at the end of the line), so the repeat never chops a word in two."""
+    bs = deck.beat_seconds
+    near = [a for a, _ in spans[1] if abs(a - hook["time"]) <= 0.3 * bs]
+    if near:
+        hook["time"] = round(min(near, key=lambda a: abs(a - hook["time"])), 3)
+    end_of_line = line_end_after(spans, hook["time"], 0.3 * bs)
+
+    def cost(length):
+        end = hook["time"] + length * bs
+        clean = mid_line(spans, end)
+        # Ending just after the line is sung through is the cleanest loop there is.
+        bonus = -0.5 if end_of_line is not None and end_of_line - 0.05 <= end <= end_of_line + 0.5 * bs else 0.0
+        return clean + bonus + (0.1 if length != hook["length"] else 0.0)
+
+    hook["length"] = min((1, 2), key=cost)
 
 
 def _word(deck, beat):
@@ -1100,6 +1128,55 @@ def _digest(deck):
         return None
 
 
+#: FOLLOW LYRICS: what a mix costs (in plan score) for cutting the old song off in the middle of a sung line,
+#: or bringing the new one in mid-line. 1.0 = in a word, 0.6 = between two words of a line. Moving the mix a
+#: phrase costs 0.12, so a mid-line cut gives way to a clean one a few phrases off.
+LYRIC_COST = 0.6
+LYRIC_COST_IN = 0.4
+
+
+def lyric_spans(deck):
+    """(lines, words) of a deck's song: [(start, end)] in the deck's seconds, from the words Oracle timed
+    (words.spans), when FOLLOW LYRICS is on, else None. Only for audio that is the cached song itself
+    (same length as its stems): a stream of it may be offset."""
+    if not getattr(deck, "lyrics", False) or getattr(deck, "stems", None) is None:
+        return None
+    key = (getattr(deck, "wave_id", None), id(deck.stems))
+    cached = getattr(deck, "_lyric_spans", None)
+    if cached and cached[0] == key:
+        return cached[1]
+    found = None
+    try:
+        digest = _digest(deck)
+        if digest and stems.stem_frames(digest) == deck.stems.shape[1]:
+            found = words.spans(digest)
+    except Exception:
+        logger.debug("No lyric timing for %s", getattr(deck, "name", "?"), exc_info=True)
+    deck._lyric_spans = (key, found)
+    return found
+
+
+def mid_line(spans, t, margin=0.08):
+    """How badly cutting at `t` seconds breaks a sung line: 1.0 inside a word, 0.6 between the words of a
+    line, 0.0 between lines (or without timing)."""
+    if not spans:
+        return 0.0
+    lines, timed = spans
+    if not any(a + margin < t < b - margin for a, b in lines):
+        return 0.0
+    return 1.0 if any(a + margin < t < b - margin for a, b in timed) else 0.6
+
+
+def line_end_after(spans, t, within):
+    """The end of the line sung at `t` (or of the next one starting within `within` s), or None."""
+    if not spans:
+        return None
+    for a, b in spans[0]:
+        if a - within <= t < b or (t <= a <= t + within):
+            return b
+    return None
+
+
 def _riff_parts(out, inn, so, si, start):
     """The parts to borrow a riff of, the likeliest to suit first: a guitar for
     songs with guitars in, else keys, else a bass line."""
@@ -1204,11 +1281,17 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
         logger.debug("Loop crate unavailable", exc_info=True)
         borrowed_drums = None
 
+    lyrics_out, lyrics_in = lyric_spans(out), lyric_spans(inn)
+
     def consider(move, start, overlap, landing, base, why, **extra):
         if start < earliest or start + overlap > count:
             return
         cue, on_big = _landing(si, landing)
         score = base * taste.get(move if move in taste else "drop", 1.0)
+        if lyrics_out or lyrics_in:
+            # FOLLOW LYRICS: not mid-sentence where the old vocal goes, nor where the new song comes in.
+            score -= LYRIC_COST * mid_line(lyrics_out, out.time_of_beat((start + overlap) * P))
+            score -= LYRIC_COST_IN * mid_line(lyrics_in, inn.time_of_beat(cue * P))
         score += 0.35 if on_big else -0.3
         score -= 0.12 * abs(start + overlap - ideal_end)
         if move in last_styles[-2:]:
@@ -1294,6 +1377,7 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
             score = (TOP_SUNG if opening["sung"] else TOP_PLAYED) - 0.12 * abs(start - ideal_end) + rng.random() * 0.2
             if "top" in last_styles[-2:]:
                 score *= 0.6
+            score -= LYRIC_COST * mid_line(lyrics_out, out.time_of_beat(start * P))
             candidates.append((score, "top", start, 0,
                                "from the top: the old song cuts with an echo, the new song's opening "
                                + ("line" if opening["sung"] else "bars") + " in the clear, then its beat", {}))

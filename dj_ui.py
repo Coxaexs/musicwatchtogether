@@ -265,6 +265,22 @@ body:not(.realmode) .realonly{display:none!important}
 .mxfoot{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .mxfoot .btn{padding:10px 14px}
 .pill.mixed.on{border-color:var(--orange);color:var(--orange)}
+/* ---------- settings drawer ---------- */
+.pill.gear{display:flex;align-items:center;gap:6px}
+.drawer-bg{position:fixed;inset:0;z-index:45;background:#000a}
+.drawer{position:fixed;top:0;right:0;bottom:0;z-index:46;width:min(420px,100%);overflow-y:auto;background:linear-gradient(#1b1e23,#121418);border-left:1px solid #000;box-shadow:-30px 0 80px #000c;padding:0 18px 24px}
+.drawer .dhead{position:sticky;top:0;display:flex;align-items:center;justify-content:space-between;padding:16px 0 12px;background:#1b1e23;z-index:1}
+.drawer .dhead b{font-size:16px;letter-spacing:.04em}
+.drawer .x{width:34px;height:34px;border-radius:50%;border:1px solid var(--edge2);font-size:14px}
+.drawer h4{margin:18px 0 6px;font-size:10px;letter-spacing:.18em;color:var(--dim);font-weight:800;text-transform:uppercase}
+.opt{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 0;border-top:1px solid #ffffff0d}
+.opt>div:first-child{min-width:0}
+.opt b{display:block;font-size:13px}
+.opt small{display:block;color:var(--muted);font-size:12px;margin-top:3px;line-height:1.4}
+.opt small em{font-style:normal;color:var(--text)}
+.opt .seg{flex:none}.opt .seg button{padding:7px 10px;font-size:10px}
+.opt .tag{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:999px;border:1px solid var(--edge2);font-size:9px;letter-spacing:.1em;color:var(--muted);vertical-align:1px}
+.opt .pill{flex:none;min-width:64px;text-align:center}
 .toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%) translateY(20px);opacity:0;transition:.25s;background:#1d2025;border:1px solid var(--edge2);padding:10px 14px;border-radius:10px;z-index:60;max-width:calc(100% - 32px);box-shadow:0 10px 30px #000a}
 .toast.show{opacity:1;transform:translateX(-50%)}
 
@@ -295,12 +311,10 @@ body:not(.realmode) .realonly{display:none!important}
     <button data-mode="simple">SIMPLE</button><button data-mode="medium">MEDIUM</button><button data-mode="advanced">ADVANCED</button>
   </div>
   <div class="onair" id="onair"><i></i>OFF AIR</div>
-  <button class="pill stemsw" id="stemsTop" title="Split songs into drums, bass, vocals and melody for stem controls and stem mixes">STEMS</button>
   <button class="pill auto" id="autoTop" title="Auto DJ mixes the queue for you, in order">AUTO DJ</button>
   <button class="pill real" id="realTop" title="Real DJ performs a set: picks songs from the queue, plays their best part, mashups, loop rolls and drops">REAL DJ</button>
-  <button class="pill autoplay" id="autoplayTop" title="Autoplay: when the queue runs out, the set carries on with stemmed songs from the library">AUTOPLAY</button>
   <select id="stationTop" title="Mood: the DJ picks songs from the whole library for this mood, and mixes in its style" aria-label="Mood"><option value="">Any mood</option></select>
-  <a class="pill" id="loopsTop" href="#" style="text-decoration:none;color:inherit" title="The loop crate: listen to the riffs and grooves Real DJ borrows from other songs, and turn down the bad ones">LOOPS</a>
+  <button class="pill gear" id="setTop" aria-haspopup="dialog" aria-controls="settings" title="Booth settings: stems, autoplay, how the DJ mixes">⚙ SETTINGS</button>
   <button class="pill end" id="endBtn">END SET</button>
 </header>
 
@@ -323,6 +337,30 @@ body:not(.realmode) .realonly{display:none!important}
   <section class="panel sampler" id="sampler"></section>
   <section class="panel browser" id="browser"></section>
 </main>
+
+<div class="drawer-bg hide" id="setBg"></div>
+<aside class="drawer hide" id="settings" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+  <div class="dhead"><b id="setTitle">Booth settings</b><button class="x" id="setClose" aria-label="Close settings">✕</button></div>
+  <h4>The set</h4>
+  <div class="opt"><div><b>Stems</b><small>Split songs into drums, bass, vocals and melody, for stem controls and stem mixes.</small></div>
+    <button class="pill stemsw" id="stemsTop" aria-label="Stems">OFF</button></div>
+  <div class="opt"><div><b>Autoplay</b><small>When the queue runs out, the set carries on with songs from the library.</small></div>
+    <button class="pill autoplay" id="autoplayTop" aria-label="Autoplay">OFF</button></div>
+  <div class="opt"><div><b>Loop crate</b><small>Listen to the riffs and grooves Real DJ borrows from other songs, and turn down the bad ones.</small></div>
+    <a class="pill" id="loopsTop" href="#" style="text-decoration:none;color:inherit">OPEN</a></div>
+  <h4>How the DJ mixes</h4>
+  <div class="opt"><div><b>Mixes</b><small>New: a song that opens on a line everyone knows is played from that line, in a one-bar gap. Classic: the booth mixes as it did before.</small></div>
+    <div class="seg" id="topSeg"><button data-v="0">CLASSIC</button><button data-v="1">NEW</button></div></div>
+  <div class="opt"><div><b>Follow the lyrics<span class="tag">REAL DJ</span></b><small>Waits for a sung line to end before cutting a song or bringing the next one in, and loops whole words. Only for songs whose words are timed. <span id="wordsNote"></span></small></div>
+    <div class="seg" id="lyricsSeg"><button data-v="0">OFF</button><button data-v="1">ON</button></div></div>
+  <div class="opt"><div><b>AI analysis<span class="tag">REAL DJ · BETA</span></b><small>Songs that sound alike follow each other, and exits, entries, loops and effects go where an AI that listened to each song says they fit.</small></div>
+    <div class="seg" id="aiSeg"><button data-v="0">OFF</button><button data-v="1">ON</button></div></div>
+  <div class="opt"><div><b>Songs at once<span class="tag">REAL DJ</span></b><small>3: a third song's vocal sings over the playing beat for a phrase, then that song plays next.</small></div>
+    <div class="seg" id="threeSeg"><button data-v="2">2</button><button data-v="3">3</button></div></div>
+  <h4>Mixer</h4>
+  <div class="opt"><div><b>Crossfader curve</b><small>Smooth fades both songs across the whole throw. Cut switches at the edges, for scratching.</small></div>
+    <div class="seg" id="xfCurve"><button data-v="smooth">SMOOTH</button><button data-v="sharp">CUT</button></div></div>
+</aside>
 
 <div class="overlay hide" id="start"><div class="card">
   <h1>HUDDLE <b>DJ</b></h1>
@@ -503,8 +541,7 @@ function mixerHTML(){
     <button class="mixbtn" id="mixBtn">MIX ▶</button>
   </div>
   <div class="hold simple-only" id="holdFx"></div>
-  <div class="xf"><b>A</b><input type="range" class="hfader" id="xfader" min="-1" max="1" step="0.005" value="0" aria-label="Crossfader"><b>B</b></div>
-  <div class="row between adv"><span class="label">X-FADER CURVE</span><div class="seg" id="xfCurve"><button data-v="smooth">SMOOTH</button><button data-v="sharp">CUT</button></div></div>`;
+  <div class="xf"><b>A</b><input type="range" class="hfader" id="xfader" min="-1" max="1" step="0.005" value="0" aria-label="Crossfader"><b>B</b></div>`;
 }
 function build(){
   for(const k of DECKS)$('.deck-'+k).innerHTML=deckHTML(k);
@@ -513,9 +550,7 @@ function build(){
     <button class="pill" id="pauseSet" title="Pause the whole set (both decks and the mix in progress); resume carries on exactly there">⏸ PAUSE SET</button>
     <div class="seg modeseg" id="autoMode" title="Auto DJ: plays the queue in order, smooth mixes. Real DJ: performs a set — picks songs, plays their best part, mashups and drops."><button data-v="auto">AUTO DJ</button><button data-v="real">REAL DJ</button></div>
     <div class="seg modeseg vibeseg realonly" id="vibeSeg" title="How much Real DJ plays the decks: loops, effects, sampler, drops"><button data-v="chill">CHILL</button><button data-v="club">CLUB</button><button data-v="hype">HYPE</button></div>
-    <div class="seg modeseg realonly" id="threeSeg" title="3 songs: Real DJ also lays a third song's vocal over the playing beat for a phrase, then plays that song next"><button data-v="2">2 SONGS</button><button data-v="3">3 SONGS</button></div>
-    <div class="seg modeseg aiseg realonly" id="aiSeg" title="Beta, on by default: Real DJ uses the offline AI analysis: songs that sound alike follow each other, and it leaves, enters, loops and plays effects where an AI that listened to each song says it fits. Off = the DJ as before."><button data-v="0">AI OFF</button><button data-v="1">✨ AI · BETA</button></div>
-    <div class="seg modeseg" id="topSeg" title="New: a song that opens on a line everyone knows is played from that line, in a one-bar gap, instead of being blended over or skipped into. Classic: the booth mixes as it did before."><button data-v="0">CLASSIC MIXES</button><button data-v="1">NEW MIXES</button></div>
+    <button class="pill" data-open-settings title="Stems, autoplay, mix style, follow the lyrics, AI">⚙ More settings</button>
     <div class="realinfo" id="realInfo"></div>
     <div class="smoothonly"><div class="label">Transition</div><div class="chips" id="styleChips"></div></div>
     <div class="row between med smoothonly"><span class="label">Length</span><select id="autoBeats" style="padding:4px 6px"><option value="">Style default</option><option value="4">1 bar</option><option value="8">2 bars</option><option value="16">4 bars</option><option value="32">8 bars</option><option value="64">16 bars</option></select></div>
@@ -629,6 +664,13 @@ function wire(){
     api({op:'auto',mode,on:true}).then(r=>r&&toast(msg))};
   const VIBE_MSG={chill:'Chill: long smooth blends, few tricks.',club:'Club: loops, effects and drops most phrases.',hype:'Hype: tricks all the time, drops, sampler.'};
   $$('#vibeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',vibe:b.dataset.v}).then(r=>r&&toast(VIBE_MSG[b.dataset.v])));
+  $$('#lyricsSeg button').forEach(b=>b.onclick=()=>api({op:'auto',lyrics:b.dataset.v==='1'}).then(r=>r&&toast(b.dataset.v==='1'?'Following the lyrics: Real DJ cuts and loops at the end of a sung line.':'Not following the lyrics: mixes land on the phrase, wherever the singer is.')));
+  {let back=null;
+   const open=()=>{back=document.activeElement;$('#settings').classList.remove('hide');$('#setBg').classList.remove('hide');$('#setTop').setAttribute('aria-expanded','true');$('#setClose').focus()};
+   const shut=()=>{if($('#settings').classList.contains('hide'))return;$('#settings').classList.add('hide');$('#setBg').classList.add('hide');$('#setTop').setAttribute('aria-expanded','false');if(back&&back.focus)back.focus()};
+   $('#setTop').onclick=open;$$('[data-open-settings]').forEach(b=>b.onclick=open);
+   $('#setClose').onclick=shut;$('#setBg').onclick=shut;
+   addEventListener('keydown',e=>{if(e.key==='Escape')shut()})}
   $$('#topSeg button').forEach(b=>b.onclick=()=>api({op:'auto',top:b.dataset.v==='1'}).then(r=>r&&toast(b.dataset.v==='1'?'New mixes: songs with an opening line are played from the top.':'Classic mixes: the booth mixes as it did before.')));
   $$('#aiSeg button').forEach(b=>b.onclick=()=>api({op:'auto',ai:b.dataset.v==='1'}).then(r=>r&&toast(b.dataset.v==='1'?'AI (beta): songs that sound alike, and exits, entries and effects an AI picked for each song.':'AI off: the DJ as before.')));
   $('#pauseSet').onclick=()=>api({op:S&&S.paused?'resume':'pause'});
@@ -814,6 +856,7 @@ function renderMixer(){
   const m=S.mixer,fx=S.fx;
   const sw=$('#stemsTop'),stm=S.stems||{};
   sw.classList.toggle('on',!!stm.on);sw.disabled=!stm.available;
+  {const t=!stm.available?'N/A':stm.on?'ON':'OFF';if(sw.textContent!==t)sw.textContent=t}
   sw.title=stm.available?(stm.on?'Stems on: click to turn off for this room':'Stems off: click to split songs into drums, bass, vocals and melody'):'Stem separation is not installed on this bot';
   $('#onair').className='onair'+(S.live?' live':'');$('#onair').lastChild.textContent=S.live?'ON AIR':'STARTING…';
   if(!held('xfader'))$('#xfader').value=m.xfader;
@@ -861,6 +904,9 @@ function renderAuto(){
   $$('#threeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.three?'3':'2')));
   $$('#aiSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.ai?'1':'0')));
   $$('#topSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.top?'1':'0')));
+  $$('#lyricsSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.lyrics===false?'0':'1')));
+  {const parts=[];for(const k of DECKS){const d=S.decks&&S.decks[k];if(d&&d.loaded&&d.words!=null)parts.push(`Deck ${k}: <em>${d.words?'timed':'not timed yet'}</em>`)}
+   const h=parts.join(' · ');const n=$('#wordsNote');if(n._h!==h){n._h=h;n.innerHTML=h}}
   {const pb=$('#pauseSet');const t=S.paused?'▶ RESUME SET':'⏸ PAUSE SET';if(pb.textContent!==t)pb.textContent=t;pb.classList.toggle('on',!!S.paused)}
 
   const ri=$('#realInfo');
@@ -871,6 +917,7 @@ function renderAuto(){
   else if(ri._h!==''){ri._h='';ri.innerHTML=''}
   $('#autoSwitch').classList.toggle('on',a.on);$('#autoTop').classList.toggle('on',a.on&&!real);$('#realTop').classList.toggle('on',a.on&&real);
   $('#autoplayTop').classList.toggle('on',!!a.autoplay);
+  {const b=$('#autoplayTop'),t=a.autoplay?'ON':'OFF';if(b.textContent!==t)b.textContent=t}
   const st=$('#stationTop');
   if(a.stations&&st.options.length<2){a.stations.forEach(x=>{const o=document.createElement('option');o.value=x.id;o.textContent=`${x.emoji} ${x.label}`;st.appendChild(o)})}
   if(document.activeElement!==st)st.value=a.station||'';

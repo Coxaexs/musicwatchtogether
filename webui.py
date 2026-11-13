@@ -39,6 +39,7 @@ import songlib
 import stations
 import stem_mixes
 import stems
+import words
 from music import Song, get_autocomplete_suggestions, state_store, ytdl_playlist
 from musixmatch import MusixmatchLyrics
 from security import SlidingWindowLimiter, client_identity
@@ -2292,7 +2293,36 @@ class WebUI:
         return web.json_response(data)
 
     async def api_lyrics_search(self, request):
-        """Lyrics for an arbitrary track, so Huddle rooms can show them too."""
+        """Lyrics for an arbitrary track, so Huddle rooms can show them too.
+
+        With ?key= (the track's page URL and query, as many as it has) and stems for
+        that song, the answer also carries "words": per line, when each word is sung
+        (words.py), once Oracle has timed them; until then this asks for them."""
+        response = await self._lyrics_search_answer(request)
+        keys = [mixer.track_key(k) for k in request.query.getall('key', [])[:4]]
+        keys = [k for k in keys if k]
+        if response.status != 200 or not keys:
+            return response
+        try:
+            data = json.loads(response.body)
+            lines = data.get('lines') or []
+            if not lines:
+                return response
+            loop = asyncio.get_running_loop()
+            digest = await loop.run_in_executor(None, stems.lookup, keys)
+            if not digest:
+                return response
+            timed = await loop.run_in_executor(None, words.for_lines, digest, lines)
+            if not timed:
+                await loop.run_in_executor(None, words.want, digest, lines, data.get('source'), data.get('track'))
+                return response
+            data['words'] = timed
+            return web.json_response(data)
+        except Exception:
+            logger.warning('Could not add timed words to the lyrics', exc_info=True)
+        return response
+
+    async def _lyrics_search_answer(self, request):
         query = (request.query.get('q') or '').strip()[:200]
         if not query:
             return web.json_response({'error': 'give a track name'}, status=400)
