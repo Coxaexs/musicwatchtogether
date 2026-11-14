@@ -291,3 +291,22 @@ def want_twin(keys, lines, title=None, duration=None):
         logger.debug("Could not ask for a twin of %s: %s", video, error)
         return False
     return True
+
+
+def available(urls):
+    """Which of these track URLs have word-timed lyrics to show: their own (aligned, not just heard by
+    Whisper) or a twin's. For Hoffle's music search, which marks them. One read of the stems index."""
+    tracks = stems.load_index()["tracks"]
+    out = set()
+    for url in urls:
+        found = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", str(url or ""))
+        if not found:
+            continue
+        video = found.group(1)
+        entry = tracks.get("yt:" + video) or {}
+        data = load(entry.get("hash")) if entry.get("hash") else None
+        if not data:
+            data = _trusted(_read(os.path.join(twins_dir(), video + ".words.json")))
+        if data and data.get("mode") == "aligned":
+            out.add(url)
+    return out

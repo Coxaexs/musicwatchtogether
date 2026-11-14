@@ -2657,7 +2657,7 @@ class WebUI:
         key = query.casefold()
         cached = self._search_cache.get(key)
         if cached and time.monotonic() - cached[0] < 600:
-            return web.json_response({'results': cached[1]})
+            return web.json_response({'results': await self._mark_words(cached[1])})
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(
@@ -2689,7 +2689,18 @@ class WebUI:
         if len(self._search_cache) > 200:
             self._search_cache.clear()
         self._search_cache[key] = (time.monotonic(), results)
-        return web.json_response({'results': results})
+        return web.json_response({'results': await self._mark_words(results)})
+
+    async def _mark_words(self, results):
+        """The search results with "words": true on the ones whose lyrics light up word by word (words.py).
+        Worked out on every answer, not cached: Oracle times more songs all the time."""
+        try:
+            have = await asyncio.get_running_loop().run_in_executor(
+                None, words.available, [r['url'] for r in results])
+        except Exception:
+            logger.debug('Could not check for timed words', exc_info=True)
+            return results
+        return [dict(r, words=True) if r['url'] in have else r for r in results]
 
     def musixmatch(self):
         if self._musixmatch is None:

@@ -128,6 +128,20 @@ class TwinTests(unittest.TestCase):
         self.assertEqual(out[0][0][2], "Was")
         self.assertFalse(words.want_twin(keys, LINES))                 # answered
 
+    def test_search_marks_songs_with_their_own_words_or_a_twins(self):
+        own, twin, heard, none = ("https://www.youtube.com/watch?v=" + v for v in
+                                  ("aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"))
+        with open(os.path.join(stems.CACHE_DIR, "index.json"), "w") as f:
+            json.dump({"tracks": {"yt:aaaaaaaaaaa": {"hash": "abc"}, "yt:ccccccccccc": {"hash": "hrd"}}}, f)
+        with open(words.words_path("abc"), "w") as f:
+            json.dump(timed(words.fingerprint(LINES)), f)
+        with open(words.words_path("hrd"), "w") as f:
+            json.dump(timed(None, fit=None, mode="heard"), f)          # Whisper's words are never shown
+        os.makedirs(words.twins_dir())
+        with open(os.path.join(words.twins_dir(), "bbbbbbbbbbb.words.json"), "w") as f:
+            json.dump(timed(words.fingerprint(LINES)), f)
+        self.assertEqual(words.available([own, twin, heard, none, "not a link"]), {own, twin})
+
     def test_no_youtube_id_no_twin(self):
         self.assertFalse(words.want_twin(["some query"], LINES))
         self.assertIsNone(words.twin_lines(["some query"], LINES))
