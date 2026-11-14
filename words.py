@@ -21,6 +21,7 @@ lyrics for are heard by Whisper on Oracle ("mode": "heard", no fingerprint):
 its words are too often misheard to show, so those only give the DJ its timing.
 """
 
+import difflib
 import hashlib
 import json
 import logging
@@ -36,6 +37,9 @@ logger = logging.getLogger("MusicBot.Words")
 #: An aligned song is trusted when this share of its lines start within 1.5 s of where the
 #: lyrics put them (after their overall offset): fewer means another song's or version's words.
 MIN_FIT = 0.5
+#: ... unless Whisper confirmed the words (share of heard words in the lyrics, hq_words.PLAIN_MATCH): then
+#: the lyrics' own line times were another version's, and ours are the ones to trust.
+MIN_MATCH = 0.6
 #: A line whose words the aligner was this unsure of (mean letter probability over the line) keeps its
 #: line timing only. Sung words score low in general (median 0.26 over the first 37 songs) and a low score
 #: is not a wrong time (a line at 0.11 sat within 1.2 s of lrclib), so only near-zero lines are dropped.
@@ -88,7 +92,8 @@ def load(digest):
     data = _read(words_path(digest))
     if not isinstance(data, dict) or data.get("error") or not data.get("lines"):
         return None
-    if data.get("mode") == "aligned" and data.get("fit") is not None and data["fit"] < MIN_FIT:
+    if data.get("mode") == "aligned" and data.get("fit") is not None and data["fit"] < MIN_FIT \
+            and (data.get("match") or 0) < MIN_MATCH:
         return None
     return data
 
@@ -119,16 +124,23 @@ def want(digest, lines, source=None, title=None):
     return True
 
 
-def for_lines(digest, lines):
-    """Per shown line, its timed words [[start, end, word, [ms, ...]], ...] (or [] for a line without),
-    when this song's words were timed for exactly these lyrics; else None."""
-    data = load(digest)
-    if not data or data.get("fp") != fingerprint(lines):
-        return None
-    timed = data["lines"]
-    shown = [line for line in lines if str(line[1]).strip()]
-    if len(timed) != len(shown):
-        return None
+#: Lyrics shown that differ a little from the ones that were timed (another lrclib upload: a line split in
+#: two, "I push it down" for "push it down", ad libs in brackets): words are matched one by one. A shown line
+#: gets its words when this share of them matched a timed word; the song needs MAP_SONG of all of them.
+MAP_LINE = 0.7
+MAP_SONG = 0.6
+
+
+def _lost(line):
+    scores = [w[4] for w in line.get("words") or () if len(w) > 4]
+    return bool(scores) and sum(scores) / len(scores) < MIN_LINE_SCORE
+
+
+def _key(word):
+    return _norm(word).replace(" ", "")
+
+
+def _same_lines(timed, lines):
     by_line, out = iter(timed), []
     for line in lines:
         if not str(line[1]).strip():
@@ -136,11 +148,66 @@ def for_lines(digest, lines):
             continue
         t = next(by_line)
         ws = t.get("words") or []
-        scores = [w[4] for w in ws if len(w) > 4]
-        lost = bool(scores) and sum(scores) / len(scores) < MIN_LINE_SCORE
         # A line where the aligner lost its way keeps its line timing only.
-        out.append([] if lost or not ws else [[w[0], w[1], w[2], w[3]] for w in ws])
+        out.append([] if _lost(t) or not ws else [[w[0], w[1], w[2], w[3]] for w in ws])
     return out
+
+
+def _mapped(timed, lines):
+    """The timed words put on the shown lyrics word by word (difflib over the normalised words)."""
+    pool = [w for t in timed if not _lost(t) for w in t.get("words") or () if w[0] is not None and w[1] is not None]
+    shown = [(li, word) for li, line in enumerate(lines) for word in str(line[1]).split()]
+    if not pool or not shown:
+        return None
+    match = difflib.SequenceMatcher(None, [_key(w[2]) for w in pool], [_key(w) for _, w in shown], autojunk=False)
+    hit = {}
+    for a, b, size in match.get_matching_blocks():
+        for k in range(size):
+            hit[b + k] = pool[a + k]
+    if len(hit) < MAP_SONG * len(shown):
+        return None
+    out, k = [[] for _ in lines], 0
+    for li, line in enumerate(lines):
+        n = len(str(line[1]).split())
+        idx = list(range(k, k + n))
+        k += n
+        if not n or sum(1 for i in idx if i in hit) < MAP_LINE * n:
+            continue
+        row = []
+        for j, i in enumerate(idx):
+            word = shown[i][1]
+            if i in hit:
+                w = hit[i]
+                row.append([w[0], w[1], word, list(w[3])])
+                continue
+            # A word only the shown lyrics have: the gap between its timed neighbours in the line.
+            before = next((hit[idx[m]][1] for m in range(j - 1, -1, -1) if idx[m] in hit), None)
+            after = next((hit[idx[m]][0] for m in range(j + 1, n) if idx[m] in hit), None)
+            start = before if before is not None else max(0.0, after - 0.3)
+            end = after if after is not None else start + 0.3
+            row.append([start, max(start, end), word, []])
+        # Never backwards: a repeated chorus word matched out of order keeps the line moving forward.
+        for j in range(1, len(row)):
+            if row[j][0] < row[j - 1][0]:
+                row[j][0] = row[j - 1][0]
+                row[j][1] = max(row[j][1], row[j][0])
+                row[j][3] = []
+        out[li] = row
+    return out if any(out) else None
+
+
+def for_lines(digest, lines):
+    """Per shown line, its timed words [[start, end, word, [ms, ...]], ...] (or [] for a line without),
+    or None when this song has no timed words that fit these lyrics. Lyrics timed exactly as shown are used
+    line for line; slightly different ones (another upload of the same lyrics) word by word (_mapped)."""
+    data = load(digest)
+    if not data:
+        return None
+    timed = data["lines"]
+    shown = [line for line in lines if str(line[1]).strip()]
+    if data.get("fp") == fingerprint(lines) and len(timed) == len(shown):
+        return _same_lines(timed, lines)
+    return _mapped(timed, lines)
 
 
 def spans(digest):

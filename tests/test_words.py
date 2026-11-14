@@ -72,6 +72,24 @@ class WordsTests(unittest.TestCase):
         self.assertEqual(len(out[0]), 4)
         self.assertEqual(out[2], [])
 
+    def test_slightly_different_lyrics_get_words_word_by_word(self):
+        # Another upload of the same lyrics: a line split in two, a word dropped, one added.
+        self.write(timed(words.fingerprint(LINES)))
+        shown = [[10.0, "Was an honest"], [11.0, "man"], [15.0, "Asked me for phone, yeah"]]
+        out = words.for_lines("abc", shown)
+        self.assertEqual([w[2] for w in out[0]], ["Was", "an", "honest"])
+        self.assertEqual(out[1], [[11.3, 11.9, "man", [200, 400, 600]]])
+        self.assertEqual([w[2] for w in out[2]], ["Asked", "me", "for", "phone,", "yeah"])
+        self.assertEqual(out[2][3][0], 16.4)                       # "phone," is the timed "phone"
+        self.assertEqual(out[2][4][3], [])                         # "yeah" only the shown lyrics have
+        self.assertGreaterEqual(out[2][4][0], out[2][3][0])
+
+    def test_a_poor_fit_is_trusted_once_whisper_confirmed_the_words(self):
+        data = timed(words.fingerprint(LINES), fit=0.1)
+        data["match"] = 0.8
+        self.write(data)
+        self.assertIsNotNone(words.for_lines("abc", LINES))
+
     def test_other_lyrics_get_no_words(self):
         self.write(timed(words.fingerprint(LINES)))
         self.assertIsNone(words.for_lines("abc", [[10.0, "A different song"]]))
