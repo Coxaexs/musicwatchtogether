@@ -2310,25 +2310,62 @@ class WebUI:
                 return response
             loop = asyncio.get_running_loop()
             digest = await loop.run_in_executor(None, stems.lookup, keys)
-            if not digest:
-                # An upload without stems: the words of another upload of the same recording, shifted onto
-                # this one (words.py "twins"), once words-sync has found one; until then, ask it to look.
+            timed = await loop.run_in_executor(None, words.for_lines, digest, lines) if digest else None
+            if not timed:
+                # Another upload's words, shifted onto this one (words.py "twins": found by words-sync, or
+                # borrowed by hand in the player); "words_from" lets the player say so and save a timing.
                 timed = await loop.run_in_executor(None, words.twin_lines, keys, lines)
-                if not timed:
+                if timed:
+                    data['words_from'] = await loop.run_in_executor(None, words.twin_info, keys)
+            if not timed:
+                if digest:
+                    await loop.run_in_executor(None, words.want, digest, lines, data.get('source'),
+                                               data.get('track'))
+                else:
                     await loop.run_in_executor(None, words.want_twin, keys, lines, data.get('track'),
                                                request.query.get('duration'))
-                    return response
-                data['words'] = timed
-                return web.json_response(data)
-            timed = await loop.run_in_executor(None, words.for_lines, digest, lines)
-            if not timed:
-                await loop.run_in_executor(None, words.want, digest, lines, data.get('source'), data.get('track'))
                 return response
             data['words'] = timed
             return web.json_response(data)
         except Exception:
             logger.warning('Could not add timed words to the lyrics', exc_info=True)
         return response
+
+    async def api_words(self, request):
+        """Borrowing another version's timed words in Hoffle's music player (words.py):
+        {"action": "donors" | "borrow" | "shift" | "clear", "keys": [page URL, query], "lines": [[at, text]],
+         "from": <hash> (borrow), "delta": seconds (shift), "by": who}."""
+        if not self._authorized_admin(request):
+            return web.json_response({'error': 'admin password required'}, status=403)
+        try:
+            body = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text='invalid json')
+        keys = [k for k in (mixer.track_key(str(x)) for x in (body.get('keys') or [])[:4] if x) if k]
+        lines = [[float(line[0]) if line[0] is not None else None, str(line[1])[:300]]
+                 for line in (body.get('lines') or [])[:400]
+                 if isinstance(line, (list, tuple)) and len(line) == 2]
+        by = str(body.get('by') or '')[:80] or None
+        action = body.get('action')
+        loop = asyncio.get_running_loop()
+        try:
+            if action == 'donors':
+                found = await loop.run_in_executor(None, words.donors, lines)
+                return web.json_response({'donors': found})
+            if action == 'borrow':
+                timed = await loop.run_in_executor(None, words.borrow, keys, lines, str(body.get('from') or ''), by)
+                info = await loop.run_in_executor(None, words.twin_info, keys)
+                logger.info('Words for %s borrowed from %s by %s', keys, body.get('from'), by)
+                return web.json_response({'words': timed, 'words_from': info})
+            if action == 'shift':
+                shift = await loop.run_in_executor(None, words.reshift, keys, float(body.get('delta') or 0), by)
+                return web.json_response({'shift': shift})
+            if action == 'clear':
+                cleared = await loop.run_in_executor(None, words.unborrow, keys)
+                return web.json_response({'cleared': cleared})
+        except (ValueError, TypeError) as error:
+            return web.json_response({'error': str(error)}, status=400)
+        return web.json_response({'error': 'Unknown action.'}, status=400)
 
     async def _lyrics_search_answer(self, request):
         query = (request.query.get('q') or '').strip()[:200]
@@ -3210,6 +3247,7 @@ async def start_web_server(bot):
     app.router.add_get('/api/lyrics/search', ui.api_lyrics_search)
     app.router.add_get('/api/lyrics/candidates', ui.api_lyrics_candidates)
     app.router.add_post('/api/lyrics/pick', ui.api_lyrics_pick)
+    app.router.add_post('/api/words', ui.api_words)
     app.router.add_post('/api/lyrics/ask-musixmatch', ui.api_lyrics_ask_musixmatch)
     app.router.add_get('/api/admin/musixmatch', ui.api_musixmatch_usage)
     app.router.add_get('/api/stems/status', ui.api_stems_status)

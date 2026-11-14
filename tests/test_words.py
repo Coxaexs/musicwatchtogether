@@ -142,6 +142,28 @@ class TwinTests(unittest.TestCase):
             json.dump(timed(words.fingerprint(LINES)), f)
         self.assertEqual(words.available([own, twin, heard, none, "not a link"]), {own, twin})
 
+    def test_borrow_another_versions_words_then_line_them_up_by_hand(self):
+        with open(words.words_path("abc"), "w") as f:
+            json.dump(dict(timed(words.fingerprint(LINES)), title="Hard to Explain (album)"), f)
+        # A live upload: the same words, sung 2 s later than the album's.
+        shown = [[12.1, "Was an honest man"], [17.2, "Asked me for the phone"]]
+        found = words.donors(shown)
+        self.assertEqual([(d["id"], d["match"]) for d in found], [("abc", 1.0)])
+        keys = ["yt:eeeeeeeeeee"]
+        out = words.borrow(keys, shown, "abc", by="kiwi")
+        self.assertAlmostEqual(out[0][0][0], 12.1, delta=0.05)         # started on the lyrics' own line times
+        self.assertEqual(words.twin_info(keys)["borrowed"], True)
+        self.assertEqual(words.reshift(keys, -0.3), round(words.twin_info(keys)["shift"], 3))
+        self.assertAlmostEqual(words.twin_lines(keys, shown)[0][0][0], 11.8, delta=0.05)
+        self.assertTrue(words.unborrow(keys))
+        self.assertIsNone(words.twin_lines(keys, shown))
+        self.assertTrue(os.path.exists(os.path.join(words.twins_dir(), "eeeeeeeeeee.none.json")))
+
+    def test_whispers_words_are_never_lent(self):
+        with open(words.words_path("hrd"), "w") as f:
+            json.dump(timed(None, fit=None, mode="heard"), f)
+        self.assertEqual(words.donors(LINES), [])
+
     def test_no_youtube_id_no_twin(self):
         self.assertFalse(words.want_twin(["some query"], LINES))
         self.assertIsNone(words.twin_lines(["some query"], LINES))

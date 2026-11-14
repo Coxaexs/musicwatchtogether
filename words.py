@@ -310,3 +310,117 @@ def available(urls):
         if data and data.get("mode") == "aligned":
             out.add(url)
     return out
+
+
+# ---------------------------------------------------------------- borrowing another version's words, by hand
+#
+# When no upload of the same recording lines up (a live take, another edit), someone in the music player can
+# still pick a timed version whose words fit these lyrics and line it up themselves with the timing buttons.
+# It is kept as this upload's twin ("borrowed": true), so everyone gets it, and "Save this timing" moves it.
+
+def _write_twin(video, data):
+    os.makedirs(twins_dir(), exist_ok=True)
+    path = os.path.join(twins_dir(), video + ".words.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.chmod(tmp, 0o664)
+    os.replace(tmp, path)
+    _cache.pop(path, None)
+
+
+def _moved(lines, delta):
+    def move(t):
+        return None if t is None else round(t + delta, 3)
+    return [dict(line, at=move(line.get("at")), end=move(line.get("end")),
+                 words=[[move(w[0]), move(w[1]), *w[2:]] for w in line.get("words") or ()]) for line in lines]
+
+
+def donors(lines, limit=6):
+    """Timed songs whose words fit these lyrics (60% of the words, in order), best first:
+    [{"id", "title", "duration", "match"}]. Only songs timed from real lyrics, never Whisper's."""
+    want = [w for line in lines for w in _norm(line[1]).split()]
+    if not want:
+        return []
+    found = []
+    for name in os.listdir(stems.CACHE_DIR):
+        if not name.endswith(".words.json"):
+            continue
+        digest = name[: -len(".words.json")]
+        data = load(digest)
+        if not data or data.get("mode") != "aligned":
+            continue
+        have = [w for line in data["lines"] for w in _norm(line.get("text", "")).split()]
+        match = difflib.SequenceMatcher(None, have, want, autojunk=False)
+        share = sum(b.size for b in match.get_matching_blocks()) / len(want)
+        if share >= 0.6:
+            found.append({"id": digest, "title": data.get("title") or digest[:8],
+                          "duration": data.get("duration"), "match": round(share, 2)})
+    return sorted(found, key=lambda d: -d["match"])[:limit]
+
+
+def _start_shift(data, lines):
+    """Where to start the borrowed words: the median gap between the lyrics' own line times and the
+    borrowed words' line starts (0 when the lyrics have no times)."""
+    mapped = _mapped(data["lines"], lines)
+    gaps = sorted(float(line[0]) - row[0][0] for line, row in zip(lines, mapped or ())
+                  if row and line[0] is not None and row[0][0] is not None)
+    return round(gaps[len(gaps) // 2], 2) if gaps else 0.0
+
+
+def borrow(keys, lines, digest, by=None):
+    """Use song `digest`'s timed words for this upload; returns for_lines-style words for `lines`."""
+    video = _video(keys)
+    if not video:
+        raise ValueError("Only songs from YouTube can borrow timed words for now.")
+    data = load(digest)
+    if not data or data.get("mode") != "aligned":
+        raise ValueError("That version has no timed words any more.")
+    shift = _start_shift(data, lines)
+    out = {k: data.get(k) for k in ("fp", "mode", "fit", "match", "language", "title")}
+    out.update(lines=_moved(data["lines"], shift), twin_of=digest, video=video, shift=shift, borrowed=True,
+               by=by, at=int(time.time()))
+    _write_twin(video, out)
+    try:
+        os.remove(os.path.join(twins_dir(), video + ".none.json"))
+    except OSError:
+        pass
+    return _fit_to(_trusted(out), lines)
+
+
+def reshift(keys, delta, by=None):
+    """Move this upload's twin words by `delta` seconds (someone lined them up by ear and saved it)."""
+    video = _video(keys)
+    path = os.path.join(twins_dir(), video + ".words.json") if video else None
+    data = _read(path) if path else None
+    if not isinstance(data, dict) or not data.get("lines"):
+        raise ValueError("This song has no borrowed words to move.")
+    delta = max(-60.0, min(60.0, float(delta)))
+    data = dict(data, lines=_moved(data["lines"], delta), shift=round((data.get("shift") or 0) + delta, 3),
+                by=by, at=int(time.time()))
+    _write_twin(video, data)
+    return data["shift"]
+
+
+def unborrow(keys):
+    """Stop using another version's words for this upload. Automatic twins are told not to come back."""
+    video = _video(keys)
+    if not video:
+        return False
+    path = os.path.join(twins_dir(), video + ".words.json")
+    if not os.path.exists(path):
+        return False
+    os.remove(path)
+    _cache.pop(path, None)
+    with open(os.path.join(twins_dir(), video + ".none.json"), "w", encoding="utf-8") as f:
+        json.dump({"at": int(time.time()) + 10 * 365 * 86400, "why": "removed by hand"}, f)
+    return True
+
+
+def twin_info(keys):
+    """What the player says about this upload's words: {"borrowed", "twin_of", "title", "shift"} or None."""
+    video = _video(keys)
+    data = _read(os.path.join(twins_dir(), video + ".words.json")) if video else None
+    if not isinstance(data, dict):
+        return None
+    return {"borrowed": bool(data.get("borrowed")), "title": data.get("title"), "shift": data.get("shift")}
