@@ -397,9 +397,20 @@ def reshift(keys, delta, by=None):
         raise ValueError("This song has no borrowed words to move.")
     delta = max(-60.0, min(60.0, float(delta)))
     data = dict(data, lines=_moved(data["lines"], delta), shift=round((data.get("shift") or 0) + delta, 3),
-                by=by, at=int(time.time()))
+                by=by, at=int(time.time()), confirmed=True)       # lined up by ear: right, as far as they know
     _write_twin(video, data)
     return data["shift"]
+
+
+def confirm(keys, by=None):
+    """Someone listened and this upload's twin words are right: the player stops asking."""
+    video = _video(keys)
+    path = os.path.join(twins_dir(), video + ".words.json") if video else None
+    data = _read(path) if path else None
+    if not isinstance(data, dict) or not data.get("lines"):
+        raise ValueError("This song has no borrowed words to confirm.")
+    _write_twin(video, dict(data, confirmed=True, confirmed_by=by, confirmed_at=int(time.time())))
+    return True
 
 
 def unborrow(keys):
@@ -423,4 +434,5 @@ def twin_info(keys):
     data = _read(os.path.join(twins_dir(), video + ".words.json")) if video else None
     if not isinstance(data, dict):
         return None
-    return {"borrowed": bool(data.get("borrowed")), "title": data.get("title"), "shift": data.get("shift")}
+    return {"borrowed": bool(data.get("borrowed")), "title": data.get("title"), "shift": data.get("shift"),
+            "confirmed": bool(data.get("confirmed"))}

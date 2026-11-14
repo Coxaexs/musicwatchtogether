@@ -2334,7 +2334,7 @@ class WebUI:
 
     async def api_words(self, request):
         """Borrowing another version's timed words in Hoffle's music player (words.py):
-        {"action": "donors" | "borrow" | "shift" | "clear", "keys": [page URL, query], "lines": [[at, text]],
+        {"action": "donors" | "borrow" | "shift" | "confirm" | "clear", "keys": [page URL, query], "lines": [[at, text]],
          "from": <hash> (borrow), "delta": seconds (shift), "by": who}."""
         if not self._authorized_admin(request):
             return web.json_response({'error': 'admin password required'}, status=403)
@@ -2361,6 +2361,9 @@ class WebUI:
             if action == 'shift':
                 shift = await loop.run_in_executor(None, words.reshift, keys, float(body.get('delta') or 0), by)
                 return web.json_response({'shift': shift})
+            if action == 'confirm':
+                await loop.run_in_executor(None, words.confirm, keys, by)
+                return web.json_response({'confirmed': True})
             if action == 'clear':
                 cleared = await loop.run_in_executor(None, words.unborrow, keys)
                 return web.json_response({'cleared': cleared})

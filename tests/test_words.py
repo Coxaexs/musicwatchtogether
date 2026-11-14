@@ -155,6 +155,8 @@ class TwinTests(unittest.TestCase):
         self.assertEqual(words.twin_info(keys)["borrowed"], True)
         self.assertEqual(words.reshift(keys, -0.3), round(words.twin_info(keys)["shift"], 3))
         self.assertAlmostEqual(words.twin_lines(keys, shown)[0][0][0], 11.8, delta=0.05)
+        self.assertTrue(words.twin_info(keys)["confirmed"])            # a saved timing counts as checked
+        self.assertTrue(words.confirm(keys, by="kiwi"))
         self.assertTrue(words.unborrow(keys))
         self.assertIsNone(words.twin_lines(keys, shown))
         self.assertTrue(os.path.exists(os.path.join(words.twins_dir(), "eeeeeeeeeee.none.json")))
