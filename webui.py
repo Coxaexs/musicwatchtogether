@@ -738,6 +738,7 @@ HOFFLE_BOT_PATHS = re.compile(
     r'admin/(?:huddle-link|watch-ticket|watch-command|musixmatch)'
     r'|huddle/(?:resolve|search)'
     r'|lyrics/(?:search|candidates|pick|ask-musixmatch)'
+    r'|words'
     r'|library/(?:songs|delete)'
     r'|guilds(?:/[^/]+(?:/(?:action|play|lyrics|playlists|dj))?)?'
     r')$')

@@ -20,6 +20,7 @@ HOFFLE_PATHS = [
     ("GET", "/api/lyrics/candidates"),
     ("POST", "/api/lyrics/pick"),
     ("POST", "/api/lyrics/ask-musixmatch"),
+    ("POST", "/api/words"),
     ("GET", "/api/library/songs"),
     ("POST", "/api/library/delete"),
     ("POST", "/api/admin/huddle-link"),
