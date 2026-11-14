@@ -488,6 +488,12 @@ def analyze_buffer(audio, keys):
 # Deck
 # --------------------------------------------------------------------------
 
+#: VINYL STOP & START: how long a deck takes to slow to a standstill when paused, and to come up to speed
+#: again. A Technics takes about a second to stop with its brake off and under half a second to start.
+SPIN_STOP = 1.1
+SPIN_START = 0.5
+
+
 class Deck:
     def __init__(self, name):
         self.name = name
@@ -627,17 +633,41 @@ class Deck:
         if self.brake:
             kind, start_rate, length, elapsed = self.brake
             progress = elapsed / max(0.05, length)
-            if progress >= 1:
-                self.brake = None
-                self.playing = False
-                return 0.0
-            if kind == "spinback":
-                return -3.2 * (1 - progress) ** 2
-            return start_rate * (1 - progress) ** 1.4
+            if kind == "start":
+                # A turntable's motor bringing the platter up to speed (spin_up): fast at first, then easing
+                # onto the speed; pitch rises with it, since key lock stays out while self.brake is set.
+                if progress >= 1:
+                    self.brake = None
+                else:
+                    return start_rate + (self.play_rate() - start_rate) * (1 - (1 - progress) ** 2)
+            else:
+                if progress >= 1:
+                    self.brake = None
+                    self.playing = False
+                    return 0.0
+                if kind == "spinback":
+                    return -3.2 * (1 - progress) ** 2
+                return start_rate * (1 - progress) ** 1.4
         if not self.playing:
             return 0.0
+        return self.play_rate()
+
+    def play_rate(self):
         rate = self.base_rate() + self.bend * 0.08 + self.nudge
         return -rate if self.reverse else rate
+
+    def spin_down(self, seconds=None):
+        """Stop like a turntable switched off: the record slows to a standstill, the pitch falling with it
+        (the vinyl brake), then the deck is stopped. Nothing to do on a deck that isn't moving."""
+        if self.playing and not (self.brake and self.brake[0] != "start"):
+            self.end_slip()
+            self.brake = ("stop", self.rate_now or self.play_rate(), seconds or SPIN_STOP, 0.0)
+
+    def spin_up(self, seconds=None):
+        """Start like a turntable switched on: from wherever the platter is (still, or still slowing) up to
+        speed, the pitch rising with it."""
+        self.playing = True
+        self.brake = ("start", self.rate_now if self.brake else 0.0, seconds or SPIN_START, 0.0)
 
     def slipping(self):
         return self.slip and (self.loop_on or self.reverse or self.scratch is not None
@@ -1290,6 +1320,14 @@ class DJEngine:
                     best = candidate
         return best or (deck if deck and deck.loaded and deck.bpm else None)
 
+    def _motion(self):
+        """How fast the set moves against its own tempo: 1 playing, 0 paused, in between while VINYL STOP &
+        START slows the leading record down or brings it up to speed."""
+        m = self.master()
+        if m is not None and m.brake and m.brake[0] in ("stop", "start"):
+            return max(0.0, min(1.0, abs(m.rate_now) / max(0.05, abs(m.play_rate()))))
+        return 0.0 if self.paused else 1.0
+
     def clock(self):
         """(beat seconds of real time, current beat position) for synced FX."""
         m = self.master()
@@ -1808,7 +1846,13 @@ class DJEngine:
             self._sync_tempo()
             beat_seconds, beat_pos = self.clock()
             beat_step = BLOCK / SR / beat_seconds
-            if not self.paused:
+            motion = self._motion()
+            if motion and motion < 1:
+                # VINYL STOP & START: the records are slowing down or coming up to speed. A mix moves with
+                # them, so it keeps its place in the music (a frozen mix would land late on resume).
+                self._run_transition(beat_step * motion)
+                self._run_tempo_release(beat_step * motion)
+            elif not self.paused:
                 # Paused, a mix, a hook loop or a scratch waits exactly where it was.
                 self._run_transition(beat_step)
                 self._run_tempo_release(beat_step)
@@ -2039,6 +2083,7 @@ class DJSession:
         self.ai = True                   # beta, on by default: Real DJ uses the offline AI analysis (djbrain)
         self.top = True                  # NEW mixes: a song with an opening line is played from the top. Off = CLASSIC
         self.lyrics = True               # FOLLOW LYRICS: Real DJ cuts and loops on the ends of sung lines (words.py)
+        self.spin = True                 # VINYL STOP & START: pause / play slow down and speed up like a record
         self.paused = False              # the whole set paused (pause / resume)
         self.paused_decks = []           # what was playing when it was paused
         self.saved_at = 0.0              # monotonic time of the last snapshot
@@ -2743,6 +2788,8 @@ class DJSession:
                 self.set_top(bool(body["top"]))
             if "lyrics" in body:
                 self.set_lyrics(bool(body["lyrics"]))
+            if "spin" in body:
+                self.spin = bool(body["spin"])
             if "on" in body:
                 self.auto = bool(body["on"])
             if body.get("style") in STYLES:
@@ -2769,14 +2816,21 @@ class DJSession:
         if op == "play":
             if deck.cue_preview:
                 deck.cue_preview = False
-            want = (not deck.playing) if value is None else bool(value)
+            # A deck slowing down from a pause counts as stopped: pressing play brings it back up.
+            stopping = bool(deck.brake and deck.brake[0] == "stop")
+            want = (not deck.playing or stopping) if value is None else bool(value)
             if want and deck.ended:
                 deck.seek(deck.cue)
-            deck.playing = want
-            deck.brake = None
+            if self.spin and want and (not deck.playing or stopping) and not deck.sync:
+                deck.spin_up()
+            elif self.spin and not want and deck.playing:
+                deck.spin_down()
+            else:
+                deck.playing = want
+                deck.brake = None
             if want and deck.sync:
                 deck.phase_snap = True
-            if not want:
+            if not want and not self.spin:
                 deck.end_slip()
         elif op == "cue":
             # Pioneer CUE: playing -> back to cue and stop; stopped at cue ->
@@ -3072,7 +3126,7 @@ class DJSession:
             "live": self.live,
             "auto": {"on": self.auto, "style": self.auto_style, "beats": self.auto_beats,
                      "mode": self.mode, "vibe": self.vibe, "three": self.three, "ai": self.ai, "top": self.top, "lyrics": self.lyrics,
-                     "autoplay": self.autoplay, "station": self.station, "stations": stations.catalog(),
+                     "spin": self.spin, "autoplay": self.autoplay, "station": self.station, "stations": stations.catalog(),
                      "real": self.real.state() if self.real else None},
             "stems": {"on": self.stems_on, "available": stems.enabled()},
             "paused": self.paused,
@@ -3168,7 +3222,10 @@ class DJSession:
                 return
             self.paused_decks = [d.name for d in engine.decks.values() if d.playing]
             for d in engine.decks.values():
-                d.playing = False
+                if self.spin and d.playing:
+                    d.spin_down()          # slows to a stop, then d.playing is False
+                else:
+                    d.playing = False
             engine.paused = True
             self.paused = True
         self.notice = "Paused. Resume picks the set up right here."
@@ -3182,7 +3239,11 @@ class DJSession:
             for name in self.paused_decks:
                 deck = engine.decks.get(name)
                 if deck and deck.loaded and not deck.ended:
-                    deck.playing = True
+                    if self.spin:
+                        deck.spin_up()
+                    else:
+                        deck.playing = True
+                        deck.brake = None
             self.paused_decks = []
             engine.paused = False
             self.paused = False
@@ -3210,7 +3271,7 @@ class DJSession:
                                "position": round(d.seconds, 2),
                                "playing": bool(playing and name == on_air)}
         snap = {"kind": self.kind, "auto": self.auto, "mode": self.mode, "vibe": self.vibe,
-                "three": self.three, "ai": self.ai, "ai_v": AI_DEFAULT_V, "top": self.top, "lyrics": self.lyrics, "stems": self.stems_on, "paused": self.paused,
+                "three": self.three, "ai": self.ai, "ai_v": AI_DEFAULT_V, "top": self.top, "lyrics": self.lyrics, "spin": self.spin, "stems": self.stems_on, "paused": self.paused,
                 "autoplay": self.autoplay, "played": sorted(self.played)[-300:], "station": self.station,
                 "decks": decks, "on_air": on_air if on_air in decks else None, "saved_at": time.time()}
         if self.kind == "huddle":
@@ -3257,6 +3318,7 @@ class DJSession:
         self.set_ai(bool(snap.get("ai")) if snap.get("ai_v") == AI_DEFAULT_V else True)
         self.set_top(bool(snap.get("top", True)))
         self.set_lyrics(bool(snap.get("lyrics", True)))
+        self.spin = bool(snap.get("spin", True))
         self.auto = bool(snap.get("auto", True))
         if snap.get("stems") is not None and bool(snap["stems"]) != self.stems_on:
             self.set_stems(bool(snap["stems"]))

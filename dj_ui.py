@@ -357,6 +357,9 @@ body:not(.realmode) .realonly{display:none!important}
     <div class="seg" id="aiSeg"><button data-v="0">OFF</button><button data-v="1">ON</button></div></div>
   <div class="opt"><div><b>Songs at once<span class="tag">REAL DJ</span></b><small>3: a third song's vocal sings over the playing beat for a phrase, then that song plays next.</small></div>
     <div class="seg" id="threeSeg"><button data-v="2">2</button><button data-v="3">3</button></div></div>
+  <h4>Decks</h4>
+  <div class="opt"><div><b>Vinyl stop &amp; start</b><small>Pausing slows the record to a stop, pitch dropping with it, and playing brings it back up to speed, like a turntable. Off: decks stop and start instantly.</small></div>
+    <div class="seg" id="spinSeg"><button data-v="0">OFF</button><button data-v="1">ON</button></div></div>
   <h4>Mixer</h4>
   <div class="opt"><div><b>Crossfader curve</b><small>Smooth fades both songs across the whole throw. Cut switches at the edges, for scratching.</small></div>
     <div class="seg" id="xfCurve"><button data-v="smooth">SMOOTH</button><button data-v="sharp">CUT</button></div></div>
@@ -664,6 +667,7 @@ function wire(){
     api({op:'auto',mode,on:true}).then(r=>r&&toast(msg))};
   const VIBE_MSG={chill:'Chill: long smooth blends, few tricks.',club:'Club: loops, effects and drops most phrases.',hype:'Hype: tricks all the time, drops, sampler.'};
   $$('#vibeSeg button').forEach(b=>b.onclick=()=>api({op:'auto',vibe:b.dataset.v}).then(r=>r&&toast(VIBE_MSG[b.dataset.v])));
+  $$('#spinSeg button').forEach(b=>b.onclick=()=>api({op:'auto',spin:b.dataset.v==='1'}).then(r=>r&&toast(b.dataset.v==='1'?'Vinyl stop & start: pause and play slow down and speed up like a record.':'Instant stop & start.')));
   $$('#lyricsSeg button').forEach(b=>b.onclick=()=>api({op:'auto',lyrics:b.dataset.v==='1'}).then(r=>r&&toast(b.dataset.v==='1'?'Following the lyrics: Real DJ cuts and loops at the end of a sung line.':'Not following the lyrics: mixes land on the phrase, wherever the singer is.')));
   {let back=null;
    const open=()=>{back=document.activeElement;$('#settings').classList.remove('hide');$('#setBg').classList.remove('hide');$('#setTop').setAttribute('aria-expanded','true');$('#setClose').focus()};
@@ -905,6 +909,7 @@ function renderAuto(){
   $$('#aiSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.ai?'1':'0')));
   $$('#topSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.top?'1':'0')));
   $$('#lyricsSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.lyrics===false?'0':'1')));
+  $$('#spinSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===(a.spin===false?'0':'1')));
   {const parts=[];for(const k of DECKS){const d=S.decks&&S.decks[k];if(d&&d.loaded&&d.words!=null)parts.push(`Deck ${k}: <em>${d.words?'timed':'not timed yet'}</em>`)}
    const h=parts.join(' · ');const n=$('#wordsNote');if(n._h!==h){n._h=h;n.innerHTML=h}}
   {const pb=$('#pauseSet');const t=S.paused?'▶ RESUME SET':'⏸ PAUSE SET';if(pb.textContent!==t)pb.textContent=t;pb.classList.toggle('on',!!S.paused)}

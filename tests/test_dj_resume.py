@@ -56,6 +56,7 @@ class ResumeTests(unittest.TestCase):
 
     def test_pause_freezes_the_mix_and_resume_carries_on_from_there(self):
         session, engine, a, b = self.on_air()
+        session.spin = False                                   # VINYL STOP & START off: an instant freeze
         tr = dj.Transition(a, b, "stem_swap", 32, None)
         engine.transition = tr
         for _ in range(100):
@@ -75,6 +76,24 @@ class ResumeTests(unittest.TestCase):
         for _ in range(50):
             engine.render()
         self.assertGreater(tr.elapsed, elapsed)
+
+    def test_a_vinyl_pause_mid_mix_keeps_the_mix_in_its_place_in_the_music(self):
+        session, engine, a, b = self.on_air()
+        tr = dj.Transition(a, b, "stem_swap", 32, None)
+        engine.transition = tr
+        for _ in range(100):
+            engine.render()
+        lead = a.beat_at(a.seconds) - tr.elapsed                 # where the mix is against the song
+        session.pause()
+        for _ in range(200):
+            engine.render()
+        self.assertFalse(a.playing or b.playing)
+        self.assertGreater(a.beat_at(a.seconds) - tr.elapsed, lead - 0.15)
+        session.resume()
+        for _ in range(60):
+            engine.render()
+        self.assertTrue(a.playing and b.playing and a.brake is None)
+        self.assertAlmostEqual(a.beat_at(a.seconds) - tr.elapsed, lead, delta=0.15)
 
     def test_pausing_mid_hook_loop_keeps_the_loop_on_time(self):
         import random
