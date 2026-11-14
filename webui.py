@@ -2311,7 +2311,15 @@ class WebUI:
             loop = asyncio.get_running_loop()
             digest = await loop.run_in_executor(None, stems.lookup, keys)
             if not digest:
-                return response
+                # An upload without stems: the words of another upload of the same recording, shifted onto
+                # this one (words.py "twins"), once words-sync has found one; until then, ask it to look.
+                timed = await loop.run_in_executor(None, words.twin_lines, keys, lines)
+                if not timed:
+                    await loop.run_in_executor(None, words.want_twin, keys, lines, data.get('track'),
+                                               request.query.get('duration'))
+                    return response
+                data['words'] = timed
+                return web.json_response(data)
             timed = await loop.run_in_executor(None, words.for_lines, digest, lines)
             if not timed:
                 await loop.run_in_executor(None, words.want, digest, lines, data.get('source'), data.get('track'))

@@ -106,6 +106,33 @@ class WordsTests(unittest.TestCase):
         self.assertEqual(len(ws), 9)
 
 
+class TwinTests(unittest.TestCase):
+    """Another upload of a timed song: its shifted words, looked up by the YouTube id."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = mock.patch.object(stems, "CACHE_DIR", self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+        words._cache.clear()
+
+    def test_asks_then_uses_the_shifted_words(self):
+        keys = ["yt:06NxZ4_0KO0"]
+        self.assertIsNone(words.twin_lines(keys, LINES))
+        self.assertTrue(words.want_twin(keys, LINES, "Hard to Explain", "293"))
+        self.assertFalse(words.want_twin(keys, LINES))                 # asked already
+        with open(os.path.join(words.twins_dir(), "06NxZ4_0KO0.words.json"), "w") as f:
+            json.dump(dict(timed(words.fingerprint(LINES)), twin_of="abc", shift=3.8), f)
+        out = words.twin_lines(keys, LINES)
+        self.assertEqual(out[0][0][2], "Was")
+        self.assertFalse(words.want_twin(keys, LINES))                 # answered
+
+    def test_no_youtube_id_no_twin(self):
+        self.assertFalse(words.want_twin(["some query"], LINES))
+        self.assertIsNone(words.twin_lines(["some query"], LINES))
+
+
 class FollowLyricsTests(unittest.TestCase):
     SPANS = ([(10.0, 12.0), (15.0, 17.0)], [(10.0, 10.5), (10.6, 11.2), (11.3, 12.0), (15.0, 17.0)])
 

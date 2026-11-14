@@ -89,7 +89,10 @@ def load(digest):
     """The timed words for a song, if Oracle made them and they are trustworthy, else None."""
     if not digest:
         return None
-    data = _read(words_path(digest))
+    return _trusted(_read(words_path(digest)))
+
+
+def _trusted(data):
     if not isinstance(data, dict) or data.get("error") or not data.get("lines"):
         return None
     if data.get("mode") == "aligned" and data.get("fit") is not None and data["fit"] < MIN_FIT \
@@ -200,7 +203,10 @@ def for_lines(digest, lines):
     """Per shown line, its timed words [[start, end, word, [ms, ...]], ...] (or [] for a line without),
     or None when this song has no timed words that fit these lyrics. Lyrics timed exactly as shown are used
     line for line; slightly different ones (another upload of the same lyrics) word by word (_mapped)."""
-    data = load(digest)
+    return _fit_to(load(digest), lines)
+
+
+def _fit_to(data, lines):
     if not data:
         return None
     timed = data["lines"]
@@ -226,3 +232,62 @@ def spans(digest):
     if not lines:
         return None
     return sorted(lines), sorted(words)
+
+
+# ---------------------------------------------------------------- twins: other uploads of a timed song
+#
+# The same song is often in the library several times, from different YouTube uploads (an official video
+# with an intro, an audio upload, a lyric video). Only uploads with stems get timed on Oracle. For an upload
+# without stems, words-sync finds a timed upload whose words fit the same lyrics, lines the two recordings up
+# (cross-correlation; both halves of the song must agree on the shift, so a sped-up or live version is not
+# taken), and writes the timed words shifted onto this upload:
+#
+#   twins/<YouTube id>.ask.json    the bot's request: {"keys", "title", "duration", "lines", "fp", "asked"}
+#   twins/<YouTube id>.words.json  the shifted words (the format of <hash>.words.json, plus "twin_of", "shift")
+#   twins/<YouTube id>.none.json   no timed upload of this recording (yet): {"at", "why"}
+
+def twins_dir():
+    return os.path.join(stems.CACHE_DIR, "twins")
+
+
+def _video(keys):
+    for key in keys or ():
+        if key and key.startswith("yt:") and re.fullmatch(r"[0-9A-Za-z_-]{11}", key[3:]):
+            return key[3:]
+    return None
+
+
+def twin_lines(keys, lines):
+    """for_lines() for an upload without stems, from its twin's shifted words; None without."""
+    video = _video(keys)
+    if not video:
+        return None
+    return _fit_to(_trusted(_read(os.path.join(twins_dir(), video + ".words.json"))), lines)
+
+
+def want_twin(keys, lines, title=None, duration=None):
+    """Ask words-sync to look for a timed twin of this upload. Cheap when nothing changed."""
+    video, fp = _video(keys), fingerprint(lines)
+    if not video or not fp:
+        return False
+    base = os.path.join(twins_dir(), video)
+    if os.path.exists(base + ".words.json"):
+        return False
+    asked = _read(base + ".ask.json")
+    if isinstance(asked, dict) and asked.get("fp") == fp:
+        return False
+    data = {"keys": list(keys), "title": title, "duration": duration, "fp": fp, "asked": int(time.time()),
+            "lines": [[float(at) if at is not None else None, str(text)] for at, text in lines if str(text).strip()]}
+    try:
+        if not os.path.isdir(twins_dir()):
+            os.makedirs(twins_dir(), exist_ok=True)
+            os.chmod(twins_dir(), 0o2775)      # words-sync (another user, group server) writes the answers here
+        tmp = base + ".ask.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.chmod(tmp, 0o664)
+        os.replace(tmp, base + ".ask.json")
+    except OSError as error:
+        logger.debug("Could not ask for a twin of %s: %s", video, error)
+        return False
+    return True
