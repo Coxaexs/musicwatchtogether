@@ -2504,7 +2504,9 @@ class DJSession:
                 "paused": (not deck.playing) if paused is None else paused,
                 "key": (deck.meta or {}).get("camelot"),
                 "keyShift": 0.0 if deck.key_locked else round(12 * math.log2(max(0.5, deck.base_rate())), 1),
-                "karaoke": bool(deck.karaoke)}
+                "karaoke": bool(deck.karaoke),
+                # Which song this is, for Hoffle's lyrics (the words timed for it, words.py), as a Track has it.
+                "pageUrl": _page_url(deck.info), "query": deck.info.get("query") or None}
 
     async def _report(self):
         """Tell the room what is on air, when it changes or its clock drifts."""
@@ -3487,6 +3489,15 @@ def planned_mix(out_deck, in_deck):
     if in_at is not None and 0 <= in_at < in_deck.duration - 10:
         plan["in_at"] = in_at
     return plan
+
+
+def _page_url(info):
+    """The YouTube page of a deck's song, from its keys ("yt:<id>"), else its own page URL, else None."""
+    for key in (info or {}).get("keys") or ():
+        if isinstance(key, str) and key.startswith("yt:") and len(key) == 14:
+            return "https://www.youtube.com/watch?v=" + key[3:]
+    url = (info or {}).get("page_url") or (info or {}).get("url")
+    return url if isinstance(url, str) and url.startswith("http") else None
 
 
 def _keep_split(audio, result, keys, title):
