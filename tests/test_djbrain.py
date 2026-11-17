@@ -42,6 +42,21 @@ class BrainTests(unittest.TestCase):
         djbrain.BRAIN_DIR = os.path.join(os.path.dirname(os.path.abspath(djbrain.__file__)), "dj_brain")
         djbrain.reload()
 
+    def test_oracle_fingerprints_win_when_both_songs_have_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_brain(d, {"aaaaaaaaaaa": [1, 0, 0], "bbbbbbbbbbb": [0, 1, 0], "ccccccccccc": [1, 0.1, 0]})
+            ids = ["aaaaaaaaaaa", "bbbbbbbbbbb"]
+            # Oracle hears a and b as alike (Colab said not at all), on a scale where the median pair is 0.40.
+            emb = np.array([[1, 0.2, 0], [1, 0.25, 0]], np.float32)
+            np.save(d + "/sound.npy", (emb / np.linalg.norm(emb, axis=1, keepdims=True)).astype(np.float16))
+            with open(d + "/sound.json", "w") as f:
+                json.dump({"algo": "clap-mas-win6", "ids": ids, "scale": {"median": 0.4, "spread": 0.15}}, f)
+            self.use(d)
+            a, b, c = ["yt:aaaaaaaaaaa"], ["yt:bbbbbbbbbbb"], ["yt:ccccccccccc"]
+            self.assertGreater(djbrain.similarity(a, b), djbrain.SIM_HIGH)      # Oracle's, put on the old scale
+            self.assertAlmostEqual(djbrain.similarity(a, c), 0.995, places=2)    # c has no Oracle one: Colab's
+            self.assertIsNone(djbrain.similarity(b, ["yt:zzzzzzzzzzz"]))
+
     def test_missing_folder_means_no_opinion(self):
         self.use("/nonexistent/dj_brain")
         self.assertFalse(djbrain.enabled())

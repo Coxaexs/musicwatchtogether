@@ -67,6 +67,7 @@ def reload():
         _state.update(tried=False, songs=None, index=None, emb=None)
         _plans.update(tried=False, songs={}, mtime=None, checked=0.0)
         _structure.update(songs={}, mtime=None, checked=0.0)
+        _sound.update(index=None, emb=None, mtime=None, checked=0.0)
 
 
 def _load_plans():
@@ -188,9 +189,69 @@ def lookup(keys):
         return None
 
 
+_sound = {"index": None, "emb": None, "mtime": None, "checked": 0.0}
+#: The fingerprints Oracle makes (huddle-ops brain_sync.py, "clap-mas-win6": six fixed windows per song, the same
+#: every time) are on another scale than the Colab ones (one random 10 s slice each): two songs are compared with
+#: them only when both have one, put on the Colab scale with their own median and spread (measured by brain_sync
+#: over every pair, in sound.json; these defaults until there are enough songs).
+SOUND_MEDIAN = 0.40
+SOUND_SPREAD = 0.15
+
+
+def _load_sound():
+    """dj_brain/sound.json + sound.npy, read again within a minute of brain_sync replacing them."""
+    with _lock:
+        now = time.monotonic()
+        if now - _sound["checked"] < PLANS_RECHECK and _sound["mtime"] is not None:
+            return _sound["emb"] is not None
+        _sound["checked"] = now
+        if os.environ.get("DJ_BRAIN", "1") == "0":
+            return False
+        meta, npy = os.path.join(BRAIN_DIR, "sound.json"), os.path.join(BRAIN_DIR, "sound.npy")
+        try:
+            mtime = (os.path.getmtime(meta), os.path.getmtime(npy))
+        except OSError:
+            _sound.update(index=None, emb=None, mtime=None)
+            return False
+        if mtime != _sound["mtime"]:
+            try:
+                with open(meta, encoding="utf-8") as f:
+                    data = json.load(f)
+                ids = data.get("ids") or []
+                scale = data.get("scale") or {}
+                emb = np.load(npy).astype(np.float32)
+                if emb.ndim != 2 or len(ids) != len(emb):
+                    raise ValueError("sound fingerprints do not match their ids")
+                _sound.update(index={v: i for i, v in enumerate(ids)}, emb=emb,
+                              median=float(scale.get("median") or SOUND_MEDIAN),
+                              spread=float(scale.get("spread") or SOUND_SPREAD))
+                logger.info("Sound fingerprints loaded: %d songs", len(ids))
+            except Exception:
+                logger.warning("sound.json could not be read", exc_info=True)
+                _sound.update(index=None, emb=None)
+            _sound["mtime"] = mtime
+        return _sound["emb"] is not None
+
+
+def _sound_similarity(keys_a, keys_b):
+    """Cosine of Oracle's fingerprints, put on the Colab scale (random pair ~0.5), or None unless both have one."""
+    if not _load_sound():
+        return None
+    index = _sound["index"]
+    a, b = index.get(song_id(keys_a)), index.get(song_id(keys_b))
+    if a is None or b is None:
+        return None
+    raw = float(_sound["emb"][a] @ _sound["emb"][b])
+    return SIM_MEDIAN + (raw - _sound.get("median", SOUND_MEDIAN)) / (_sound.get("spread") or SOUND_SPREAD) * SIM_SPREAD
+
+
 def similarity(keys_a, keys_b):
-    """How alike two songs sound, cosine -1..1 (random pair ~0.5, very alike > 0.74), or None if either is unknown."""
+    """How alike two songs sound, cosine -1..1 (random pair ~0.5, very alike > 0.74), or None if either is unknown.
+    Oracle's fingerprints when both songs have one, else the Colab run's."""
     try:
+        sound = _sound_similarity(keys_a, keys_b)
+        if sound is not None:
+            return sound
         if not _load():
             return None
         index = _state["index"]
