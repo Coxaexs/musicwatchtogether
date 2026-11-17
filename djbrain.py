@@ -386,3 +386,74 @@ def mood(keys):
         return None
     words = [str(w).strip().lower() for w in found["moods"][:3] if w]
     return {"words": words, "name": mood_name(words)}
+
+
+# --------------------------------------------------------------------------
+# The mix reviewer (huddle-ops brain_sync.py -> dj_brain/reviews.json): how each move has sounded in the booth, and
+# beat grids corrected to where the songs' kicks really are
+# --------------------------------------------------------------------------
+
+_reviews = {"data": {}, "mtime": None, "checked": 0.0}
+#: A move needs this many reviews before its average counts, and then moves the plan score by
+#: (average - REVIEW_PAR) / 100 * REVIEW_WEIGHT: a move that averages 60 loses 0.5 against one that averages 80+.
+REVIEW_MIN = 4
+REVIEW_PAR = 80.0
+REVIEW_WEIGHT = 2.5
+
+
+def _load_reviews():
+    with _lock:
+        now = time.monotonic()
+        if now - _reviews["checked"] < PLANS_RECHECK and _reviews["mtime"] is not None:
+            return _reviews["data"]
+        _reviews["checked"] = now
+        path = os.path.join(BRAIN_DIR, "reviews.json")
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            _reviews.update(data={}, mtime=None)
+            return {}
+        if mtime != _reviews["mtime"]:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    _reviews["data"] = json.load(f) or {}
+            except Exception:
+                logger.warning("reviews.json could not be read", exc_info=True)
+                _reviews["data"] = {}
+            _reviews["mtime"] = mtime
+        return _reviews["data"]
+
+
+def review_bonus(move):
+    """Plan score change for a Real DJ move from its reviews (0 until it has REVIEW_MIN of them)."""
+    try:
+        if os.environ.get("DJ_BRAIN", "1") == "0":
+            return 0.0
+        seen = (_load_reviews().get("moves") or {}).get(move)
+        if not seen or seen.get("n", 0) < REVIEW_MIN:
+            return 0.0
+        return max(-1.0, min(0.5, (float(seen["mean"]) - REVIEW_PAR) / 100 * REVIEW_WEIGHT))
+    except Exception:
+        return 0.0
+
+
+def grid_fix(meta, keys):
+    """`meta` with its first beat moved to where the reviewer heard the song's kicks, when it measured this song on
+    this tempo: the grid that made synced decks flam. Moves less than a quarter beat, never the bar."""
+    try:
+        if os.environ.get("DJ_BRAIN", "1") == "0":
+            return meta
+        fix = (_load_reviews().get("grids") or {}).get(song_id(keys))
+        bpm = float(meta.get("bpm") or 0) * float(meta.get("bpm_scale") or 1.0)
+        if not fix or not bpm or abs(float(fix.get("bpm") or 0) - bpm) > 0.005 * bpm:
+            return meta
+        target, now = float(fix["first_beat"]), float(meta.get("first_beat") or 0.0)
+        beat = 60.0 / bpm
+        moved = target - now
+        moved -= round(moved / beat) * beat          # the same beat, not another one
+        if abs(moved) > beat / 4 or abs(moved) < 0.004:
+            return meta
+        return dict(meta, first_beat=round(now + moved, 4),
+                    grid_fix=dict(meta.get("grid_fix") or {}, reviewer_ms=round(moved * 1000, 1)))
+    except Exception:
+        return meta

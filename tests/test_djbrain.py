@@ -57,6 +57,26 @@ class BrainTests(unittest.TestCase):
             self.assertAlmostEqual(djbrain.similarity(a, c), 0.995, places=2)    # c has no Oracle one: Colab's
             self.assertIsNone(djbrain.similarity(b, ["yt:zzzzzzzzzzz"]))
 
+    def test_reviews_steer_moves_and_fix_grids(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(d + "/reviews.json", "w") as f:
+                json.dump({"moves": {"mashup": {"n": 6, "mean": 60}, "stem_swap": {"n": 6, "mean": 95},
+                                      "tease": {"n": 2, "mean": 10}},
+                           "grids": {"aaaaaaaaaaa": {"first_beat": 0.549, "bpm": 120.0, "n": 2}}}, f)
+            self.use(d)
+            self.assertAlmostEqual(djbrain.review_bonus("mashup"), -0.5)
+            self.assertAlmostEqual(djbrain.review_bonus("stem_swap"), 0.375)
+            self.assertEqual(djbrain.review_bonus("tease"), 0.0)          # too few reviews to count
+            self.assertEqual(djbrain.review_bonus("cut"), 0.0)
+            meta = {"bpm": 120.0, "first_beat": 0.5}
+            fixed = djbrain.grid_fix(meta, ["yt:aaaaaaaaaaa"])
+            self.assertAlmostEqual(fixed["first_beat"], 0.549)
+            self.assertAlmostEqual(fixed["grid_fix"]["reviewer_ms"], 49.0)
+            # A grid a whole beat on (another bar alignment) still gets the same 49 ms, never a beat's move.
+            self.assertAlmostEqual(djbrain.grid_fix({"bpm": 120.0, "first_beat": 1.0}, ["yt:aaaaaaaaaaa"])["first_beat"], 1.049)
+            self.assertEqual(djbrain.grid_fix({"bpm": 100.0, "first_beat": 0.5}, ["yt:aaaaaaaaaaa"]), {"bpm": 100.0, "first_beat": 0.5})
+            self.assertEqual(djbrain.grid_fix(meta, ["yt:bbbbbbbbbbb"]), meta)
+
     def test_missing_folder_means_no_opinion(self):
         self.use("/nonexistent/dj_brain")
         self.assertFalse(djbrain.enabled())

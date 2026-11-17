@@ -42,8 +42,10 @@ import numpy as np
 from scipy import signal
 
 import beatgrid
+import djbrain
 import club
 import keylock
+import mixtape
 import mixer
 import mixes
 import realdj
@@ -1295,6 +1297,7 @@ class DJEngine:
         self.transition = None
         self.tempo_release = None    # (deck, pitch at start, beats, elapsed)
         self.events = []             # ("ended", deck) / ("transition_done", tr) for Auto DJ
+        self.recorder = None         # mixtape.MixRecorder in Hoffle rooms: each transition, for the mix reviewer
         # Beat-timed touches (Real DJ): [deck name, start beat, end beat,
         # on(), off(), state] run on that deck's own beat clock.
         self.automations = []
@@ -1861,6 +1864,7 @@ class DJEngine:
                 self._run_gestures()
             mix = np.zeros((BLOCK, 2), np.float32)
             fx_target = self.fx.target
+            heard = {} if self.recorder is not None else None
             for deck in self.decks.values():
                 was_ended = deck.ended
                 raw = deck.read(BLOCK, now)
@@ -1870,13 +1874,19 @@ class DJEngine:
                     if deck.level:
                         deck.level *= 0.8
                     if fx_target == deck.name and self.fx.active():
-                        mix += self.fx.process(np.zeros((BLOCK, 2), np.float32), beat_seconds,
+                        tail = self.fx.process(np.zeros((BLOCK, 2), np.float32), beat_seconds,
                                                beat_pos, 1 / (beat_seconds * SR)) * self._xf_gain(deck)
+                        mix += tail
+                        if heard is not None:
+                            heard[deck.name] = tail
                     continue
                 channel = deck.strip(raw, beat_seconds) * (deck.fader ** 1.6)
                 if fx_target == deck.name:
                     channel = self.fx.process(channel, beat_seconds, beat_pos, 1 / (beat_seconds * SR))
-                mix += channel * self._xf_gain(deck)
+                channel = channel * self._xf_gain(deck)
+                mix += channel
+                if heard is not None:
+                    heard[deck.name] = channel
             self._render_loops(mix)
             if fx_target == "master":
                 mix = self.fx.process(mix, beat_seconds, beat_pos, 1 / (beat_seconds * SR))
@@ -1897,6 +1907,14 @@ class DJEngine:
                 mix[over] = sign * (0.8 + 0.2 * np.tanh((np.abs(mix[over]) - 0.8) / 0.2))
             peak = np.abs(mix).max(axis=0)
             self.master_level = [max(self.master_level[i] * 0.82, float(peak[i])) for i in (0, 1)]
+            if heard is not None and not (self.paused and not any(d.playing for d in self.decks.values())):
+                try:
+                    self.recorder.block(heard, mix, self.transition, {
+                        name: (d.beat_at(d.seconds) if d.loaded and d.bpm else None)
+                        for name, d in self.decks.items()})
+                except Exception:
+                    logger.debug("Mix recorder failed", exc_info=True)
+                    self.recorder = None
             if (self.light is not None and self.light.wanted and not self.paused
                     and any(d.playing for d in self.decks.values())):
                 values, notes, beat, bpm, lit_by_stems = club.frame(self)
@@ -2175,6 +2193,7 @@ class DJSession:
             meta = await loop.run_in_executor(None, realdj.aligned_grid, dict(meta), keys)
             if cached_stems is not None:
                 meta = await loop.run_in_executor(None, beatgrid.refine, meta, cached_stems[stems.NAMES.index("drums")])
+            meta = djbrain.grid_fix(meta, keys)      # where the mix reviewer heard this song's kicks
         except Exception as error:
             with self.engine.lock:
                 if deck.load_token == token:
@@ -2302,6 +2321,7 @@ class DJSession:
                     None, lambda: _keep_split(audio, result, keys, title))
                 grid = await asyncio.get_running_loop().run_in_executor(
                     None, beatgrid.refine, dict(deck.meta), result[stems.NAMES.index("drums")])
+                grid = djbrain.grid_fix(grid, keys)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -2319,7 +2339,8 @@ class DJSession:
             deck.stems = result
             deck.extra = extra
             deck.stems_status = "ready"
-            if grid.get("grid_fix", {}).get("kick_shift") is not None and not self._audible(deck):
+            if ((grid.get("grid_fix", {}).get("kick_shift") is not None
+                 or grid.get("grid_fix", {}).get("reviewer_ms") is not None) and not self._audible(deck)):
                 # The beat grid, now on the kick. Not under a song on air: its cues, loops and
                 # any mix being counted in are in the old grid's beats.
                 deck.meta = grid
@@ -3826,6 +3847,11 @@ async def start_huddle(channel_id, auto=True, restore=False):
         return session
     session = DJSession(key, "huddle", HuddleCrate(channel_id), auto=auto)
     session.engine.light = club.Feed()     # the room's club lights follow the booth
+    if mixtape.enabled():
+        # Each transition goes to the mix reviewer on Oracle (mixtape.py); Real DJ learns from the grades.
+        session.engine.recorder = mixtape.MixRecorder(lambda: {
+            "room": channel_id, "mode": session.mode, "vibe": session.vibe, "auto": session.auto,
+            "ai": session.ai, "lyrics": session.lyrics, "top": session.top})
     session.restoring = restore            # held until restore() has put the decks back
     sessions[key] = session
     manager = huddle_voice.MANAGER

@@ -1296,6 +1296,7 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
         score -= 0.12 * abs(start + overlap - ideal_end)
         if move in last_styles[-2:]:
             score *= 0.6
+        score += djbrain.review_bonus(move)       # how this move has sounded in this booth (the mix reviewer)
         score += rng.random() * 0.2
         candidates.append((score, move, start, cue, why, extra))
 
@@ -1378,6 +1379,7 @@ def plan_with_stems(out, inn, current, last_styles, rng=random, vibe="club"):
             if "top" in last_styles[-2:]:
                 score *= 0.6
             score -= LYRIC_COST * mid_line(lyrics_out, out.time_of_beat(start * P))
+            score += djbrain.review_bonus("top")
             candidates.append((score, "top", start, 0,
                                "from the top: the old song cuts with an echo, the new song's opening "
                                + ("line" if opening["sung"] else "bars") + " in the clear, then its beat", {}))
@@ -1576,6 +1578,8 @@ class RealDJ:
             if seconds_left < 1.2:
                 engine.transition = Transition(m, other, plan.style, plan.beats, plan.start_beat)
                 engine.transition.samples = self._transition_samples(plan.style)
+                # For the mix reviewer's recording (mixtape.py): which move this was and why.
+                engine.transition.move, engine.transition.why = plan.move, plan.why
                 if plan.script:
                     engine.transition.script = plan.script
                     engine.transition.label = plan.label
