@@ -23,6 +23,11 @@ Songs without it simply have no separate guitar / piano: those stay in
 Set DJ_STEMS=0 to turn it off. Without the worker venv it is off too, and the
 booth simply works without stems.
 
+Set DJ_STEMS_LOCAL=0 to never split on this machine: songs that already have
+stems (from Oracle via huddle-ops stems-sync, or the cache) keep working, and
+songs without them play without stems until Oracle has split them. Home's disk
+and CPU cannot take Demucs next to the live chat server (2026-11-17 outage).
+
 Beyond the DJ booth, the cache also serves:
   * karaoke: instrumental() writes "<hash>.inst.flac" (the mix minus vocals),
     which the players stream instead of the phase-cancel filter;
@@ -90,6 +95,11 @@ JOB_TIMEOUT = 15 * 60
 
 
 _enabled_cache = (0.0, False, None)          # (checked at, answer, for which PYTHON)
+
+
+def local_enabled():
+    """Whether this machine may run the Demucs worker itself (DJ_STEMS_LOCAL)."""
+    return os.environ.get("DJ_STEMS_LOCAL", "1") != "0"
 
 
 def enabled():
@@ -744,6 +754,9 @@ class Separator:
         path = os.path.join(CACHE_DIR, key + ".npy")
         if has_stems(key):
             return await loop.run_in_executor(None, load_stems, key)
+        if not local_enabled():
+            # Stems are made on Oracle only; this song waits for stems-sync.
+            return None
         if background:
             # Yield to listeners, to a live DJ set, and to a hot GPU (whose
             # jobs would otherwise fall back to the CPU).
