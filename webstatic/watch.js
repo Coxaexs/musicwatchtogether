@@ -516,9 +516,19 @@
   }
 
   // ------------------------------------------------------------ search
+  // A pasted link plays (or queues) at once instead of showing a one-result search.
+  const LINK = /^(https?:\/\/|www\.|youtu\.be\/)\S+$/i;
   function runSearch(q) {
     q = q.trim();
     if (!q) return;
+    if (LINK.test(q)) {
+      const nothingPlaying = !current();
+      T.send({ t: 'add', q: /^https?:/i.test(q) ? q : 'https://' + q, next: false });
+      T.toast(nothingPlaying ? 'Starting it…' : 'Added to the queue');
+      $('#searchInput').value = '';
+      openTab('queue');
+      return;
+    }
     searchState = { q, items: null, busy: true, error: '' };
     $('#searchInput').value = q;
     renderSearch();
